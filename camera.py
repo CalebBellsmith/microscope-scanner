@@ -12,14 +12,33 @@ class ToupTekCamera:
         import toupcam
         self._sdk = toupcam
         self._cam = None
+        self._frame = None
 
     def open(self):
+        import toupcam
         arr = self._sdk.Toupcam.EnumV2()
         if not arr:
             raise RuntimeError("No ToupTek camera found")
         self._cam = self._sdk.Toupcam.Open(arr[0].id)
+
+        # Resolution & format
         self._cam.put_Size(TARGET_W, TARGET_H)
-        self._frame = None
+        self._cam.put_Option(toupcam.TOUPCAM_OPTION_RGB, 0)  # RGB24
+
+        # Exposure — fixed settings required by analysis pipeline
+        self._cam.put_AutoExpoEnable(False)   # disable auto exposure
+        self._cam.put_ExpoAGain(300)          # analog gain 3x = 300%
+        self._cam.put_ExpoTime(1300000)       # 1300 ms in microseconds
+
+        # Negative image (white background, black scratches)
+        try:
+            self._cam.put_Negative(True)
+        except Exception:
+            # SDK version doesn't support put_Negative — apply in software via grab()
+            self._negative_fallback = True
+        else:
+            self._negative_fallback = False
+
         self._cam.StartPullModeWithCallback(self._on_event, None)
 
     def _on_event(self, event, ctx):
@@ -27,7 +46,10 @@ class ToupTekCamera:
         if event == toupcam.TOUPCAM_EVENT_IMAGE:
             buf = bytes(TARGET_W * TARGET_H * 3)
             self._cam.PullImageV2(buf, 24, None)
-            self._frame = np.frombuffer(buf, dtype=np.uint8).reshape(TARGET_H, TARGET_W, 3).copy()
+            frame = np.frombuffer(buf, dtype=np.uint8).reshape(TARGET_H, TARGET_W, 3).copy()
+            if getattr(self, '_negative_fallback', False):
+                frame = 255 - frame  # software inversion fallback
+            self._frame = frame
 
     def grab(self):
         return self._frame
