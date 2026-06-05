@@ -123,7 +123,16 @@ class CapturePipeline:
             self._motor.move("Y", -cumulative_dy)
         return best_frame
 
-    def _wait_for_frame(self, timeout=2.0):
+    def _wait_for_frame(self, timeout=5.0):
+        """
+        Get a full-quality frame for saving.
+        Uses grab_fresh() on ToupTek (switches to 1300ms exposure, waits for
+        a genuinely new frame, then restores fast preview exposure).
+        Falls back to grab() for OpenCV/mss cameras.
+        """
+        if hasattr(self._cam, 'grab_fresh'):
+            return self._cam.grab_fresh(timeout=timeout)
+        # Fallback for non-ToupTek cameras
         deadline = time.time() + timeout
         while time.time() < deadline:
             frame = self._cam.grab()

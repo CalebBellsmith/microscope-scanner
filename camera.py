@@ -14,6 +14,10 @@ class ToupTekCamera:
         self._cam = None
         self._frame = None
 
+    # Exposure times
+    PREVIEW_EXPOSURE_US = 100_000   # 100ms  — smooth live feed (~10fps)
+    CAPTURE_EXPOSURE_US = 1_300_000 # 1300ms — full quality for saved images
+
     def open(self):
         import toupcam
         arr = self._sdk.Toupcam.EnumV2()
@@ -25,36 +29,33 @@ class ToupTekCamera:
         self._cam.put_Size(TARGET_W, TARGET_H)
         self._cam.put_Option(toupcam.TOUPCAM_OPTION_RGB, 0)  # RGB24
 
-        # Start in analysis mode by default
-        self._analysis_mode = True
+        self._analysis_mode    = True
         self._negative_fallback = False
+        self._frame_count      = 0   # increments on every new frame from camera
         self._apply_settings(analysis=True)
 
         self._cam.StartPullModeWithCallback(self._on_event, None)
 
     def _apply_settings(self, analysis: bool):
-        """Switch between analysis settings and raw camera defaults."""
-        import toupcam
+        """Switch between analysis and raw camera defaults."""
         self._analysis_mode = analysis
         if analysis:
-            # Fixed settings required by analysis pipeline
             self._cam.put_AutoExpoEnable(False)
-            self._cam.put_ExpoAGain(300)       # 3x gain
-            self._cam.put_ExpoTime(1300000)    # 1300ms
+            self._cam.put_ExpoAGain(300)                    # 3x gain
+            self._cam.put_ExpoTime(self.PREVIEW_EXPOSURE_US) # fast for live feed
             try:
                 self._cam.put_Negative(True)
                 self._negative_fallback = False
             except Exception:
                 self._negative_fallback = True
         else:
-            # Raw mode — auto exposure, no inversion, default gain
             self._cam.put_AutoExpoEnable(True)
-            self._cam.put_ExpoAGain(100)       # 1x gain
+            self._cam.put_ExpoAGain(100)
             try:
                 self._cam.put_Negative(False)
-                self._negative_fallback = False
             except Exception:
-                self._negative_fallback = False  # no inversion needed in raw mode
+                pass
+            self._negative_fallback = False
 
     def set_analysis_mode(self, enabled: bool):
         """Called from GUI toggle."""
@@ -67,12 +68,42 @@ class ToupTekCamera:
             buf = bytes(TARGET_W * TARGET_H * 3)
             self._cam.PullImageV2(buf, 24, None)
             frame = np.frombuffer(buf, dtype=np.uint8).reshape(TARGET_H, TARGET_W, 3).copy()
-            # Software inversion fallback — only apply in analysis mode
             if self._negative_fallback and self._analysis_mode:
                 frame = 255 - frame
             self._frame = frame
+            self._frame_count += 1  # signal that a fresh frame has arrived
 
     def grab(self):
+        """Return the latest frame (used by live preview)."""
+        return self._frame
+
+    def grab_fresh(self, timeout=5.0):
+        """
+        Capture a full-quality frame for saving:
+          1. Switch to 1300ms capture exposure
+          2. Wait for the camera to deliver a genuinely new frame
+          3. Restore fast preview exposure
+          4. Return the frame
+        Called by capture_pipeline instead of grab().
+        """
+        import time
+        if self._cam is None:
+            return None
+
+        self._cam.put_ExpoTime(self.CAPTURE_EXPOSURE_US)
+        count_before = self._frame_count
+
+        # Wait up to timeout for a fresh frame taken at capture exposure
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self._frame_count > count_before:
+                frame = self._frame
+                self._cam.put_ExpoTime(self.PREVIEW_EXPOSURE_US)  # restore preview
+                return frame
+            time.sleep(0.05)
+
+        # Timed out — restore preview exposure and return whatever we have
+        self._cam.put_ExpoTime(self.PREVIEW_EXPOSURE_US)
         return self._frame
 
     def close(self):
