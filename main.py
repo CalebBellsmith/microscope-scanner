@@ -132,6 +132,19 @@ class MainWindow(QMainWindow):
             "background:#111; color:#888; border:1px solid #444;"
         )
         left.addWidget(self._feed_label, stretch=1)
+
+        # Camera mode toggle — sits below the feed
+        self._cam_mode_btn = QPushButton("🔬  Analysis mode  (exposure: 1300ms · gain: 3x · negative: on)")
+        self._cam_mode_btn.setCheckable(True)
+        self._cam_mode_btn.setChecked(True)
+        self._cam_mode_btn.setFixedHeight(32)
+        self._cam_mode_btn.setStyleSheet(
+            "QPushButton:checked   { background:#1565C0; color:white; font-weight:bold; }"
+            "QPushButton:unchecked { background:#555;    color:#ccc;  font-weight:normal; }"
+        )
+        self._cam_mode_btn.clicked.connect(self._on_cam_mode_toggle)
+        left.addWidget(self._cam_mode_btn)
+
         root.addLayout(left, stretch=3)
 
         # ── Right: scrollable controls ────────────────────────────────────────
@@ -350,6 +363,24 @@ class MainWindow(QMainWindow):
                 jpegs = [f for f in os.listdir(full)
                          if f.endswith(".jpg") and "overlay" not in f]
                 self._upsert_leg_row(entry, len(jpegs), "—")
+
+    # ── Camera mode toggle ────────────────────────────────────────────────────
+
+    def _on_cam_mode_toggle(self):
+        analysis = self._cam_mode_btn.isChecked()
+        if analysis:
+            self._cam_mode_btn.setText(
+                "🔬  Analysis mode  (exposure: 1300ms · gain: 3x · negative: on)"
+            )
+        else:
+            self._cam_mode_btn.setText(
+                "📷  Raw mode  (auto exposure · gain: 1x · negative: off)"
+            )
+        if self._camera is not None:
+            try:
+                self._camera.set_analysis_mode(analysis)
+            except Exception as e:
+                self._statusbar.showMessage(f"Camera mode switch failed: {e}")
 
     # ── Profile helpers ───────────────────────────────────────────────────────
 

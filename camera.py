@@ -21,25 +21,45 @@ class ToupTekCamera:
             raise RuntimeError("No ToupTek camera found")
         self._cam = self._sdk.Toupcam.Open(arr[0].id)
 
-        # Resolution & format
+        # Resolution & format (same in both modes)
         self._cam.put_Size(TARGET_W, TARGET_H)
         self._cam.put_Option(toupcam.TOUPCAM_OPTION_RGB, 0)  # RGB24
 
-        # Exposure — fixed settings required by analysis pipeline
-        self._cam.put_AutoExpoEnable(False)   # disable auto exposure
-        self._cam.put_ExpoAGain(300)          # analog gain 3x = 300%
-        self._cam.put_ExpoTime(1300000)       # 1300 ms in microseconds
-
-        # Negative image (white background, black scratches)
-        try:
-            self._cam.put_Negative(True)
-        except Exception:
-            # SDK version doesn't support put_Negative — apply in software via grab()
-            self._negative_fallback = True
-        else:
-            self._negative_fallback = False
+        # Start in analysis mode by default
+        self._analysis_mode = True
+        self._negative_fallback = False
+        self._apply_settings(analysis=True)
 
         self._cam.StartPullModeWithCallback(self._on_event, None)
+
+    def _apply_settings(self, analysis: bool):
+        """Switch between analysis settings and raw camera defaults."""
+        import toupcam
+        self._analysis_mode = analysis
+        if analysis:
+            # Fixed settings required by analysis pipeline
+            self._cam.put_AutoExpoEnable(False)
+            self._cam.put_ExpoAGain(300)       # 3x gain
+            self._cam.put_ExpoTime(1300000)    # 1300ms
+            try:
+                self._cam.put_Negative(True)
+                self._negative_fallback = False
+            except Exception:
+                self._negative_fallback = True
+        else:
+            # Raw mode — auto exposure, no inversion, default gain
+            self._cam.put_AutoExpoEnable(True)
+            self._cam.put_ExpoAGain(100)       # 1x gain
+            try:
+                self._cam.put_Negative(False)
+                self._negative_fallback = False
+            except Exception:
+                self._negative_fallback = False  # no inversion needed in raw mode
+
+    def set_analysis_mode(self, enabled: bool):
+        """Called from GUI toggle."""
+        if self._cam:
+            self._apply_settings(analysis=enabled)
 
     def _on_event(self, event, ctx):
         import toupcam
@@ -47,8 +67,9 @@ class ToupTekCamera:
             buf = bytes(TARGET_W * TARGET_H * 3)
             self._cam.PullImageV2(buf, 24, None)
             frame = np.frombuffer(buf, dtype=np.uint8).reshape(TARGET_H, TARGET_W, 3).copy()
-            if getattr(self, '_negative_fallback', False):
-                frame = 255 - frame  # software inversion fallback
+            # Software inversion fallback — only apply in analysis mode
+            if self._negative_fallback and self._analysis_mode:
+                frame = 255 - frame
             self._frame = frame
 
     def grab(self):
