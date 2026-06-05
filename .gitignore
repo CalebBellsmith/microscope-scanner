@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+
+# Model file (large, trained locally)
+model.pt
+
+# Training data (images, kept local)
+training_data/
+
+# Scan output folders
+slide_scan/
+
+# Mac
+.DS_Store
+.AppleDouble
+
+# Windows
+Thumbs.db
+desktop.ini
+
+# ToupTek SDK (platform-specific, added locally)
+toupcam.py
+toupcam.dll
+libtoupcam.dylib

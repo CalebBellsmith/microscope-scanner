@@ -1,0 +1,11 @@
+PyQt5>=5.15
+opencv-python>=4.8
+numpy>=1.24
+pyserial>=3.5
+torch>=2.0
+torchvision>=0.15
+Pillow>=9.0
+mss>=9.0
+scipy>=1.11
+scikit-image>=0.21
+openpyxl>=3.1
