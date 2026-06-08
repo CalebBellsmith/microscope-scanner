@@ -34,6 +34,12 @@ class ToupTekCamera:
         self._frame_count      = 0   # increments on every new frame from camera
         self._apply_settings(analysis=True)
 
+        # One-shot neutral white balance — eliminates warm/orange tint
+        try:
+            self._cam.put_TempTint(6503, 0)   # 6503 K = neutral daylight, 0 tint
+        except Exception:
+            pass
+
         self._cam.StartPullModeWithCallback(self._on_event, None)
 
     def _apply_settings(self, analysis: bool):
