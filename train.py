@@ -156,7 +156,7 @@ def train(good_dir: str, bad_dir: str, progress_cb=None) -> float:
         model, dummy, onnx_path,
         input_names=["input"], output_names=["output"],
         dynamic_axes={"input": {0: "batch"}, "output": {0: "batch"}},
-        opset_version=17,
+        opset_version=11,
     )
     print(f"Saved: {onnx_path}")
     return acc
