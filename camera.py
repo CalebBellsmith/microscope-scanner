@@ -76,6 +76,13 @@ class ToupTekCamera:
             frame = np.frombuffer(buf, dtype=np.uint8).reshape(TARGET_H, TARGET_W, 3).copy()
             if self._negative_fallback and self._analysis_mode:
                 frame = 255 - frame
+            if self._analysis_mode:
+                # Convert to greyscale so preview matches the old MATLAB pipeline.
+                # Stored as RGB (all 3 channels equal) so the rest of the code is unchanged.
+                grey  = (0.299 * frame[:, :, 0] +
+                         0.587 * frame[:, :, 1] +
+                         0.114 * frame[:, :, 2]).astype(np.uint8)
+                frame = np.stack([grey, grey, grey], axis=2)
             self._frame = frame
             self._frame_count += 1  # signal that a fresh frame has arrived
 
