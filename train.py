@@ -9,6 +9,9 @@ Output: model.pt  (loaded by ml_inference.py)
 import os
 import random
 
+# Force CPU — prevents DLL init error on machines without compatible CUDA drivers
+os.environ["CUDA_VISIBLE_DEVICES"] = ""
+
 MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "model.pt")
 IMG_SIZE   = 224
 BATCH_SIZE = 16
