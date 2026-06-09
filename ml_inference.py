@@ -11,6 +11,9 @@ import os
 import numpy as np
 from PIL import Image
 
+# Prevent CUDA DLL init crash on Windows machines without compatible GPU drivers
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
+
 MODEL_PATH = os.path.join(os.path.dirname(__file__), "model.pt")
 _IMG_SIZE  = 224
 _SHARPNESS_THRESHOLD = 80.0  # Laplacian variance below this → probably bad

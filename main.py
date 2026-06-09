@@ -648,7 +648,6 @@ class MainWindow(QMainWindow):
                     self._camera.open()
                 else:
                     self._camera = open_camera()
-                self._preview_timer.start(66)
 
             if self._motor is None:
                 esp_txt = self._esp_port_edit.text().strip()
@@ -657,6 +656,10 @@ class MainWindow(QMainWindow):
                 self._motor.open()
 
             self._clf.load()
+            # Re-apply camera settings now that camera is open
+            self._set_analysis_mode(self._analysis_on)
+            # Delay preview so camera settles at new exposure before first frame shows
+            QTimer.singleShot(2000, lambda: self._preview_timer.start(66))
             self._connect_btn.setText("Connected ✓")
             self._connect_btn.setEnabled(False)
             self._go_btn.setEnabled(True)

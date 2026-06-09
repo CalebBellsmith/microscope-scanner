@@ -244,9 +244,11 @@ class LabelingWindow(QMainWindow):
     def _connect_camera(self):
         try:
             self._camera = open_camera()
-            # Delay preview start so camera can settle at the new exposure
-            # before we show any frames (prevents startup oversaturation flash)
-            QTimer.singleShot(1500, lambda: self._preview_timer.start(80))
+            # Re-apply analysis settings now that camera is open
+            # (_set_analysis_mode was called during _build_ui when camera was None)
+            self._set_analysis_mode(self._analysis_on)
+            # Wait for camera to stabilise at new exposure before showing frames
+            QTimer.singleShot(2000, lambda: self._preview_timer.start(80))
             self._status.showMessage(
                 "Camera connected.  Press Space to capture a frame."
             )
