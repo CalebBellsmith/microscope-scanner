@@ -94,17 +94,24 @@ class LabelingWindow(QMainWindow):
         )
         left.addWidget(self._feed_label, stretch=1)
 
-        self._cam_mode_btn = QPushButton(
-            "🔬  Analysis mode  (exposure: 1300ms · gain: 3x · negative: on)"
-        )
-        self._cam_mode_btn.setCheckable(True)
-        self._cam_mode_btn.setChecked(True)
-        self._cam_mode_btn.setStyleSheet(
-            "QPushButton:checked   { background:#1565C0; color:white; font-weight:bold; }"
-            "QPushButton:unchecked { background:#555;    color:#ccc;  font-weight:normal; }"
-        )
-        self._cam_mode_btn.toggled.connect(self._on_cam_mode_toggle)
-        left.addWidget(self._cam_mode_btn)
+        # Analysis mode ON / OFF — two explicit buttons so state is always clear
+        mode_row = QHBoxLayout()
+        mode_lbl = QLabel("Camera mode:")
+        mode_lbl.setStyleSheet("color:#aaa;")
+        mode_row.addWidget(mode_lbl)
+
+        self._analysis_on_btn  = QPushButton("🔬  Analysis ON")
+        self._analysis_off_btn = QPushButton("👁  Raw OFF")
+
+        for btn in (self._analysis_on_btn, self._analysis_off_btn):
+            btn.setFocusPolicy(Qt.NoFocus)   # prevent Space from clicking buttons
+            btn.setFixedHeight(32)
+            mode_row.addWidget(btn)
+
+        self._analysis_on_btn.clicked.connect(lambda: self._set_analysis_mode(True))
+        self._analysis_off_btn.clicked.connect(lambda: self._set_analysis_mode(False))
+        self._set_analysis_mode(True)   # start in analysis mode
+        left.addLayout(mode_row)
 
         root.addLayout(left, stretch=3)
 
@@ -170,6 +177,7 @@ class LabelingWindow(QMainWindow):
         train_lay = QVBoxLayout(train_box)
 
         self._train_btn = QPushButton("▶  Train model.pt")
+        self._train_btn.setFocusPolicy(Qt.NoFocus)
         self._train_btn.setStyleSheet(
             "QPushButton         { background:#1565C0; color:white;"
             "  font-weight:bold; padding:8px; border-radius:4px; }"
@@ -212,9 +220,16 @@ class LabelingWindow(QMainWindow):
         if frame is not None:
             self._sig.frame_ready.emit(frame)
 
-    def _on_cam_mode_toggle(self, checked):
+    def _set_analysis_mode(self, on: bool):
+        """Switch camera mode and update button appearances."""
         if self._camera and hasattr(self._camera, "set_analysis_mode"):
-            self._camera.set_analysis_mode(checked)
+            self._camera.set_analysis_mode(on)
+        # Active button = bright, inactive = dim
+        active   = "background:#1565C0; color:white; font-weight:bold; border-radius:4px;"
+        inactive = "background:#333;    color:#888; font-weight:normal; border-radius:4px;"
+        self._analysis_on_btn.setStyleSheet( active   if on  else inactive)
+        self._analysis_off_btn.setStyleSheet(inactive if on  else active)
+        self.setFocus()   # reclaim keyboard focus so Space works
 
     # ── Frame display ─────────────────────────────────────────────────────────
 
@@ -315,6 +330,7 @@ class LabelingWindow(QMainWindow):
             f"color:{color}; font-weight:bold; padding:8px;"
         )
         self._status.showMessage(f"Saved {label.upper()}: {os.path.basename(path)}")
+        self.setFocus()
         QTimer.singleShot(1200, self._back_to_live)
 
     def _predict(self):
