@@ -271,6 +271,9 @@ class LabelingWindow(QMainWindow):
         for w in self._adj_widgets:
             w.setEnabled(on)
         if on:
+            # Set the flag on the camera first so greyscale conversion fires
+            if self._camera and hasattr(self._camera, "set_analysis_mode"):
+                self._camera.set_analysis_mode(True)
             self._apply_analysis_settings()
         else:
             # Hand full control back to the camera's auto defaults
