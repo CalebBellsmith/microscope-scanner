@@ -244,7 +244,9 @@ class LabelingWindow(QMainWindow):
     def _connect_camera(self):
         try:
             self._camera = open_camera()
-            self._preview_timer.start(80)
+            # Delay preview start so camera can settle at the new exposure
+            # before we show any frames (prevents startup oversaturation flash)
+            QTimer.singleShot(1500, lambda: self._preview_timer.start(80))
             self._status.showMessage(
                 "Camera connected.  Press Space to capture a frame."
             )
@@ -353,11 +355,12 @@ class LabelingWindow(QMainWindow):
 
     def keyPressEvent(self, event):
         k = event.key()
-        if   k == Qt.Key_Space: self._capture_frame()
-        elif k == Qt.Key_D:     self._label("good")
-        elif k == Qt.Key_A:     self._label("bad")
-        elif k == Qt.Key_W:     self._predict()
-        elif k == Qt.Key_S:     self._undo()
+        if   k == Qt.Key_Space:                          self._capture_frame()
+        elif k == Qt.Key_D:                              self._label("good")
+        elif k == Qt.Key_A:                              self._label("bad")
+        elif k == Qt.Key_W:                              self._predict()
+        elif k == Qt.Key_S:                              self._undo()
+        elif k in (Qt.Key_Return, Qt.Key_Enter):         self._dismiss_prediction()
         else: super().keyPressEvent(event)
 
     # ── Actions ───────────────────────────────────────────────────────────────
@@ -419,6 +422,15 @@ class LabelingWindow(QMainWindow):
         label, conf      = self._clf.predict(frame)
         cx_frac, cy_frac = _defect_centroid(frame)
         self._sig.overlay_ready.emit(frame, cx_frac, cy_frac, label, conf)
+
+    def _dismiss_prediction(self):
+        """Clear prediction overlay — show plain frozen frame again (or go live)."""
+        self._pred_lbl.setText("")
+        if self._frozen_frame is not None:
+            self._sig.frame_ready.emit(self._frozen_frame)   # redraw without crosshair
+            self._status.showMessage(
+                "Prediction dismissed.  D = good  ·  A = bad  ·  S = undo"
+            )
 
     def _undo(self):
         if self._last_saved is None:
