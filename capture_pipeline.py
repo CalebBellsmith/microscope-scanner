@@ -28,6 +28,7 @@ class CapturePipeline:
     def __init__(self, camera, motor, classifier,
                  output_dir, set_name, leg,
                  rows, cols, x_spacing, y_spacing,
+                 quality_threshold=0.5,
                  on_progress=None, on_frame=None, on_done=None, on_error=None):
         self._cam       = camera
         self._motor     = motor
@@ -35,8 +36,9 @@ class CapturePipeline:
         self._out       = os.path.join(output_dir, set_name, leg)
         self._rows      = rows
         self._cols      = cols
-        self._x_spacing = x_spacing   # stepper steps per grid column
-        self._y_spacing = y_spacing   # stepper steps per grid row
+        self._x_spacing = x_spacing          # stepper steps per grid column
+        self._y_spacing = y_spacing          # stepper steps per grid row
+        self._threshold = quality_threshold  # 0.0 = accept anything, 1.0 = perfect only
         self._on_progress = on_progress or (lambda done, total: None)
         self._on_frame    = on_frame    or (lambda img: None)
         self._on_done     = on_done     or (lambda: None)
@@ -103,7 +105,8 @@ class CapturePipeline:
         frame = self._wait_for_frame()
         if frame is None:
             return None
-        if self._clf.is_good(frame):
+        _, conf = self._clf.predict(frame)
+        if conf >= self._threshold:
             return frame
 
         # Locate defect and compute nudge direction

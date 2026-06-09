@@ -22,7 +22,7 @@ from PyQt5.QtWidgets import (
     QComboBox, QLineEdit, QFileDialog, QMessageBox, QStatusBar,
     QRadioButton, QButtonGroup, QInputDialog, QTableWidget,
     QTableWidgetItem, QHeaderView, QSizePolicy, QFrame,
-    QScrollArea, QCheckBox,
+    QScrollArea, QCheckBox, QSlider,
 )
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject
 from PyQt5.QtGui import QImage, QPixmap, QColor, QFont
@@ -306,6 +306,30 @@ class MainWindow(QMainWindow):
         profile_lay.addLayout(_row("X spacing (steps):", self._x_spin))
         profile_lay.addLayout(_row("Y spacing (units):", self._y_spin))
         profile_lay.addWidget(self._total_label)
+
+        # Quality threshold slider
+        profile_lay.addWidget(QLabel("Quality threshold (nudge sensitivity):"))
+        thresh_row = QHBoxLayout()
+        self._thresh_label_lo = QLabel("Lenient")
+        self._thresh_label_lo.setStyleSheet("color:#888; font-size:10px;")
+        self._thresh_slider = QSlider(Qt.Horizontal)
+        self._thresh_slider.setRange(1, 9)   # maps to 0.1 – 0.9
+        self._thresh_slider.setValue(5)       # default 0.5
+        self._thresh_slider.setTickPosition(QSlider.TicksBelow)
+        self._thresh_slider.setTickInterval(1)
+        self._thresh_val_lbl = QLabel("0.5")
+        self._thresh_val_lbl.setFixedWidth(28)
+        self._thresh_slider.valueChanged.connect(
+            lambda v: self._thresh_val_lbl.setText(f"{v/10:.1f}")
+        )
+        self._thresh_label_hi = QLabel("Strict")
+        self._thresh_label_hi.setStyleSheet("color:#888; font-size:10px;")
+        thresh_row.addWidget(self._thresh_label_lo)
+        thresh_row.addWidget(self._thresh_slider, stretch=1)
+        thresh_row.addWidget(self._thresh_label_hi)
+        thresh_row.addWidget(self._thresh_val_lbl)
+        profile_lay.addLayout(thresh_row)
+
         right.addWidget(self._profile_box)
 
         # ── Run Slide button (primary action) ─────────────────────────────────
@@ -673,6 +697,7 @@ class MainWindow(QMainWindow):
             rows=rows, cols=cols,
             x_spacing=self._x_spin.value(),
             y_spacing=self._y_spin.value(),
+            quality_threshold=self._thresh_slider.value() / 10.0,
             on_progress=lambda d, t: self._sig.capture_progress.emit(d, t),
             on_frame=lambda f: self._sig.frame_ready.emit(f),
             on_done=lambda: self._sig.capture_done.emit(),
