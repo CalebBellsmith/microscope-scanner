@@ -461,17 +461,39 @@ class LabelingWindow(QMainWindow):
         self._train_bar.setVisible(True)
         self._train_bar.setValue(0)
         self._train_result.setText("Training…")
+        # Run train.py as a subprocess — avoids PyQt5 thread DLL init issues with torch
         threading.Thread(target=self._run_training, daemon=True).start()
 
     def _run_training(self):
+        import subprocess, sys, re
         try:
-            import train as tr
-            acc = tr.train(
-                GOOD_DIR, BAD_DIR,
-                progress_cb=lambda ep, tot, loss:
-                    self._sig.train_progress.emit(ep, tot, loss),
+            proc = subprocess.Popen(
+                [sys.executable, os.path.join(_HERE, "train.py")],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
             )
-            self._sig.train_done.emit(acc)
+            # Parse stdout lines for progress and final accuracy
+            acc = None
+            for line in proc.stdout:
+                line = line.strip()
+                # "  Epoch  3/15  loss=0.4231"
+                m = re.match(r"Epoch\s+(\d+)/(\d+)\s+loss=([\d.]+)", line)
+                if m:
+                    ep, tot, loss = int(m[1]), int(m[2]), float(m[3])
+                    self._sig.train_progress.emit(ep, tot, loss)
+                # "Val accuracy: 91.2%"
+                m2 = re.match(r"Val accuracy:\s+([\d.]+)%", line)
+                if m2:
+                    acc = float(m2[1]) / 100.0
+            proc.wait()
+            if proc.returncode != 0:
+                self._sig.train_error.emit(f"train.py exited with code {proc.returncode}")
+            elif acc is not None:
+                self._sig.train_done.emit(acc)
+            else:
+                self._sig.train_error.emit("Training finished but no accuracy reported.")
         except Exception as e:
             self._sig.train_error.emit(str(e))
 
