@@ -254,6 +254,34 @@ class MainWindow(QMainWindow):
         conn_lay.addWidget(self._connect_btn)
         right.addWidget(self._conn_box)
 
+        # ── Manual joystick mode ──────────────────────────────────────────────
+        manual_box = QGroupBox("Manual control")
+        manual_lay = QVBoxLayout(manual_box)
+        manual_lay.setSpacing(4)
+
+        self._manual_chk = QCheckBox("Enable arrow-key joystick")
+        self._manual_chk.setFocusPolicy(Qt.NoFocus)
+        self._manual_chk.setToolTip(
+            "When checked: ← → move X stepper, ↑ ↓ move Y stepper"
+        )
+        manual_lay.addWidget(self._manual_chk)
+
+        step_row = QHBoxLayout()
+        step_row.addWidget(QLabel("Step size:"))
+        self._manual_step_spin = QSpinBox()
+        self._manual_step_spin.setFocusPolicy(Qt.NoFocus)
+        self._manual_step_spin.setRange(1, 2048)
+        self._manual_step_spin.setValue(100)
+        self._manual_step_spin.setSuffix(" steps")
+        step_row.addWidget(self._manual_step_spin)
+        step_row.addStretch()
+        manual_lay.addLayout(step_row)
+
+        manual_lay.addWidget(QLabel(
+            "← → = X axis    ↑ ↓ = Y axis",
+        ))
+        right.addWidget(manual_box)
+
         # ── Scan profile ──────────────────────────────────────────────────────
         self._profile_box = QGroupBox("Scan profile")
         profile_lay = QVBoxLayout(self._profile_box)
@@ -438,6 +466,24 @@ class MainWindow(QMainWindow):
             cam._negative_fallback = False
         except Exception:
             cam._negative_fallback = neg
+
+    # ── Manual joystick ──────────────────────────────────────────────────────
+
+    def keyPressEvent(self, event):
+        if not self._manual_chk.isChecked():
+            super().keyPressEvent(event)
+            return
+        if self._motor is None:
+            self._statusbar.showMessage("Motor not connected — connect first.")
+            super().keyPressEvent(event)
+            return
+        steps = self._manual_step_spin.value()
+        key   = event.key()
+        if   key == Qt.Key_Left:  self._motor.move("X", -steps)
+        elif key == Qt.Key_Right: self._motor.move("X",  steps)
+        elif key == Qt.Key_Up:    self._motor.move("Y", -steps)
+        elif key == Qt.Key_Down:  self._motor.move("Y",  steps)
+        else: super().keyPressEvent(event)
 
     # ── Profile helpers ───────────────────────────────────────────────────────
 
