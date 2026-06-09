@@ -112,7 +112,6 @@ class LabelingWindow(QMainWindow):
 
         self._analysis_on_btn.clicked.connect(lambda: self._set_analysis_mode(True))
         self._analysis_off_btn.clicked.connect(lambda: self._set_analysis_mode(False))
-        self._set_analysis_mode(True)   # start in analysis mode
         left.addLayout(mode_row)
 
         # ── Analysis adjusters (only active when analysis mode is ON) ─────────
@@ -153,6 +152,7 @@ class LabelingWindow(QMainWindow):
         self._adj_widgets = [
             self._expo_spin, self._gain_spin, self._negative_chk,
         ]
+        self._set_analysis_mode(True)   # start in analysis mode (must be after _adj_widgets)
 
         root.addLayout(left, stretch=3)
 
