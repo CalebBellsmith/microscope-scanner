@@ -295,6 +295,7 @@ class LabelingWindow(QMainWindow):
             cam._cam.put_AutoExpoEnable(False)
             cam._cam.put_ExpoTime(expo_us)
             cam._cam.put_ExpoAGain(gain)
+            cam._preview_expo_us = expo_us   # keep grab_fresh in sync
         except Exception:
             pass
         try:

@@ -22,7 +22,7 @@ from PyQt5.QtWidgets import (
     QComboBox, QLineEdit, QFileDialog, QMessageBox, QStatusBar,
     QRadioButton, QButtonGroup, QInputDialog, QTableWidget,
     QTableWidgetItem, QHeaderView, QSizePolicy, QFrame,
-    QScrollArea,
+    QScrollArea, QCheckBox,
 )
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject
 from PyQt5.QtGui import QImage, QPixmap, QColor, QFont
@@ -101,6 +101,7 @@ class MainWindow(QMainWindow):
         self._capture_pipeline  = None
         self._preview_timer = QTimer()
         self._preview_timer.timeout.connect(self._update_preview)
+        self._analysis_on = True
 
         self._set_dir: str | None = None
         # {leg_name: list_of_result_dicts}  — None means analysis still running
@@ -133,17 +134,51 @@ class MainWindow(QMainWindow):
         )
         left.addWidget(self._feed_label, stretch=1)
 
-        # Camera mode toggle — sits below the feed
-        self._cam_mode_btn = QPushButton("🔬  Analysis mode  (exposure: 1300ms · gain: 3x · negative: on)")
-        self._cam_mode_btn.setCheckable(True)
-        self._cam_mode_btn.setChecked(True)
-        self._cam_mode_btn.setFixedHeight(32)
-        self._cam_mode_btn.setStyleSheet(
-            "QPushButton:checked   { background:#1565C0; color:white; font-weight:bold; }"
-            "QPushButton:unchecked { background:#555;    color:#ccc;  font-weight:normal; }"
-        )
-        self._cam_mode_btn.clicked.connect(self._on_cam_mode_toggle)
-        left.addWidget(self._cam_mode_btn)
+        # Camera mode ON / OFF buttons
+        mode_row = QHBoxLayout()
+        mode_row.addWidget(QLabel("Camera mode:"))
+        self._analysis_on_btn  = QPushButton("🔬  Analysis ON")
+        self._analysis_off_btn = QPushButton("👁  Raw OFF")
+        for btn in (self._analysis_on_btn, self._analysis_off_btn):
+            btn.setFocusPolicy(Qt.NoFocus)
+            btn.setFixedHeight(32)
+            mode_row.addWidget(btn)
+        self._analysis_on_btn.clicked.connect(lambda: self._set_analysis_mode(True))
+        self._analysis_off_btn.clicked.connect(lambda: self._set_analysis_mode(False))
+        left.addLayout(mode_row)
+
+        # Exposure / gain / negative adjusters (enabled only in analysis mode)
+        adj_row = QHBoxLayout()
+        adj_row.addWidget(QLabel("Exposure (ms):"))
+        self._expo_spin = QSpinBox()
+        self._expo_spin.setFocusPolicy(Qt.NoFocus)
+        self._expo_spin.setRange(10, 5000)
+        self._expo_spin.setValue(1300)
+        self._expo_spin.setSuffix(" ms")
+        self._expo_spin.setFixedWidth(90)
+        self._expo_spin.valueChanged.connect(self._apply_analysis_settings)
+        adj_row.addWidget(self._expo_spin)
+        adj_row.addSpacing(12)
+        adj_row.addWidget(QLabel("Gain:"))
+        self._gain_spin = QSpinBox()
+        self._gain_spin.setFocusPolicy(Qt.NoFocus)
+        self._gain_spin.setRange(100, 3200)
+        self._gain_spin.setValue(300)
+        self._gain_spin.setSingleStep(50)
+        self._gain_spin.setFixedWidth(75)
+        self._gain_spin.valueChanged.connect(self._apply_analysis_settings)
+        adj_row.addWidget(self._gain_spin)
+        adj_row.addSpacing(12)
+        self._negative_chk = QCheckBox("Negative")
+        self._negative_chk.setFocusPolicy(Qt.NoFocus)
+        self._negative_chk.setChecked(True)
+        self._negative_chk.stateChanged.connect(self._apply_analysis_settings)
+        adj_row.addWidget(self._negative_chk)
+        adj_row.addStretch()
+        left.addLayout(adj_row)
+
+        self._adj_widgets = [self._expo_spin, self._gain_spin, self._negative_chk]
+        self._set_analysis_mode(True)
 
         root.addLayout(left, stretch=3)
 
@@ -364,23 +399,45 @@ class MainWindow(QMainWindow):
                          if f.endswith(".jpg") and "overlay" not in f]
                 self._upsert_leg_row(entry, len(jpegs), "—")
 
-    # ── Camera mode toggle ────────────────────────────────────────────────────
+    # ── Camera mode ───────────────────────────────────────────────────────────
 
-    def _on_cam_mode_toggle(self):
-        analysis = self._cam_mode_btn.isChecked()
-        if analysis:
-            self._cam_mode_btn.setText(
-                "🔬  Analysis mode  (exposure: 1300ms · gain: 3x · negative: on)"
-            )
+    def _set_analysis_mode(self, on: bool):
+        self._analysis_on = on
+        active   = "background:#1565C0; color:white; font-weight:bold; border-radius:4px;"
+        inactive = "background:#333;    color:#888; font-weight:normal; border-radius:4px;"
+        self._analysis_on_btn.setStyleSheet( active   if on else inactive)
+        self._analysis_off_btn.setStyleSheet(inactive if on else active)
+        for w in self._adj_widgets:
+            w.setEnabled(on)
+        if on:
+            if self._camera and hasattr(self._camera, "set_analysis_mode"):
+                self._camera.set_analysis_mode(True)
+            self._apply_analysis_settings()
         else:
-            self._cam_mode_btn.setText(
-                "📷  Raw mode  (auto exposure · gain: 1x · negative: off)"
-            )
-        if self._camera is not None:
-            try:
-                self._camera.set_analysis_mode(analysis)
-            except Exception as e:
-                self._statusbar.showMessage(f"Camera mode switch failed: {e}")
+            if self._camera and hasattr(self._camera, "set_analysis_mode"):
+                self._camera.set_analysis_mode(False)
+
+    def _apply_analysis_settings(self, *_):
+        if not self._analysis_on:
+            return
+        cam = self._camera
+        if cam is None or not hasattr(cam, "_cam") or cam._cam is None:
+            return
+        expo_us = self._expo_spin.value() * 1000
+        gain    = self._gain_spin.value()
+        neg     = self._negative_chk.isChecked()
+        try:
+            cam._cam.put_AutoExpoEnable(False)
+            cam._cam.put_ExpoTime(expo_us)
+            cam._cam.put_ExpoAGain(gain)
+            cam._preview_expo_us = expo_us   # keep grab_fresh in sync
+        except Exception:
+            pass
+        try:
+            cam._cam.put_Negative(neg)
+            cam._negative_fallback = False
+        except Exception:
+            cam._negative_fallback = neg
 
     # ── Profile helpers ───────────────────────────────────────────────────────
 

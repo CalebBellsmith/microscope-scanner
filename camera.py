@@ -32,6 +32,7 @@ class ToupTekCamera:
         self._analysis_mode    = True
         self._negative_fallback = False
         self._frame_count      = 0   # increments on every new frame from camera
+        self._preview_expo_us  = self.PREVIEW_EXPOSURE_US  # tracks current live exposure
         self._apply_settings(analysis=True)
 
         # One-shot neutral white balance — eliminates warm/orange tint
@@ -111,12 +112,12 @@ class ToupTekCamera:
         while time.time() < deadline:
             if self._frame_count > count_before:
                 frame = self._frame
-                self._cam.put_ExpoTime(self.PREVIEW_EXPOSURE_US)  # restore preview
+                self._cam.put_ExpoTime(self._preview_expo_us)  # restore to user's chosen preview exposure
                 return frame
             time.sleep(0.05)
 
         # Timed out — restore preview exposure and return whatever we have
-        self._cam.put_ExpoTime(self.PREVIEW_EXPOSURE_US)
+        self._cam.put_ExpoTime(self._preview_expo_us)
         return self._frame
 
     def close(self):
