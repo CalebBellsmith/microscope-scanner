@@ -144,9 +144,21 @@ def train(good_dir: str, bad_dir: str, progress_cb=None) -> float:
 
     # ── Save ──────────────────────────────────────────────────────────────────
 
-    # Save full model object so ml_inference.py can torch.load() it directly
+    # Save full model (.pt) as backup
     torch.save(model, MODEL_PATH)
     print(f"Saved: {MODEL_PATH}")
+
+    # Also export to ONNX — used by ml_inference.py to avoid torch DLL issues
+    onnx_path = MODEL_PATH.replace(".pt", ".onnx")
+    dummy = torch.zeros(1, 3, IMG_SIZE, IMG_SIZE)
+    model.eval()
+    torch.onnx.export(
+        model, dummy, onnx_path,
+        input_names=["input"], output_names=["output"],
+        dynamic_axes={"input": {0: "batch"}, "output": {0: "batch"}},
+        opset_version=17,
+    )
+    print(f"Saved: {onnx_path}")
     return acc
 
 
