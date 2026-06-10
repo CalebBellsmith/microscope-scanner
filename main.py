@@ -1,15 +1,33 @@
 """
-Automated Microscope Slide Scanner
+Automated Microscope Slide Scanner — main GUI (main.py)
+========================================================
 Double-click run.bat (Windows) or run.sh (Mac) to launch.
 
-Workflow:
-  1. App opens → user picks / creates set folder  (e.g. A-08/)
-  2. User selects profile + mode, clicks Go
-  3. 30 images captured → dialog: "Name this leg:" (free text, typically FR/FL/BR/BL)
-  4. Images saved to  set_folder / leg_name / 001.jpg … 030.jpg
-  5. Analysis starts in background; user swaps slide and clicks Go again
-  6. Repeat for each leg; re-run any leg to overwrite its results
-  7. Click Finish → waits for all running analyses → writes Excel
+WORKFLOW
+────────
+  1. App opens → user picks / creates a set folder (e.g. ~/Downloads/alchemy/abrasion/A-08/)
+  2. User selects a scan profile (rows × cols) and capture mode, clicks Connect
+  3. Click "Run Slide" → stage moves in a boustrophedon grid, capturing one image per stop
+  4. After capture: "Name this leg?" dialog (FR / FL / BR / BL, or free text)
+  5. Images saved to  set_folder/leg_name/001.jpg … 030.jpg
+  6. If "Capture + Analyze" mode: analysis pipeline starts immediately in background
+  7. User swaps slide and clicks "Run Slide" again for each leg
+  8. Click "Finish & Export Excel" → waits for all analyses → writes workbook
+
+KEY CLASSES & MODULES USED
+───────────────────────────
+  camera.py              → open_camera()         live preview + grab_fresh for saves
+  motor.py               → MotorController       serial commands to ESP32 stepper/servo
+  ml_inference.py        → QualityClassifier     good/bad classifier via inference_worker subprocess
+  capture_pipeline.py    → CapturePipeline       background thread: grid scan + quality nudge
+  analysis_pipeline.py   → AnalysisPipeline      background thread: scratch detection per image
+                           write_new_format       single-workbook Excel export
+                           write_legacy_format    3-file MATLAB-compatible export
+
+THREAD SAFETY
+─────────────
+  All background callbacks post via pyqtSignal → received on the GUI thread.
+  Direct Qt widget updates from other threads would cause crashes.
 """
 import sys
 import os
@@ -36,8 +54,11 @@ from analysis_pipeline import (
     LEGS, EXPECTED_IMAGES,
 )
 
+# Default root for the file-chooser dialog — user can navigate away from here
 DEFAULT_BASE = os.path.join(os.path.expanduser("~"), "Downloads", "alchemy", "abrasion")
 
+# Built-in scan profiles: (display label, rows, cols)
+# None means "Custom" — user types their own rows/cols values
 PROFILES = [
     ("Standard  3 × 10  (30 images)", 3, 10),
     ("Small     2 × 5   (10 images)", 2, 5),
@@ -45,37 +66,42 @@ PROFILES = [
     ("Large     5 × 12  (60 images)", 5, 12),
     ("Custom",                        None, None),
 ]
-_CUSTOM_IDX = len(PROFILES) - 1
+_CUSTOM_IDX = len(PROFILES) - 1   # index of the "Custom" entry in the combo box
 
-MODE_CAPTURE_ONLY    = 0
-MODE_ANALYZE_ONLY    = 1
-MODE_CAPTURE_ANALYZE = 2
+# Integer IDs for the three operating modes (used by QButtonGroup)
+MODE_CAPTURE_ONLY    = 0   # capture images but skip analysis
+MODE_ANALYZE_ONLY    = 1   # run analysis on an existing folder
+MODE_CAPTURE_ANALYZE = 2   # capture then analyze automatically
 
-# Leg table column indices
-COL_LEG    = 0
-COL_IMAGES = 1
-COL_STATUS = 2
-COL_RERUN  = 3
+# Column indices for the leg status table (QTableWidget)
+COL_LEG    = 0   # leg name (FR / FL / etc.)
+COL_IMAGES = 1   # image count
+COL_STATUS = 2   # status text
+COL_RERUN  = 3   # Re-run button widget
 
+# Colours shown in the status column to make state immediately visible
 STATUS_COLORS = {
-    "—":         QColor("#888888"),
-    "Capturing": QColor("#1565C0"),
-    "Analyzing": QColor("#E65100"),
-    "Done":      QColor("#2E7D32"),
-    "Error":     QColor("#C62828"),
+    "—":         QColor("#888888"),   # not started
+    "Capturing": QColor("#1565C0"),   # blue — currently capturing
+    "Analyzing": QColor("#E65100"),   # orange — analysis in progress
+    "Done":      QColor("#2E7D32"),   # green — finished
+    "Error":     QColor("#C62828"),   # red — something went wrong
 }
 
 
-# ── Signals ───────────────────────────────────────────────────────────────────
+# ── Cross-thread signals ──────────────────────────────────────────────────────
+# PyQt5 requires all widget updates to happen on the GUI (main) thread.
+# Background threads (camera, capture, analysis) emit these signals to safely
+# hand data back to the GUI — Qt queues them and delivers on the right thread.
 
 class Signals(QObject):
-    frame_ready         = pyqtSignal(np.ndarray)
-    capture_progress    = pyqtSignal(int, int)
-    analysis_progress   = pyqtSignal(int, int)
-    capture_done        = pyqtSignal()
-    leg_analysis_done   = pyqtSignal(str, list)   # (leg_name, results)
-    error               = pyqtSignal(str)
-    status_msg          = pyqtSignal(str)
+    frame_ready         = pyqtSignal(np.ndarray)      # new camera frame to display
+    capture_progress    = pyqtSignal(int, int)         # (images_done, images_total)
+    analysis_progress   = pyqtSignal(int, int)         # (images_analysed, images_total)
+    capture_done        = pyqtSignal()                  # grid scan finished
+    leg_analysis_done   = pyqtSignal(str, list)        # (leg_name, result_list)
+    error               = pyqtSignal(str)               # error message to show in a dialog
+    status_msg          = pyqtSignal(str)               # status bar text update
 
 
 # ── Main Window ───────────────────────────────────────────────────────────────
@@ -95,19 +121,20 @@ class MainWindow(QMainWindow):
         self._sig.error.connect(self._on_error)
         self._sig.status_msg.connect(lambda m: self._statusbar.showMessage(m))
 
-        self._camera  = None
-        self._motor   = None
-        self._clf     = QualityClassifier()
-        self._capture_pipeline  = None
-        self._preview_timer = QTimer()
+        self._camera  = None               # camera object (ToupTekCamera / OpenCVCamera)
+        self._motor   = None               # MotorController for ESP32
+        self._clf     = QualityClassifier()   # ML quality classifier (uses inference_worker subprocess)
+        self._capture_pipeline  = None     # currently running CapturePipeline (or None)
+        self._preview_timer = QTimer()     # fires every ~66 ms to refresh the live feed
         self._preview_timer.timeout.connect(self._update_preview)
-        self._analysis_on = True
+        self._analysis_on = True           # whether the camera is in analysis mode
 
-        self._set_dir: str | None = None
-        # {leg_name: list_of_result_dicts}  — None means analysis still running
+        self._set_dir: str | None = None   # root folder for this scan set
+        # Accumulates completed leg results: {leg_name: [result_dicts] | None}
+        # None = analysis still running; list = finished
         self._leg_results: dict = {}
-        self._analyzing_legs: set = set()
-        self._finish_waiting = False
+        self._analyzing_legs: set = set()  # legs whose analysis threads are still running
+        self._finish_waiting = False        # True if user clicked Finish while analysis running
         self._pending_leg_name: str | None = None   # leg being captured right now
 
         self._build_ui()

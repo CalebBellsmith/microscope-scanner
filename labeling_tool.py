@@ -1,13 +1,38 @@
 """
-Training data labeler for the quality classifier.
+Training data labeler for the quality classifier (labeling_tool.py)
+====================================================================
+Run via train.bat or:  py -3.12 labeling_tool.py
 
-Keyboard shortcuts
+PURPOSE
+───────
+Helps you build the training dataset for the ML quality classifier
+(model.pt / model.onnx used by capture_pipeline to decide whether to nudge).
+
+The camera live-feeds to the screen.  Point the microscope at a slide,
+press Space to freeze a frame, then label it as GOOD or BAD.
+Saved images land in:
+  training_data/good/  — clean slide area (horizontal scratches are fine)
+  training_data/bad/   — dust, debris, watermarks, non-horizontal artefacts
+
+Once you have ≥ 10 of each class, click "Train model.pt" to start training.
+Training runs as a subprocess (train.py) to avoid Windows DLL issues with torch.
+
+KEYBOARD SHORTCUTS
 ──────────────────
-  Space  — freeze/capture current frame
-  D      — label frozen frame as GOOD  → training_data/good/
-  A      — label frozen frame as BAD   → training_data/bad/
-  W      — show model prediction + defect centroid overlay
-  S      — undo last label (deletes the saved file)
+  Space   — freeze / capture the current frame (switches to FROZEN mode)
+  D       — save frozen frame as GOOD  → training_data/good/<n>.jpg
+  A       — save frozen frame as BAD   → training_data/bad/<n>.jpg
+  W       — run model prediction on frozen frame + show defect centroid overlay
+  S       — undo: delete the last saved file
+  Enter   — dismiss prediction overlay (return to plain frozen frame)
+
+CAMERA MODE
+───────────
+Analysis mode ON  — fixed exposure/gain/negative; greyscale output
+                    (matches what the full scanner captures)
+Analysis mode OFF — auto-exposure; full colour raw view for reference
+
+The camera mode is mirrored in main.py so both GUIs show consistent images.
 """
 import sys
 import os
@@ -25,21 +50,24 @@ from PyQt5.QtGui import QImage, QPixmap, QFont
 from camera import open_camera
 from ml_inference import QualityClassifier
 
-_HERE        = os.path.dirname(os.path.abspath(__file__))
-TRAINING_DIR = os.path.join(_HERE, "training_data")
-GOOD_DIR     = os.path.join(TRAINING_DIR, "good")
-BAD_DIR      = os.path.join(TRAINING_DIR, "bad")
+_HERE        = os.path.dirname(os.path.abspath(__file__))   # folder this script lives in
+TRAINING_DIR = os.path.join(_HERE, "training_data")          # root for all label images
+GOOD_DIR     = os.path.join(TRAINING_DIR, "good")            # clean/acceptable frames
+BAD_DIR      = os.path.join(TRAINING_DIR, "bad")             # dusty/defective frames
 
 
-# ── Signals ───────────────────────────────────────────────────────────────────
+# ── Cross-thread signals ──────────────────────────────────────────────────────
+# Background threads (camera, inference, training) post results through these
+# signals so Qt delivers them safely on the GUI thread.
 
 class Signals(QObject):
-    frame_ready    = pyqtSignal(np.ndarray)
-    # cx_frac, cy_frac in 0-1 coords; -1 means no centroid found
+    frame_ready    = pyqtSignal(np.ndarray)                        # new camera frame to display
+    # Prediction result: (frame, cx_frac, cy_frac, label, confidence)
+    # cx_frac / cy_frac are 0–1 image coordinates; -1 means no defect found
     overlay_ready  = pyqtSignal(np.ndarray, float, float, str, float)
-    train_progress = pyqtSignal(int, int, float)   # epoch, total, loss
-    train_done     = pyqtSignal(float)             # val accuracy
-    train_error    = pyqtSignal(str)
+    train_progress = pyqtSignal(int, int, float)   # (current_epoch, total_epochs, avg_loss)
+    train_done     = pyqtSignal(float)             # validation accuracy 0.0–1.0
+    train_error    = pyqtSignal(str)               # error message if training fails
 
 
 # ── Main window ───────────────────────────────────────────────────────────────
@@ -59,11 +87,11 @@ class LabelingWindow(QMainWindow):
             lambda e: self._status.showMessage(f"Training error: {e}")
         )
 
-        self._camera        = None
-        self._clf           = QualityClassifier()
-        self._frozen_frame  = None   # None = live mode
-        self._last_saved    = None   # path of last saved file (for undo)
-        self._analysis_on   = True   # tracks current mode for _apply_analysis_settings
+        self._camera        = None               # ToupTekCamera / OpenCVCamera / MSSCamera
+        self._clf           = QualityClassifier()  # wraps inference_worker subprocess
+        self._frozen_frame  = None   # numpy frame; None = live preview mode, set = frozen
+        self._last_saved    = None   # path of most recently saved file (used by undo)
+        self._analysis_on   = True   # whether analysis exposure/gain settings are active
 
         self._preview_timer = QTimer()
         self._preview_timer.timeout.connect(self._update_preview)
