@@ -1,123 +1,166 @@
 """
 ML quality classifier — binary: good (1) vs bad (0).
 
-Inference priority:
-  1. model.onnx via onnxruntime  (no CUDA DLL issues, fast)
-  2. model.pt  via torch         (fallback if onnx missing)
-  3. Laplacian variance heuristic (fallback if no model at all)
+HOW IT WORKS
+────────────
+Inference runs inside a persistent subprocess (inference_worker.py) so
+that torch / onnxruntime DLLs are never loaded in the PyQt5 GUI thread,
+which causes WinError 1114 on some Windows machines.
 
-"good"  = clean slide area suitable for scratch measurement
-"bad"   = dust, debris, watermarks, or non-horizontal lines
+On the first call to predict(), this module spawns inference_worker.py
+and keeps it alive.  Each prediction sends the image over stdin and
+reads the result from stdout.  The worker is shut down on program exit.
+
+"good"  = clean slide area (horizontal scratches are fine — that's what
+          the analysis pipeline counts)
+"bad"   = dust, debris, watermarks, or non-horizontal artefacts
 """
+
 import os
+import sys
+import base64
+import atexit
+import subprocess
+import threading
+
 import numpy as np
-from PIL import Image
 
-# Prevent CUDA DLL crash if torch is used as fallback
-os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
-
+# ── Paths ─────────────────────────────────────────────────────────────────────
 _HERE      = os.path.dirname(os.path.abspath(__file__))
 ONNX_PATH  = os.path.join(_HERE, "model.onnx")
 MODEL_PATH = os.path.join(_HERE, "model.pt")
-_IMG_SIZE  = 224
-_SHARPNESS_THRESHOLD = 80.0
+_WORKER    = os.path.join(_HERE, "inference_worker.py")
 
 
-def _laplacian_variance(rgb_array):
-    import cv2
-    gray = cv2.cvtColor(rgb_array, cv2.COLOR_RGB2GRAY)
-    return cv2.Laplacian(gray, cv2.CV_64F).var()
+# ── Worker process management ─────────────────────────────────────────────────
+
+_worker_proc  = None   # the subprocess.Popen object
+_worker_lock  = threading.Lock()   # ensures only one request at a time
 
 
-def _preprocess(rgb_array) -> np.ndarray:
-    """Resize, normalise, return float32 NCHW array ready for inference."""
-    img = Image.fromarray(rgb_array).resize((_IMG_SIZE, _IMG_SIZE))
-    arr = np.array(img, dtype=np.float32) / 255.0
-    mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-    std  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
-    arr  = (arr - mean) / std
-    return arr.transpose(2, 0, 1)[np.newaxis]   # NCHW
+def _get_worker() -> subprocess.Popen:
+    """
+    Return the inference worker subprocess, spawning it if needed.
+    The worker loads the model once and then stays alive.
+    """
+    global _worker_proc
+    with _worker_lock:
+        # Check if worker is alive (returncode is None while running)
+        if _worker_proc is not None and _worker_proc.poll() is None:
+            return _worker_proc
 
+        # Spawn a new worker process using the same Python interpreter
+        _worker_proc = subprocess.Popen(
+            [sys.executable, _WORKER],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,   # line-buffered so responses arrive immediately
+        )
+
+        # Wait for the worker to print "ready" (model loaded)
+        while True:
+            line = _worker_proc.stdout.readline().strip()
+            if line == "ready":
+                break
+            if line.startswith("loaded"):
+                # e.g. "loaded onnx" — informational, keep waiting for "ready"
+                print(f"[inference_worker] {line}", flush=True)
+            elif line.startswith("onnx_failed") or line.startswith("pt_failed"):
+                print(f"[inference_worker] {line}", flush=True)
+            elif not line:
+                # Worker died before printing "ready"
+                raise RuntimeError("inference_worker failed to start")
+
+        return _worker_proc
+
+
+def _shutdown_worker():
+    """Send quit to worker on program exit so it closes cleanly."""
+    global _worker_proc
+    if _worker_proc is not None and _worker_proc.poll() is None:
+        try:
+            _worker_proc.stdin.write("quit\n")
+            _worker_proc.stdin.flush()
+            _worker_proc.wait(timeout=3)
+        except Exception:
+            _worker_proc.kill()
+
+
+atexit.register(_shutdown_worker)   # called automatically when Python exits
+
+
+# ── Public classifier class ───────────────────────────────────────────────────
 
 class QualityClassifier:
-    def __init__(self):
-        self._session      = None   # onnxruntime InferenceSession
-        self._torch_model  = None   # torch model (fallback)
-        self._transform    = None
-        self._use_heuristic = True
-        self.load()
+    """
+    Wraps the inference worker subprocess.
+    Call predict(rgb_array) to get (label, confidence).
+    The worker is started lazily on the first prediction.
+    """
 
-    def load(self):
-        # ── Try onnxruntime first ─────────────────────────────────────────────
-        if os.path.exists(ONNX_PATH):
-            try:
-                import onnxruntime as ort
-                self._session = ort.InferenceSession(
-                    ONNX_PATH,
-                    providers=["CPUExecutionProvider"],
-                )
-                self._use_heuristic = False
-                print("ML model loaded from model.onnx (onnxruntime)")
-                return
-            except Exception as e:
-                print(f"onnxruntime load failed ({e})")
+    def predict(self, rgb_array: np.ndarray) -> tuple[str, float]:
+        """
+        Classify a frame.
+        rgb_array : numpy uint8 array shaped (H, W, 3)
+        Returns   : ("good"|"bad", confidence 0.0–1.0)
+        """
+        try:
+            worker = _get_worker()
 
-        # ── Try torch fallback ────────────────────────────────────────────────
-        if os.path.exists(MODEL_PATH):
-            try:
-                import torch
-                import torchvision.transforms as T
-                self._torch_model = torch.load(
-                    MODEL_PATH, map_location="cpu", weights_only=False
-                )
-                self._torch_model.eval()
-                self._transform = T.Compose([
-                    T.Resize((_IMG_SIZE, _IMG_SIZE)),
-                    T.ToTensor(),
-                    T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-                ])
-                self._use_heuristic = False
-                print("ML model loaded from model.pt (torch fallback)")
-                return
-            except Exception as e:
-                print(f"model.pt load failed ({e})")
+            # Encode the image as base64 so it fits on one stdin line
+            h, w, c = rgb_array.shape
+            b64     = base64.b64encode(rgb_array.tobytes()).decode()
+            line    = f"{h} {w} {c} {b64}\n"
 
-        print("No model found — using sharpness heuristic until model is trained")
+            # Send image → worker, read back prediction (thread-safe)
+            with _worker_lock:
+                worker.stdin.write(line)
+                worker.stdin.flush()
+                response = worker.stdout.readline().strip()
 
-    def predict(self, rgb_array) -> tuple[str, float]:
-        """Return ("good"|"bad", confidence 0–1)."""
-        if self._use_heuristic:
-            score = _laplacian_variance(rgb_array)
-            if score >= _SHARPNESS_THRESHOLD:
-                return "good", min(score / 200.0, 1.0)
-            else:
-                return "bad", 1.0 - score / _SHARPNESS_THRESHOLD
+            if response.startswith("error"):
+                raise RuntimeError(response)
 
-        # ── onnxruntime inference ─────────────────────────────────────────────
-        if self._session is not None:
-            inp   = _preprocess(rgb_array)
-            logits = self._session.run(None, {"input": inp})[0][0]
-            # softmax
-            e     = np.exp(logits - logits.max())
-            probs = e / e.sum()
-            good_conf = float(probs[1])
-            if good_conf >= 0.5:
-                return "good", good_conf
-            else:
-                return "bad", float(probs[0])
+            # Response format: "good 0.923456" or "bad 0.731200"
+            label, conf_str = response.split()
+            return label, float(conf_str)
 
-        # ── torch inference ───────────────────────────────────────────────────
-        import torch
-        img    = Image.fromarray(rgb_array)
-        tensor = self._transform(img).unsqueeze(0)
-        with torch.no_grad():
-            probs = torch.softmax(self._torch_model(tensor), dim=1)[0]
-        good_conf = float(probs[1])
-        if good_conf >= 0.5:
-            return "good", good_conf
-        else:
-            return "bad", float(probs[0])
+        except Exception as e:
+            # If the worker crashes, fall back to a simple heuristic
+            print(f"[ml_inference] predict failed ({e}), using heuristic")
+            return _heuristic(rgb_array)
 
-    def is_good(self, rgb_array) -> bool:
+    def is_good(self, rgb_array: np.ndarray) -> bool:
+        """Convenience wrapper — returns True if label == 'good'."""
         label, _ = self.predict(rgb_array)
         return label == "good"
+
+    def load(self):
+        """
+        Pre-warm the worker so the first real prediction has no startup delay.
+        Called by main.py after the camera connects.
+        """
+        try:
+            _get_worker()
+            print("[ml_inference] inference worker ready")
+        except Exception as e:
+            print(f"[ml_inference] worker pre-warm failed: {e}")
+
+
+# ── Heuristic fallback (no model) ─────────────────────────────────────────────
+
+def _heuristic(rgb_array: np.ndarray) -> tuple[str, float]:
+    """
+    Simple Laplacian-variance sharpness check used when no model is
+    available.  A sharp image scores high → "good"; blurry → "bad".
+    Note: does NOT detect dust specifically — just a rough proxy.
+    """
+    import cv2
+    gray  = cv2.cvtColor(rgb_array, cv2.COLOR_RGB2GRAY)
+    score = cv2.Laplacian(gray, cv2.CV_64F).var()
+    if score >= 80.0:
+        return "good", min(score / 200.0, 1.0)
+    else:
+        return "bad", 1.0 - score / 80.0
