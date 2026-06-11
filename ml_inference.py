@@ -51,9 +51,9 @@ _HORIZONTAL_COVERAGE_GOOD = 0.40
 # Blob check: a dark contour is a "blob" (defect) if it spans less than this
 # fraction of the image width.  A real scratch always runs across many columns;
 # a dust spot is localised and narrow.
-_BLOB_MAX_COL_SPAN = 0.25   # must span < 25% of frame width to be a blob candidate
-_BLOB_MAX_ASPECT   = 8.0    # also must not be extremely elongated (which would be a scratch fragment)
-_BLOB_MIN_AREA     = 80     # ignore tiny noise below this pixel count
+_BLOB_MAX_COL_SPAN = 0.15   # must span < 15% of frame width to be a blob candidate
+_BLOB_MAX_ASPECT   = 6.0    # also must not be extremely elongated (which would be a scratch fragment)
+_BLOB_MIN_AREA     = 250    # ignore small contours — thick line edge-fragments are typically smaller
 
 def _rule_predict(rgb_array: np.ndarray) -> tuple[str, float]:
     """
@@ -137,7 +137,7 @@ def _rule_predict(rgb_array: np.ndarray) -> tuple[str, float]:
 
     # Good: neither check triggered
     good_conf = round(min(horizontal_frac, 1.0 - worst_blob_frac / 0.0005), 4)
-    return "good", max(good_conf, 0.4)
+    return "good", max(good_conf, 0.6)
 
 
 # ── ML worker process management ──────────────────────────────────────────────
