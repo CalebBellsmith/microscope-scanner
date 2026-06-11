@@ -42,7 +42,7 @@ import numpy as np
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QPushButton,
     QVBoxLayout, QHBoxLayout, QGroupBox, QProgressBar, QStatusBar,
-    QSpinBox, QCheckBox, QComboBox,
+    QSpinBox, QCheckBox, QComboBox, QSlider,
 )
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject
 from PyQt5.QtGui import QImage, QPixmap, QFont
@@ -250,18 +250,43 @@ class LabelingWindow(QMainWindow):
 
         self._clf_combo = QComboBox()
         self._clf_combo.setFocusPolicy(Qt.NoFocus)
-        self._clf_combo.addItem("Hybrid  (rules + ML)",  "hybrid")
-        self._clf_combo.addItem("Rules only  (shape)",   "rules")
+        self._clf_combo.addItem("Hybrid  (rules + ML)",     "hybrid")
+        self._clf_combo.addItem("Rules only  (shape)",      "rules")
         self._clf_combo.addItem("ML only  (trained model)", "ml")
         self._clf_combo.currentIndexChanged.connect(self._on_clf_mode_changed)
-
         clf_lay.addWidget(self._clf_combo)
 
-        # Brief explanation of each mode shown as a hint label
+        # Brief explanation of the selected mode
         self._clf_hint = QLabel("")
         self._clf_hint.setWordWrap(True)
         self._clf_hint.setStyleSheet("color:#888; font-size:10px;")
         clf_lay.addWidget(self._clf_hint)
+
+        # Quality threshold — same slider as in main.py scan profile.
+        # Controls at what confidence the W-key prediction reads ACCEPT vs NUDGE.
+        # Lower = more lenient (accept borderline frames), higher = stricter.
+        clf_lay.addWidget(QLabel("Threshold (accept if confidence ≥):"))
+        thresh_row = QHBoxLayout()
+        self._thresh_lo_lbl = QLabel("Lenient")
+        self._thresh_lo_lbl.setStyleSheet("color:#888; font-size:10px;")
+        self._thresh_slider = QSlider(Qt.Horizontal)
+        self._thresh_slider.setFocusPolicy(Qt.NoFocus)
+        self._thresh_slider.setRange(1, 9)   # maps to 0.1 – 0.9
+        self._thresh_slider.setValue(5)       # default 0.5
+        self._thresh_slider.setTickPosition(QSlider.TicksBelow)
+        self._thresh_slider.setTickInterval(1)
+        self._thresh_val_lbl = QLabel("0.5")
+        self._thresh_val_lbl.setFixedWidth(28)
+        self._thresh_slider.valueChanged.connect(
+            lambda v: self._thresh_val_lbl.setText(f"{v/10:.1f}")
+        )
+        self._thresh_hi_lbl = QLabel("Strict")
+        self._thresh_hi_lbl.setStyleSheet("color:#888; font-size:10px;")
+        thresh_row.addWidget(self._thresh_lo_lbl)
+        thresh_row.addWidget(self._thresh_slider, stretch=1)
+        thresh_row.addWidget(self._thresh_hi_lbl)
+        thresh_row.addWidget(self._thresh_val_lbl)
+        clf_lay.addLayout(thresh_row)
 
         right.addWidget(clf_box)
         self._on_clf_mode_changed(0)   # populate hint for default selection
@@ -403,11 +428,20 @@ class LabelingWindow(QMainWindow):
         )
         self._show_frame(display)
 
-        color_hex = "#2E7D32" if label == "good" else "#C62828"
+        threshold  = self._thresh_slider.value() / 10.0
+        # A "good" frame is accepted if its confidence meets the threshold;
+        # a "bad" frame is always nudged regardless of confidence.
+        accepted   = (label == "good") and (conf >= threshold)
+        verdict    = "✓ ACCEPT" if accepted else "✗ NUDGE"
+        color_hex  = "#2E7D32" if accepted else "#C62828"
+
         direction = _direction_hint(cx_frac, cy_frac) if cx_frac >= 0 else ""
-        html = f"Model: <b>{label.upper()}</b> ({conf*100:.0f}%)"
-        if direction:
-            html += f"<br><small>Defect detected → nudge <b>{direction}</b></small>"
+        html = (f"<b>{label.upper()}</b>  {conf*100:.0f}%"
+                f"  →  <b>{verdict}</b>"
+                f"<br><small>threshold {threshold:.1f}"
+                f"  |  mode: {self._clf.mode}</small>")
+        if direction and not accepted:
+            html += f"<br><small>nudge direction: <b>{direction}</b></small>"
         self._pred_lbl.setText(html)
         self._pred_lbl.setStyleSheet(f"color:{color_hex}; font-size:13px;")
 

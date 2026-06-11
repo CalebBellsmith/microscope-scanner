@@ -45,42 +45,31 @@ _WORKER    = os.path.join(_HERE, "inference_worker.py")
 
 # ── Rule-based classifier ─────────────────────────────────────────────────────
 
-# Tuning constants for the rule-based classifier.
-# A "bad" feature covering this fraction of the image = full confidence bad.
-# Two tiers based on how circular the shape is:
-#   OBVIOUS blobs (roundness > 0.45, clearly not a line) — flagged at just 0.05% of image
-#   BORDERLINE shapes (roundness 0.20–0.45)             — flagged at 0.20% of image
-_BAD_AREA_OBVIOUS     = 0.0005   # 0.05% — a small but clear dust spot
-_BAD_AREA_BORDERLINE  = 0.002    # 0.20% — needs to be larger before we care
+# Minimum contour area to consider — filters single-pixel noise and JPEG
+# compression artefacts.  Anything above this that isn't a horizontal line
+# is flagged immediately, regardless of size.
+_MIN_NOISE_AREA = 25   # px²
 
-# Roundness boundary values (matches analysis_pipeline THRESHOLD = 0.2)
-_ROUNDNESS_SCRATCH    = 0.20     # below this + wider than tall = horizontal scratch
-_ROUNDNESS_OBVIOUS    = 0.45     # above this = clearly a circle/blob, not a line
-
-# Minimum contour area to consider (filters single-pixel noise)
-_MIN_AREA_OBVIOUS     = 30       # px² — even a small obvious blob matters
-_MIN_AREA_BORDERLINE  = 100      # px² — borderline shapes need to be larger
+# Once the total area of non-scratch features exceeds this fraction of the
+# image the confidence saturates at 1.0.  Set very low so even a small blob
+# scores high confidence.
+_BAD_AREA_SATURATE = 0.0003   # 0.03% of image (~25px on a 1024×822 frame)
 
 def _rule_predict(rgb_array: np.ndarray) -> tuple[str, float]:
     """
-    Shape-based quality check — no ML model needed.
+    Shape-based quality check — maximum sensitivity mode.
 
-    Two-tier detection:
-      TIER 1 — obvious blobs (roundness > 0.45, clearly circular):
-        Flagged at very small sizes (≥ 30px²).  A small round dust spot
-        is almost certainly not a scratch and should trigger a nudge even
-        if it is tiny.
+    Rule: ANYTHING that is not a horizontal line is flagged as bad.
+    A feature is a horizontal line if and only if:
+        roundness < 0.20   (elongated, not circular — matches analysis_pipeline.THRESHOLD)
+        AND aspect > 1.1   (wider than tall)
+    Every other dark feature — circles, blobs, spots, vertical lines,
+    diagonal smears — is immediately treated as a defect regardless of size,
+    as long as it is above the noise floor (_MIN_NOISE_AREA px²).
 
-      TIER 2 — borderline shapes (roundness 0.20–0.45):
-        Could be a short scratch fragment, a watermark edge, or a small
-        clump of debris.  Only flagged if large enough (≥ 100px²) to be
-        worth moving away from.
-
-      PASS — horizontal scratches (roundness < 0.20 AND wider than tall):
-        These are exactly what analysis_pipeline counts — leave them alone.
-
-    Roundness thresholds mirror analysis_pipeline.THRESHOLD (0.20) so the
-    two systems agree on what counts as a scratch.
+    Confidence is proportional to the total area of non-scratch features
+    relative to _BAD_AREA_SATURATE.  Even a single small dust spot will
+    saturate to near-1.0 confidence bad.
     """
     import cv2
 
@@ -88,22 +77,19 @@ def _rule_predict(rgb_array: np.ndarray) -> tuple[str, float]:
     mean_v = float(gray.mean())
     std_v  = float(gray.std())
 
-    # 1.5σ below mean catches mid-grey dust that a 2σ threshold might miss
+    # 1.5σ below mean catches mid-grey dust that a stricter threshold misses
     thr = max(0, int(mean_v - 1.5 * std_v))
     _, mask = cv2.threshold(gray, thr, 255, cv2.THRESH_BINARY_INV)
 
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-    img_pixels = rgb_array.shape[0] * rgb_array.shape[1]
-
-    # Track worst offender separately for each tier so they scale independently
-    worst_obvious_frac     = 0.0
-    worst_borderline_frac  = 0.0
+    img_pixels    = rgb_array.shape[0] * rgb_array.shape[1]
+    total_bad_frac = 0.0   # accumulated non-scratch area as fraction of image
 
     for cnt in contours:
         area = cv2.contourArea(cnt)
-        if area < _MIN_AREA_OBVIOUS:
-            continue   # pure noise — ignore
+        if area < _MIN_NOISE_AREA:
+            continue   # below noise floor — ignore
 
         perimeter = cv2.arcLength(cnt, True)
         if perimeter < 1:
@@ -113,28 +99,19 @@ def _rule_predict(rgb_array: np.ndarray) -> tuple[str, float]:
         _, _, w, h = cv2.boundingRect(cnt)
         aspect    = w / max(h, 1)   # > 1 = wider than tall
 
-        # ── Horizontal scratch: skip entirely ─────────────────────────────
-        if roundness < _ROUNDNESS_SCRATCH and aspect > 1.1:
+        # Horizontal scratch: pass silently
+        if roundness < 0.20 and aspect > 1.1:
             continue
 
-        frac = area / img_pixels
+        # Anything else: accumulate its area as a bad contribution
+        total_bad_frac += area / img_pixels
 
-        if roundness >= _ROUNDNESS_OBVIOUS:
-            # Tier 1: clearly circular — flag even if small
-            worst_obvious_frac = max(worst_obvious_frac, frac)
-        elif area >= _MIN_AREA_BORDERLINE:
-            # Tier 2: borderline shape — only count if large enough
-            worst_borderline_frac = max(worst_borderline_frac, frac)
+    bad_conf = min(total_bad_frac / _BAD_AREA_SATURATE, 1.0)
 
-    # Map each tier to a 0–1 confidence and take the maximum
-    obvious_conf    = min(worst_obvious_frac    / _BAD_AREA_OBVIOUS,    1.0)
-    borderline_conf = min(worst_borderline_frac / _BAD_AREA_BORDERLINE, 1.0)
-    bad_conf        = max(obvious_conf, borderline_conf)
-
-    if bad_conf < 0.35:
+    if bad_conf < 0.25:
         return "good", round(1.0 - bad_conf, 4)
     else:
-        return "bad", round(bad_conf, 4)
+        return "bad", round(min(bad_conf + 0.3, 1.0), 4)   # boost so bad reads clearly bad
 
 
 # ── ML worker process management ──────────────────────────────────────────────
