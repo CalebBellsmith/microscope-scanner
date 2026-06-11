@@ -4,9 +4,9 @@ ML quality classifier — binary: good (1) vs bad (0).
 THREE MODES
 ───────────
 "rules"   — Pure shape analysis (no ML required).
-            Treats a frame as good if every dark feature is a horizontal
-            scratch (low roundness, wider than tall).  Dust spots, blobs,
-            and vertical lines fail the shape test → bad.
+            Three checks: row projection, blob contour detection, and FFT
+            residual.  Passes frames where all dark features are horizontal
+            (regardless of thickness).  Flags dust, blobs, watermarks.
             Fast, interpretable, works immediately with no training data.
 
 "ml"      — Pure ML (MobileNetV3-Small fine-tuned on your labeled images).
@@ -55,27 +55,80 @@ _BLOB_MAX_COL_SPAN = 0.15   # must span < 15% of frame width to be a blob candid
 _BLOB_MAX_ASPECT   = 6.0    # also must not be extremely elongated (which would be a scratch fragment)
 _BLOB_MIN_AREA     = 250    # ignore small contours — thick line edge-fragments are typically smaller
 
+# FFT residual check: after zeroing near-zero horizontal frequencies, the
+# fraction of the remaining std vs the original std.
+# Near 0  → frame is dominated by horizontal content (lines, scratches) → good
+# Near 1  → frame has significant non-horizontal energy (blobs, watermarks) → bad
+_FFT_H_BAND_FRAC  = 0.05    # fraction of the kx frequency range treated as "horizontal"
+_FFT_RESIDUAL_BAD = 0.45    # residual/original ratio above which is flagged as bad
+_FFT_RESIDUAL_CERTAIN = 0.65  # standalone bad flag without needing blob confirmation
+
+
+def _fft_residual_ratio(gray: np.ndarray) -> float:
+    """
+    2D real-FFT analysis: strip horizontal frequency content (low kx), return
+    residual_std / original_std.
+
+    Horizontal scratches (regardless of thickness) concentrate their energy at
+    kx ≈ 0.  After zeroing that band the residual is near zero.  Dust blobs and
+    other localised defects spread energy across all kx values so their residual
+    survives the stripping and the ratio stays high.
+
+    This is the key discriminator: it is thickness-agnostic because even a thick
+    horizontal line produces energy only at low kx.
+    """
+    std = float(gray.std())
+    if std < 1.0:
+        return 0.0     # nearly uniform image — no structure to analyse
+
+    gray_f = gray.astype(np.float32)
+    F      = np.fft.rfft2(gray_f)          # shape (H, W//2+1)
+    _, W_f = F.shape
+
+    # Zero out near-zero kx columns (horizontal frequency band to remove)
+    band       = max(2, int(W_f * _FFT_H_BAND_FRAC))
+    F_residual = F.copy()
+    F_residual[:, :band] = 0
+
+    residual = np.fft.irfft2(F_residual, s=gray.shape)
+    return float(residual.std() / (std + 1e-6))
+
+
 def _rule_predict(rgb_array: np.ndarray) -> tuple[str, float]:
     """
-    Two-check quality gate:
+    Three-check quality gate:
 
     CHECK 1 — Row projection (catches frames with no horizontal features at all):
       Pixels that deviate significantly from the mean (in either direction) are
       "feature pixels".  If ≥ 40% of them fall on high-density rows the frame
-      is considered horizontally structured.  This handles both camera modes:
-        analysis mode (negative on):  scratches appear bright  (above mean)
-        raw mode (negative off):      scratches appear dark    (below mean)
+      is considered horizontally structured.  Works in both camera modes
+      (scratches appear dark when put_Negative is a no-op, bright otherwise).
 
-    CHECK 2 — Blob detection (catches isolated defects mixed with scratches):
-      Find all dark contours.  Flag any contour that:
-        • spans < 25% of the image width (localised, not a scratch), AND
-        • is not extremely elongated (aspect < 8 — rules out narrow scratch fragments)
-      A real scratch always runs across a large portion of the frame width.
-      A dust spot or watermark is compact and narrow in column span.
-      This check catches defects even when they sit alongside valid scratches,
-      because it measures absolute column span, not relative shape.
+    CHECK 2 — Blob contour detection (catches localised defects):
+      Find all dark contours.  Flag any contour that spans < 15% of image width
+      and is not extremely elongated.  A real scratch spans the full frame width;
+      a dust spot is compact.
 
-    Frame is BAD if either check triggers.  Confidence is the stronger signal.
+    CHECK 3 — FFT residual (thickness-agnostic horizontal test):
+      Strip horizontal frequency content from the 2D FFT.  Measure how much
+      signal remains.  Horizontal lines — regardless of thickness — leave almost
+      no residual.  Blobs and non-horizontal artefacts leave a large residual.
+
+      This is the primary fix for thick lines being over-flagged: even if their
+      edge-fragments trigger the blob check, the FFT will disagree (low residual)
+      so the two-check consensus won't fire.
+
+    Logic:
+      • row_bad                    → bad (no horizontal structure at all)
+      • blob_bad                   → bad (localised dark contour found)
+      • fft_ratio > 0.65           → bad (very strong non-horizontal signal;
+                                         catches diffuse defects with no clear contour)
+      • otherwise                  → good
+
+    Note: thick lines do NOT trigger blob_bad because their bounding rect spans
+    the full frame width (col_span > 0.15) — they are correctly excluded by
+    the column-span test.  FFT confirmation is therefore NOT needed to protect
+    thick lines from the blob gate.
     """
     import cv2
 
@@ -106,8 +159,7 @@ def _rule_predict(rgb_array: np.ndarray) -> tuple[str, float]:
     row_bad      = horizontal_frac < _HORIZONTAL_COVERAGE_GOOD
     row_bad_conf = round(1.0 - horizontal_frac, 4)
 
-    # ── Check 2: blob detection ───────────────────────────────────────────────
-    # Dark-pixel mask (blobs are dark in both camera modes)
+    # ── Check 2: blob contour detection ──────────────────────────────────────
     thr = max(0, int(mean_v - 1.5 * std_v))
     _, dark_mask = cv2.threshold(gray, thr, 255, cv2.THRESH_BINARY_INV)
     contours, _  = cv2.findContours(dark_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -120,24 +172,39 @@ def _rule_predict(rgb_array: np.ndarray) -> tuple[str, float]:
         _, _, w, h = cv2.boundingRect(cnt)
         col_span = w / img_w
         aspect   = w / max(h, 1)
-
-        # Flag: localised (narrow column span) AND not a thin elongated fragment
         if col_span < _BLOB_MAX_COL_SPAN and aspect < _BLOB_MAX_ASPECT:
             worst_blob_frac = max(worst_blob_frac, area / img_pixels)
 
-    # A blob covering 0.5% of the image → full bad confidence
     blob_bad      = worst_blob_frac > 0.0005
     blob_bad_conf = round(min(worst_blob_frac / 0.005, 1.0), 4)
 
-    # ── Combine ───────────────────────────────────────────────────────────────
-    if row_bad or blob_bad:
-        bad_conf = max(row_bad_conf if row_bad else 0.0,
-                       blob_bad_conf if blob_bad else 0.0)
-        return "bad", bad_conf
+    # ── Check 3: FFT residual ─────────────────────────────────────────────────
+    fft_ratio = _fft_residual_ratio(gray)
 
-    # Good: neither check triggered
-    good_conf = round(min(horizontal_frac, 1.0 - worst_blob_frac / 0.0005), 4)
-    return "good", max(good_conf, 0.6)
+    fft_bad      = fft_ratio > _FFT_RESIDUAL_BAD
+    fft_certain  = fft_ratio > _FFT_RESIDUAL_CERTAIN
+    fft_bad_conf = round(
+        min((fft_ratio - _FFT_RESIDUAL_BAD) / (1.0 - _FFT_RESIDUAL_BAD), 1.0), 4
+    ) if fft_bad else 0.0
+
+    # ── Combine ───────────────────────────────────────────────────────────────
+    # No horizontal structure at all
+    if row_bad:
+        return "bad", row_bad_conf
+
+    # Localised dark contour found (thick lines can't trigger this — they span
+    # the full width and fail the col_span < 0.15 guard)
+    if blob_bad:
+        return "bad", blob_bad_conf
+
+    # Strong non-horizontal FFT signal — catches diffuse defects that don't
+    # produce a clear contour (watermarks, gradients, texture anomalies)
+    if fft_certain:
+        return "bad", fft_bad_conf
+
+    # Good: all checks passed
+    good_conf = round(1.0 - max(blob_bad_conf * 0.5, fft_bad_conf * 0.5), 4)
+    return "good", max(good_conf, 0.55)
 
 
 # ── ML worker process management ──────────────────────────────────────────────
@@ -306,6 +373,33 @@ class QualityClassifier:
     def is_good(self, rgb_array: np.ndarray) -> bool:
         label, _ = self.predict(rgb_array)
         return label == "good"
+
+    def calibrate(self, frames: list) -> float:
+        """
+        Given a list of RGB frames captured from the current slide, suggest a
+        quality threshold tailored to this slide's typical appearance.
+
+        Algorithm: classify each frame, collect confidence scores of frames that
+        classify as "good", then return the 25th-percentile score minus a small
+        safety margin.  This sets the bar just below the weakest good frame so
+        that most frames on this slide pass while still flagging clear defects.
+
+        Returns a threshold in [0.1, 0.8].  Returns 0.5 if no good frames found.
+        """
+        if not frames:
+            return 0.5
+        good_confs = []
+        for frame in frames:
+            label, conf = self.predict(frame)
+            if label == "good":
+                good_confs.append(conf)
+        if not good_confs:
+            return 0.5
+        good_confs.sort()
+        # 25th percentile of good-frame confidences, backed off 15%
+        p25 = good_confs[max(0, len(good_confs) // 4)]
+        suggested = round(max(0.1, min(0.8, p25 * 0.85)), 1)
+        return suggested
 
     def load(self):
         """

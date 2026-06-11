@@ -357,6 +357,17 @@ class MainWindow(QMainWindow):
         thresh_row.addWidget(self._thresh_val_lbl)
         profile_lay.addLayout(thresh_row)
 
+        # Auto-calibrate: grab a few frames from the live camera and suggest a
+        # threshold tuned for this slide's appearance.
+        self._cal_btn = QPushButton("Auto-calibrate threshold")
+        self._cal_btn.setEnabled(False)
+        self._cal_btn.setToolTip(
+            "Point camera at a clean area of the slide and click to set the\n"
+            "threshold automatically based on 6 live frames."
+        )
+        self._cal_btn.clicked.connect(self._on_auto_calibrate)
+        profile_lay.addWidget(self._cal_btn)
+
         right.addWidget(self._profile_box)
 
         # ── Run Slide button (primary action) ─────────────────────────────────
@@ -690,9 +701,45 @@ class MainWindow(QMainWindow):
             self._connect_btn.setText("Connected ✓")
             self._connect_btn.setEnabled(False)
             self._go_btn.setEnabled(True)
+            self._cal_btn.setEnabled(True)
             self._statusbar.showMessage("Connected — camera and ESP32 ready")
         except Exception as e:
             QMessageBox.critical(self, "Connection error", str(e))
+
+    # ── Auto-calibrate ────────────────────────────────────────────────────────
+
+    def _on_auto_calibrate(self):
+        """
+        Grab 6 frames from the live camera, run the classifier on each, and
+        set the threshold slider to the suggested value.
+
+        Point the camera at a representative area of the slide (ideally a clean
+        region with horizontal scratches) before clicking.  The calibration
+        finds the 25th-percentile good-frame confidence and backs off 15%, so
+        the threshold sits just below the weakest acceptable frame on this slide.
+        """
+        if self._camera is None:
+            return
+
+        self._cal_btn.setEnabled(False)
+        self._statusbar.showMessage("Calibrating — grabbing 6 frames…")
+        QApplication.processEvents()
+
+        frames = []
+        for _ in range(6):
+            frame = self._camera.grab_fresh()
+            if frame is not None:
+                frames.append(frame)
+
+        suggested = self._clf.calibrate(frames)
+        slider_val = max(1, min(9, round(suggested * 10)))
+        self._thresh_slider.setValue(slider_val)
+
+        self._cal_btn.setEnabled(True)
+        self._statusbar.showMessage(
+            f"Calibrated: threshold set to {suggested:.1f} "
+            f"(based on {len(frames)} frames)"
+        )
 
     # ── Go ────────────────────────────────────────────────────────────────────
 
