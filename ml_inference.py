@@ -45,35 +45,28 @@ _WORKER    = os.path.join(_HERE, "inference_worker.py")
 
 # ── Rule-based classifier ─────────────────────────────────────────────────────
 
-# What fraction of dark pixels must be "explained" by horizontal rows
-# for the frame to be considered good.  0.65 = lenient, 0.85 = strict.
-# The hybrid lets ML tighten this further for edge cases.
-_HORIZONTAL_COVERAGE_GOOD = 0.65
+# What fraction of feature pixels must fall on horizontal rows to pass.
+_HORIZONTAL_COVERAGE_GOOD = 0.60
 
 def _rule_predict(rgb_array: np.ndarray) -> tuple[str, float]:
     """
-    Row-projection quality check — mirrors how the analysis algorithm thinks.
+    Row-projection quality check — mode-agnostic version.
 
-    Insight: a horizontal scratch makes entire image ROWS dark (the same
-    pixel row is dark across many columns).  A dust blob or spot only
-    darkens a small localised region — it does not create a row-wide
-    dark band.
+    Previous versions looked only for DARK pixels, which broke in analysis
+    mode because the camera applies a negative (inversion): horizontal
+    scratches appear BRIGHT there, not dark.  Looking for dark pixels in
+    an inverted image finds only the background, giving garbage results.
 
-    Algorithm:
-      1. Build a dark-pixel mask (pixels below mean − 1.5σ).
-      2. Compute per-row dark-pixel density (fraction of that row that is dark).
-      3. Label a row as a "horizontal feature row" if its density is
-         significantly above the background (mean + 0.5σ of row densities).
-      4. Count what fraction of all dark pixels fall on horizontal feature rows.
-         → High fraction (≥ 0.65): dark pixels are explained by horizontal
-           lines → good.
-         → Low fraction: dark pixels are in localised blobs off the feature
-           rows → dust / defect → bad.
+    Fix: use pixels that deviate significantly from the mean in EITHER
+    direction — these are the "feature pixels" regardless of camera mode.
+        analysis mode: scratches are bright  (above mean + σ)
+        raw mode:      scratches are dark    (below mean − σ)
+        both modes:    dust/blobs deviate locally from the background
 
-    This is fast (pure numpy, no loops) and tolerant of scratch thickness —
-    a thick scratch still darkens whole rows.  The ML layer in hybrid mode
-    corrects the edge cases this heuristic misses (e.g. a blob sitting
-    directly on a scratch row).
+    Row-projection logic (unchanged):
+      Features that span many columns → raise entire rows above average density.
+      Localised blobs → raise only a few isolated pixels, not whole rows.
+      If ≥ 60% of feature pixels live on high-density rows → good.
     """
     import cv2
 
@@ -81,32 +74,37 @@ def _rule_predict(rgb_array: np.ndarray) -> tuple[str, float]:
     mean_v = float(gray.mean())
     std_v  = float(gray.std())
 
-    thr  = max(0, int(mean_v - 1.5 * std_v))
-    dark = gray < thr   # boolean mask: True where pixel is unusually dark
+    if std_v < 2.0:
+        return "good", 1.0   # nearly uniform frame — nothing to flag
 
-    total_dark = int(dark.sum())
-    if total_dark < 50:
-        return "good", 1.0   # barely any dark pixels — clean frame
+    # Feature pixels: significantly different from background in either direction
+    deviation = np.abs(gray.astype(np.int16) - int(mean_v))
+    feature   = deviation > (1.5 * std_v)   # shape (H, W) boolean
 
-    # Per-row density: fraction of each row that is dark
-    row_density = dark.mean(axis=1)   # shape (H,)
+    total_feat = int(feature.sum())
+    if total_feat < 50:
+        return "good", 1.0   # barely any features — clean frame
 
-    # A "horizontal feature row" has meaningfully more dark pixels than average
-    row_mean = float(row_density.mean())
-    row_std  = float(row_density.std())
-    h_rows   = row_density > (row_mean + 0.5 * row_std)
+    # Per-row density of feature pixels
+    row_density = feature.mean(axis=1)   # shape (H,)
+    row_mean    = float(row_density.mean())
+    row_std     = float(row_density.std())
 
-    # What fraction of dark pixels live on horizontal feature rows?
-    dark_on_h_rows   = int(dark[h_rows].sum())
-    horizontal_frac  = dark_on_h_rows / total_dark
+    if row_std < 1e-6:
+        # All rows equally featureful — uniform noise, not a scratch
+        return "good", 0.7
+
+    # A "horizontal feature row" has significantly more feature pixels than average
+    h_rows = row_density > (row_mean + 0.5 * row_std)
+
+    # Fraction of feature pixels that live on those rows
+    feat_on_h_rows  = int(feature[h_rows].sum())
+    horizontal_frac = feat_on_h_rows / total_feat
 
     if horizontal_frac >= _HORIZONTAL_COVERAGE_GOOD:
-        # Most dark pixels are explained by horizontal rows → good
-        conf = round(float(horizontal_frac), 4)
-        return "good", conf
+        return "good", round(float(horizontal_frac), 4)
     else:
-        bad_conf = round(1.0 - float(horizontal_frac), 4)
-        return "bad", bad_conf
+        return "bad", round(1.0 - float(horizontal_frac), 4)
 
 
 # ── ML worker process management ──────────────────────────────────────────────
