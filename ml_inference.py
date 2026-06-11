@@ -91,16 +91,14 @@ def _rule_predict(rgb_array: np.ndarray) -> tuple[str, float]:
         if area < _MIN_NOISE_AREA:
             continue   # below noise floor — ignore
 
-        perimeter = cv2.arcLength(cnt, True)
-        if perimeter < 1:
-            continue
-
-        roundness = 4 * math.pi * area / (perimeter ** 2)
         _, _, w, h = cv2.boundingRect(cnt)
         aspect    = w / max(h, 1)   # > 1 = wider than tall
 
-        # Horizontal scratch: pass silently
-        if roundness < 0.20 and aspect > 1.1:
+        # Horizontal scratch: width must be at least 2× the height.
+        # Roundness is NOT used here — a thick scratch can have high roundness
+        # even though it is clearly a horizontal line.  Aspect ratio alone
+        # reliably separates lines (aspect >> 1) from blobs (aspect ≈ 1).
+        if aspect >= 2.0:
             continue
 
         # Anything else: accumulate its area as a bad contribution
