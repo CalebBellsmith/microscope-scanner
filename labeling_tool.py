@@ -638,33 +638,48 @@ class LabelingWindow(QMainWindow):
 
 def _defect_centroid(frame: np.ndarray) -> tuple[float, float]:
     """
-    Locate the largest dark blob (dust / debris) in frame.
+    Locate the largest non-horizontal defect (dust, debris, fiber) in frame.
     Returns (cx_frac, cy_frac) in 0–1 image coordinates,
-    or (-1.0, -1.0) if no significant defect found.
+    or (-1.0, -1.0) if no defect found.
+
+    Uses the same blob-candidate filter as _rule_predict: a contour must be
+    localised (column span < 15% of frame width) to qualify.  This excludes
+    horizontal scratches, which always span a large portion of the frame width,
+    so the crosshair only ever lands on actual defects.
     """
     import cv2
-    gray  = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
-    mean  = float(gray.mean())
-    std   = float(gray.std())
-    thr   = max(0, int(mean - 2.0 * std))
+    gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+    mean = float(gray.mean())
+    std  = float(gray.std())
+    thr  = max(0, int(mean - 1.5 * std))
     _, mask = cv2.threshold(gray, thr, 255, cv2.THRESH_BINARY_INV)
 
-    contours, _ = cv2.findContours(
-        mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-    )
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
         return -1.0, -1.0
 
-    largest = max(contours, key=cv2.contourArea)
-    if cv2.contourArea(largest) < 50:
+    img_h, img_w = frame.shape[:2]
+    best_cnt, best_area = None, 0
+
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area < 250:
+            continue
+        _, _, cw, ch = cv2.boundingRect(cnt)
+        col_span = cw / img_w
+        aspect   = cw / max(ch, 1)
+        # Same gate as rule_predict: localised and not a thin elongated fragment
+        if col_span < 0.15 and aspect < 6.0 and area > best_area:
+            best_cnt, best_area = cnt, area
+
+    if best_cnt is None:
         return -1.0, -1.0
 
-    M = cv2.moments(largest)
+    M = cv2.moments(best_cnt)
     if M["m00"] == 0:
         return -1.0, -1.0
 
-    h, w = frame.shape[:2]
-    return M["m10"] / M["m00"] / w, M["m01"] / M["m00"] / h
+    return M["m10"] / M["m00"] / img_w, M["m01"] / M["m00"] / img_h
 
 
 def _direction_hint(cx_frac: float, cy_frac: float) -> str:
