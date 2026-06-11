@@ -42,7 +42,7 @@ import numpy as np
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QPushButton,
     QVBoxLayout, QHBoxLayout, QGroupBox, QProgressBar, QStatusBar,
-    QSpinBox, QCheckBox,
+    QSpinBox, QCheckBox, QComboBox,
 )
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject
 from PyQt5.QtGui import QImage, QPixmap, QFont
@@ -88,7 +88,7 @@ class LabelingWindow(QMainWindow):
         )
 
         self._camera        = None               # ToupTekCamera / OpenCVCamera / MSSCamera
-        self._clf           = QualityClassifier()  # wraps inference_worker subprocess
+        self._clf           = QualityClassifier(mode="hybrid")  # mode changed by dropdown
         self._frozen_frame  = None   # numpy frame; None = live preview mode, set = frozen
         self._last_saved    = None   # path of most recently saved file (used by undo)
         self._analysis_on   = True   # whether analysis exposure/gain settings are active
@@ -241,6 +241,31 @@ class LabelingWindow(QMainWindow):
 
         right.addStretch()
 
+        # ── Classifier mode selector ──────────────────────────────────────────
+        # Lets you compare rule-based vs ML vs hybrid live by pressing W.
+        # Changing the dropdown updates self._clf.mode immediately.
+        clf_box = QGroupBox("Classifier (W key)")
+        clf_lay = QVBoxLayout(clf_box)
+        clf_lay.setSpacing(4)
+
+        self._clf_combo = QComboBox()
+        self._clf_combo.setFocusPolicy(Qt.NoFocus)
+        self._clf_combo.addItem("Hybrid  (rules + ML)",  "hybrid")
+        self._clf_combo.addItem("Rules only  (shape)",   "rules")
+        self._clf_combo.addItem("ML only  (trained model)", "ml")
+        self._clf_combo.currentIndexChanged.connect(self._on_clf_mode_changed)
+
+        clf_lay.addWidget(self._clf_combo)
+
+        # Brief explanation of each mode shown as a hint label
+        self._clf_hint = QLabel("")
+        self._clf_hint.setWordWrap(True)
+        self._clf_hint.setStyleSheet("color:#888; font-size:10px;")
+        clf_lay.addWidget(self._clf_hint)
+
+        right.addWidget(clf_box)
+        self._on_clf_mode_changed(0)   # populate hint for default selection
+
         # Train section
         train_box = QGroupBox("Train model")
         train_lay = QVBoxLayout(train_box)
@@ -266,6 +291,20 @@ class LabelingWindow(QMainWindow):
 
         right.addWidget(train_box)
         root.addLayout(right, stretch=1)
+
+    # ── Classifier mode ───────────────────────────────────────────────────────
+
+    _CLF_HINTS = {
+        "hybrid": "Rules handle clear cases; ML is consulted when the shape test is uncertain. Best default.",
+        "rules":  "Shape analysis only — horizontal lines pass, round blobs/dust fail. No model needed.",
+        "ml":     "Trained MobileNetV3 model only. Requires model.onnx. Use to compare against rules.",
+    }
+
+    def _on_clf_mode_changed(self, _idx: int = 0):
+        """Update classifier mode and hint text when the dropdown changes."""
+        mode = self._clf_combo.currentData()
+        self._clf.mode = mode
+        self._clf_hint.setText(self._CLF_HINTS.get(mode, ""))
 
     # ── Camera ────────────────────────────────────────────────────────────────
 
