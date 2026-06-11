@@ -45,28 +45,37 @@ _WORKER    = os.path.join(_HERE, "inference_worker.py")
 
 # ── Rule-based classifier ─────────────────────────────────────────────────────
 
-# What fraction of feature pixels must fall on horizontal rows to pass.
+# Row-projection: fraction of feature pixels that must fall on horizontal rows.
 _HORIZONTAL_COVERAGE_GOOD = 0.40
+
+# Blob check: a dark contour is a "blob" (defect) if it spans less than this
+# fraction of the image width.  A real scratch always runs across many columns;
+# a dust spot is localised and narrow.
+_BLOB_MAX_COL_SPAN = 0.25   # must span < 25% of frame width to be a blob candidate
+_BLOB_MAX_ASPECT   = 8.0    # also must not be extremely elongated (which would be a scratch fragment)
+_BLOB_MIN_AREA     = 80     # ignore tiny noise below this pixel count
 
 def _rule_predict(rgb_array: np.ndarray) -> tuple[str, float]:
     """
-    Row-projection quality check — mode-agnostic version.
+    Two-check quality gate:
 
-    Previous versions looked only for DARK pixels, which broke in analysis
-    mode because the camera applies a negative (inversion): horizontal
-    scratches appear BRIGHT there, not dark.  Looking for dark pixels in
-    an inverted image finds only the background, giving garbage results.
+    CHECK 1 — Row projection (catches frames with no horizontal features at all):
+      Pixels that deviate significantly from the mean (in either direction) are
+      "feature pixels".  If ≥ 40% of them fall on high-density rows the frame
+      is considered horizontally structured.  This handles both camera modes:
+        analysis mode (negative on):  scratches appear bright  (above mean)
+        raw mode (negative off):      scratches appear dark    (below mean)
 
-    Fix: use pixels that deviate significantly from the mean in EITHER
-    direction — these are the "feature pixels" regardless of camera mode.
-        analysis mode: scratches are bright  (above mean + σ)
-        raw mode:      scratches are dark    (below mean − σ)
-        both modes:    dust/blobs deviate locally from the background
+    CHECK 2 — Blob detection (catches isolated defects mixed with scratches):
+      Find all dark contours.  Flag any contour that:
+        • spans < 25% of the image width (localised, not a scratch), AND
+        • is not extremely elongated (aspect < 8 — rules out narrow scratch fragments)
+      A real scratch always runs across a large portion of the frame width.
+      A dust spot or watermark is compact and narrow in column span.
+      This check catches defects even when they sit alongside valid scratches,
+      because it measures absolute column span, not relative shape.
 
-    Row-projection logic (unchanged):
-      Features that span many columns → raise entire rows above average density.
-      Localised blobs → raise only a few isolated pixels, not whole rows.
-      If ≥ 60% of feature pixels live on high-density rows → good.
+    Frame is BAD if either check triggers.  Confidence is the stronger signal.
     """
     import cv2
 
@@ -75,36 +84,60 @@ def _rule_predict(rgb_array: np.ndarray) -> tuple[str, float]:
     std_v  = float(gray.std())
 
     if std_v < 2.0:
-        return "good", 1.0   # nearly uniform frame — nothing to flag
+        return "good", 1.0
 
-    # Feature pixels: significantly different from background in either direction
-    deviation = np.abs(gray.astype(np.int16) - int(mean_v))
-    feature   = deviation > (1.5 * std_v)   # shape (H, W) boolean
+    img_h, img_w = gray.shape
+    img_pixels   = img_h * img_w
 
+    # ── Check 1: row projection ───────────────────────────────────────────────
+    deviation  = np.abs(gray.astype(np.int16) - int(mean_v))
+    feature    = deviation > (1.5 * std_v)
     total_feat = int(feature.sum())
-    if total_feat < 50:
-        return "good", 1.0   # barely any features — clean frame
 
-    # Per-row density of feature pixels
-    row_density = feature.mean(axis=1)   # shape (H,)
-    row_mean    = float(row_density.mean())
-    row_std     = float(row_density.std())
+    horizontal_frac = 1.0   # default: assume good if barely any features
+    if total_feat >= 50:
+        row_density = feature.mean(axis=1)
+        row_mean    = float(row_density.mean())
+        row_std     = float(row_density.std())
+        if row_std > 1e-6:
+            h_rows          = row_density > (row_mean + 0.5 * row_std)
+            horizontal_frac = int(feature[h_rows].sum()) / total_feat
 
-    if row_std < 1e-6:
-        # All rows equally featureful — uniform noise, not a scratch
-        return "good", 0.7
+    row_bad      = horizontal_frac < _HORIZONTAL_COVERAGE_GOOD
+    row_bad_conf = round(1.0 - horizontal_frac, 4)
 
-    # A "horizontal feature row" has significantly more feature pixels than average
-    h_rows = row_density > (row_mean + 0.5 * row_std)
+    # ── Check 2: blob detection ───────────────────────────────────────────────
+    # Dark-pixel mask (blobs are dark in both camera modes)
+    thr = max(0, int(mean_v - 1.5 * std_v))
+    _, dark_mask = cv2.threshold(gray, thr, 255, cv2.THRESH_BINARY_INV)
+    contours, _  = cv2.findContours(dark_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-    # Fraction of feature pixels that live on those rows
-    feat_on_h_rows  = int(feature[h_rows].sum())
-    horizontal_frac = feat_on_h_rows / total_feat
+    worst_blob_frac = 0.0
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area < _BLOB_MIN_AREA:
+            continue
+        _, _, w, h = cv2.boundingRect(cnt)
+        col_span = w / img_w
+        aspect   = w / max(h, 1)
 
-    if horizontal_frac >= _HORIZONTAL_COVERAGE_GOOD:
-        return "good", round(float(horizontal_frac), 4)
-    else:
-        return "bad", round(1.0 - float(horizontal_frac), 4)
+        # Flag: localised (narrow column span) AND not a thin elongated fragment
+        if col_span < _BLOB_MAX_COL_SPAN and aspect < _BLOB_MAX_ASPECT:
+            worst_blob_frac = max(worst_blob_frac, area / img_pixels)
+
+    # A blob covering 0.5% of the image → full bad confidence
+    blob_bad      = worst_blob_frac > 0.0005
+    blob_bad_conf = round(min(worst_blob_frac / 0.005, 1.0), 4)
+
+    # ── Combine ───────────────────────────────────────────────────────────────
+    if row_bad or blob_bad:
+        bad_conf = max(row_bad_conf if row_bad else 0.0,
+                       blob_bad_conf if blob_bad else 0.0)
+        return "bad", bad_conf
+
+    # Good: neither check triggered
+    good_conf = round(min(horizontal_frac, 1.0 - worst_blob_frac / 0.0005), 4)
+    return "good", max(good_conf, 0.4)
 
 
 # ── ML worker process management ──────────────────────────────────────────────
