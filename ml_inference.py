@@ -46,7 +46,7 @@ _WORKER    = os.path.join(_HERE, "inference_worker.py")
 # ── Rule-based classifier ─────────────────────────────────────────────────────
 
 # What fraction of feature pixels must fall on horizontal rows to pass.
-_HORIZONTAL_COVERAGE_GOOD = 0.60
+_HORIZONTAL_COVERAGE_GOOD = 0.40
 
 def _rule_predict(rgb_array: np.ndarray) -> tuple[str, float]:
     """
