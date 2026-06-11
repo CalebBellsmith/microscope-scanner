@@ -45,31 +45,35 @@ _WORKER    = os.path.join(_HERE, "inference_worker.py")
 
 # ── Rule-based classifier ─────────────────────────────────────────────────────
 
-# Minimum contour area to consider — filters single-pixel noise and JPEG
-# compression artefacts.  Anything above this that isn't a horizontal line
-# is flagged immediately, regardless of size.
-_MIN_NOISE_AREA = 25   # px²
-
-# Once the total area of non-scratch features exceeds this fraction of the
-# image the confidence saturates at 1.0.  Set very low so even a small blob
-# scores high confidence.
-_BAD_AREA_SATURATE = 0.0003   # 0.03% of image (~25px on a 1024×822 frame)
+# What fraction of dark pixels must be "explained" by horizontal rows
+# for the frame to be considered good.  0.65 = lenient, 0.85 = strict.
+# The hybrid lets ML tighten this further for edge cases.
+_HORIZONTAL_COVERAGE_GOOD = 0.65
 
 def _rule_predict(rgb_array: np.ndarray) -> tuple[str, float]:
     """
-    Shape-based quality check — maximum sensitivity mode.
+    Row-projection quality check — mirrors how the analysis algorithm thinks.
 
-    Rule: ANYTHING that is not a horizontal line is flagged as bad.
-    A feature is a horizontal line if and only if:
-        roundness < 0.20   (elongated, not circular — matches analysis_pipeline.THRESHOLD)
-        AND aspect > 1.1   (wider than tall)
-    Every other dark feature — circles, blobs, spots, vertical lines,
-    diagonal smears — is immediately treated as a defect regardless of size,
-    as long as it is above the noise floor (_MIN_NOISE_AREA px²).
+    Insight: a horizontal scratch makes entire image ROWS dark (the same
+    pixel row is dark across many columns).  A dust blob or spot only
+    darkens a small localised region — it does not create a row-wide
+    dark band.
 
-    Confidence is proportional to the total area of non-scratch features
-    relative to _BAD_AREA_SATURATE.  Even a single small dust spot will
-    saturate to near-1.0 confidence bad.
+    Algorithm:
+      1. Build a dark-pixel mask (pixels below mean − 1.5σ).
+      2. Compute per-row dark-pixel density (fraction of that row that is dark).
+      3. Label a row as a "horizontal feature row" if its density is
+         significantly above the background (mean + 0.5σ of row densities).
+      4. Count what fraction of all dark pixels fall on horizontal feature rows.
+         → High fraction (≥ 0.65): dark pixels are explained by horizontal
+           lines → good.
+         → Low fraction: dark pixels are in localised blobs off the feature
+           rows → dust / defect → bad.
+
+    This is fast (pure numpy, no loops) and tolerant of scratch thickness —
+    a thick scratch still darkens whole rows.  The ML layer in hybrid mode
+    corrects the edge cases this heuristic misses (e.g. a blob sitting
+    directly on a scratch row).
     """
     import cv2
 
@@ -77,39 +81,32 @@ def _rule_predict(rgb_array: np.ndarray) -> tuple[str, float]:
     mean_v = float(gray.mean())
     std_v  = float(gray.std())
 
-    # 1.5σ below mean catches mid-grey dust that a stricter threshold misses
-    thr = max(0, int(mean_v - 1.5 * std_v))
-    _, mask = cv2.threshold(gray, thr, 255, cv2.THRESH_BINARY_INV)
+    thr  = max(0, int(mean_v - 1.5 * std_v))
+    dark = gray < thr   # boolean mask: True where pixel is unusually dark
 
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    total_dark = int(dark.sum())
+    if total_dark < 50:
+        return "good", 1.0   # barely any dark pixels — clean frame
 
-    img_pixels    = rgb_array.shape[0] * rgb_array.shape[1]
-    total_bad_frac = 0.0   # accumulated non-scratch area as fraction of image
+    # Per-row density: fraction of each row that is dark
+    row_density = dark.mean(axis=1)   # shape (H,)
 
-    for cnt in contours:
-        area = cv2.contourArea(cnt)
-        if area < _MIN_NOISE_AREA:
-            continue   # below noise floor — ignore
+    # A "horizontal feature row" has meaningfully more dark pixels than average
+    row_mean = float(row_density.mean())
+    row_std  = float(row_density.std())
+    h_rows   = row_density > (row_mean + 0.5 * row_std)
 
-        _, _, w, h = cv2.boundingRect(cnt)
-        aspect    = w / max(h, 1)   # > 1 = wider than tall
+    # What fraction of dark pixels live on horizontal feature rows?
+    dark_on_h_rows   = int(dark[h_rows].sum())
+    horizontal_frac  = dark_on_h_rows / total_dark
 
-        # Horizontal scratch: width must be at least 2× the height.
-        # Roundness is NOT used here — a thick scratch can have high roundness
-        # even though it is clearly a horizontal line.  Aspect ratio alone
-        # reliably separates lines (aspect >> 1) from blobs (aspect ≈ 1).
-        if aspect >= 2.0:
-            continue
-
-        # Anything else: accumulate its area as a bad contribution
-        total_bad_frac += area / img_pixels
-
-    bad_conf = min(total_bad_frac / _BAD_AREA_SATURATE, 1.0)
-
-    if bad_conf < 0.25:
-        return "good", round(1.0 - bad_conf, 4)
+    if horizontal_frac >= _HORIZONTAL_COVERAGE_GOOD:
+        # Most dark pixels are explained by horizontal rows → good
+        conf = round(float(horizontal_frac), 4)
+        return "good", conf
     else:
-        return "bad", round(min(bad_conf + 0.3, 1.0), 4)   # boost so bad reads clearly bad
+        bad_conf = round(1.0 - float(horizontal_frac), 4)
+        return "bad", bad_conf
 
 
 # ── ML worker process management ──────────────────────────────────────────────
