@@ -94,7 +94,7 @@ def _fft_residual_ratio(gray: np.ndarray) -> float:
     return float(residual.std() / (std + 1e-6))
 
 
-def _rule_predict(rgb_array: np.ndarray) -> tuple[str, float]:
+def _rule_predict(rgb_array: np.ndarray, sensitivity: float = 0.5) -> tuple[str, float]:
     """
     Three-check quality gate:
 
@@ -159,6 +159,14 @@ def _rule_predict(rgb_array: np.ndarray) -> tuple[str, float]:
     row_bad      = horizontal_frac < _HORIZONTAL_COVERAGE_GOOD
     row_bad_conf = round(1.0 - horizontal_frac, 4)
 
+    # ── Sensitivity-scaled thresholds ────────────────────────────────────────
+    # sensitivity 0.0 = lenient (only large obvious defects)
+    # sensitivity 1.0 = strict  (flag smaller, more subtle defects)
+    s = max(0.0, min(1.0, sensitivity))
+    blob_min_area  = int(800 - 750 * s)    # lenient=800 px²  strict=50 px²
+    blob_col_span  = 0.10 + 0.15 * s       # lenient=0.10     strict=0.25
+    fft_gate       = 0.75 - 0.25 * s       # lenient=0.75     strict=0.50
+
     # ── Check 2: blob contour detection ──────────────────────────────────────
     thr = max(0, int(mean_v - 1.5 * std_v))
     _, dark_mask = cv2.threshold(gray, thr, 255, cv2.THRESH_BINARY_INV)
@@ -167,12 +175,12 @@ def _rule_predict(rgb_array: np.ndarray) -> tuple[str, float]:
     worst_blob_frac = 0.0
     for cnt in contours:
         area = cv2.contourArea(cnt)
-        if area < _BLOB_MIN_AREA:
+        if area < blob_min_area:
             continue
         _, _, w, h = cv2.boundingRect(cnt)
         col_span = w / img_w
         aspect   = w / max(h, 1)
-        if col_span < _BLOB_MAX_COL_SPAN and aspect < _BLOB_MAX_ASPECT:
+        if col_span < blob_col_span and aspect < _BLOB_MAX_ASPECT:
             worst_blob_frac = max(worst_blob_frac, area / img_pixels)
 
     blob_bad      = worst_blob_frac > 0.0005
@@ -181,8 +189,8 @@ def _rule_predict(rgb_array: np.ndarray) -> tuple[str, float]:
     # ── Check 3: FFT residual ─────────────────────────────────────────────────
     fft_ratio = _fft_residual_ratio(gray)
 
+    fft_certain  = fft_ratio > fft_gate
     fft_bad      = fft_ratio > _FFT_RESIDUAL_BAD
-    fft_certain  = fft_ratio > _FFT_RESIDUAL_CERTAIN
     fft_bad_conf = round(
         min((fft_ratio - _FFT_RESIDUAL_BAD) / (1.0 - _FFT_RESIDUAL_BAD), 1.0), 4
     ) if fft_bad else 0.0
@@ -295,7 +303,7 @@ _RULE_CONFIDENCE_THRESHOLD = 0.75
 _RULE_WEIGHT = 0.6
 _ML_WEIGHT   = 0.4
 
-def _hybrid_predict(rgb_array: np.ndarray) -> tuple[str, float]:
+def _hybrid_predict(rgb_array: np.ndarray, sensitivity: float = 0.5) -> tuple[str, float]:
     """
     Combine rules and ML:
       - Run rule-based check first (fast, no subprocess).
@@ -306,7 +314,7 @@ def _hybrid_predict(rgb_array: np.ndarray) -> tuple[str, float]:
     The blend is rule-weighted (60/40) since rules are more physically
     meaningful for this specific task.
     """
-    rule_label, rule_conf = _rule_predict(rgb_array)
+    rule_label, rule_conf = _rule_predict(rgb_array, sensitivity)
 
     # Rules are highly confident — no need to call ML
     if rule_conf >= _RULE_CONFIDENCE_THRESHOLD:
@@ -346,10 +354,13 @@ class QualityClassifier:
     The labeling tool exposes this as a dropdown so you can compare modes live.
     """
 
-    def __init__(self, mode: str = "hybrid"):
+    def __init__(self, mode: str = "hybrid", sensitivity: float = 0.5):
         if mode not in MODES:
             raise ValueError(f"mode must be one of {MODES}")
         self.mode = mode
+        # 0.0 = lenient (flag only large obvious defects)
+        # 1.0 = strict  (flag smaller, more subtle defects)
+        self.sensitivity = sensitivity
 
     def predict(self, rgb_array: np.ndarray) -> tuple[str, float]:
         """
@@ -358,7 +369,7 @@ class QualityClassifier:
         Returns   : ("good"|"bad", confidence 0.0–1.0)
         """
         if self.mode == "rules":
-            return _rule_predict(rgb_array)
+            return _rule_predict(rgb_array, self.sensitivity)
 
         if self.mode == "ml":
             try:
@@ -368,7 +379,7 @@ class QualityClassifier:
                 return _heuristic(rgb_array)
 
         # Default: hybrid
-        return _hybrid_predict(rgb_array)
+        return _hybrid_predict(rgb_array, self.sensitivity)
 
     def is_good(self, rgb_array: np.ndarray) -> bool:
         label, _ = self.predict(rgb_array)

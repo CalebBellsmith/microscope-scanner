@@ -334,8 +334,8 @@ class MainWindow(QMainWindow):
         profile_lay.addLayout(_row("Y spacing (units):", self._y_spin))
         profile_lay.addWidget(self._total_label)
 
-        # Quality threshold slider
-        profile_lay.addWidget(QLabel("Quality threshold (nudge sensitivity):"))
+        # Detection sensitivity slider
+        profile_lay.addWidget(QLabel("Detection sensitivity:"))
         thresh_row = QHBoxLayout()
         self._thresh_label_lo = QLabel("Lenient")
         self._thresh_label_lo.setStyleSheet("color:#888; font-size:10px;")
@@ -346,9 +346,7 @@ class MainWindow(QMainWindow):
         self._thresh_slider.setTickInterval(1)
         self._thresh_val_lbl = QLabel("0.5")
         self._thresh_val_lbl.setFixedWidth(28)
-        self._thresh_slider.valueChanged.connect(
-            lambda v: self._thresh_val_lbl.setText(f"{v/10:.1f}")
-        )
+        self._thresh_slider.valueChanged.connect(self._on_sensitivity_changed)
         self._thresh_label_hi = QLabel("Strict")
         self._thresh_label_hi.setStyleSheet("color:#888; font-size:10px;")
         thresh_row.addWidget(self._thresh_label_lo)
@@ -706,6 +704,14 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Connection error", str(e))
 
+    # ── Sensitivity ──────────────────────────────────────────────────────────
+
+    def _on_sensitivity_changed(self, v: int):
+        """Map slider (1–9) to classifier sensitivity (0.0–1.0)."""
+        sensitivity = (v - 1) / 8.0   # 1→0.0  5→0.5  9→1.0
+        self._clf.sensitivity = sensitivity
+        self._thresh_val_lbl.setText(f"{sensitivity:.2f}")
+
     # ── Auto-calibrate ────────────────────────────────────────────────────────
 
     def _on_auto_calibrate(self):
@@ -731,13 +737,15 @@ class MainWindow(QMainWindow):
             if frame is not None:
                 frames.append(frame)
 
-        suggested = self._clf.calibrate(frames)
-        slider_val = max(1, min(9, round(suggested * 10)))
+        suggested = self._clf.calibrate(frames)   # returns 0.1–0.8
+        # Map suggested value to slider position using sensitivity scale (1→0.0, 9→1.0)
+        slider_val = max(1, min(9, round(suggested * 8) + 1))
         self._thresh_slider.setValue(slider_val)
 
+        sensitivity = (slider_val - 1) / 8.0
         self._cal_btn.setEnabled(True)
         self._statusbar.showMessage(
-            f"Calibrated: threshold set to {suggested:.1f} "
+            f"Calibrated: sensitivity set to {sensitivity:.2f} "
             f"(based on {len(frames)} frames)"
         )
 

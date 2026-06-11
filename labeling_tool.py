@@ -262,24 +262,23 @@ class LabelingWindow(QMainWindow):
         self._clf_hint.setStyleSheet("color:#888; font-size:10px;")
         clf_lay.addWidget(self._clf_hint)
 
-        # Quality threshold — same slider as in main.py scan profile.
-        # Controls at what confidence the W-key prediction reads ACCEPT vs NUDGE.
-        # Lower = more lenient (accept borderline frames), higher = stricter.
-        clf_lay.addWidget(QLabel("Threshold (accept if confidence ≥):"))
+        # Sensitivity slider: controls how aggressively the rule classifier
+        # flags defects. Maps directly to QualityClassifier.sensitivity (0–1).
+        # Lenient = only large obvious blobs flagged (min area 800 px²).
+        # Strict  = flags smaller, more subtle defects (min area 50 px²).
+        clf_lay.addWidget(QLabel("Detection sensitivity:"))
         thresh_row = QHBoxLayout()
         self._thresh_lo_lbl = QLabel("Lenient")
         self._thresh_lo_lbl.setStyleSheet("color:#888; font-size:10px;")
         self._thresh_slider = QSlider(Qt.Horizontal)
         self._thresh_slider.setFocusPolicy(Qt.NoFocus)
-        self._thresh_slider.setRange(1, 9)   # maps to 0.1 – 0.9
+        self._thresh_slider.setRange(1, 9)   # maps to sensitivity 0.0 – 1.0
         self._thresh_slider.setValue(5)       # default 0.5
         self._thresh_slider.setTickPosition(QSlider.TicksBelow)
         self._thresh_slider.setTickInterval(1)
         self._thresh_val_lbl = QLabel("0.5")
         self._thresh_val_lbl.setFixedWidth(28)
-        self._thresh_slider.valueChanged.connect(
-            lambda v: self._thresh_val_lbl.setText(f"{v/10:.1f}")
-        )
+        self._thresh_slider.valueChanged.connect(self._on_sensitivity_changed)
         self._thresh_hi_lbl = QLabel("Strict")
         self._thresh_hi_lbl.setStyleSheet("color:#888; font-size:10px;")
         thresh_row.addWidget(self._thresh_lo_lbl)
@@ -330,6 +329,12 @@ class LabelingWindow(QMainWindow):
         mode = self._clf_combo.currentData()
         self._clf.mode = mode
         self._clf_hint.setText(self._CLF_HINTS.get(mode, ""))
+
+    def _on_sensitivity_changed(self, v: int):
+        """Map slider (1–9) to classifier sensitivity (0.0–1.0) and update label."""
+        sensitivity = (v - 1) / 8.0   # 1→0.0, 5→0.5, 9→1.0
+        self._clf.sensitivity = sensitivity
+        self._thresh_val_lbl.setText(f"{sensitivity:.2f}")
 
     # ── Camera ────────────────────────────────────────────────────────────────
 
@@ -428,17 +433,14 @@ class LabelingWindow(QMainWindow):
         )
         self._show_frame(display)
 
-        threshold  = self._thresh_slider.value() / 10.0
-        # A "good" frame is accepted if its confidence meets the threshold;
-        # a "bad" frame is always nudged regardless of confidence.
-        accepted   = (label == "good") and (conf >= threshold)
-        verdict    = "✓ ACCEPT" if accepted else "✗ NUDGE"
-        color_hex  = "#2E7D32" if accepted else "#C62828"
+        accepted  = label == "good"
+        verdict   = "✓ ACCEPT" if accepted else "✗ NUDGE"
+        color_hex = "#2E7D32" if accepted else "#C62828"
 
         direction = _direction_hint(cx_frac, cy_frac) if cx_frac >= 0 else ""
         html = (f"<b>{label.upper()}</b>  {conf*100:.0f}%"
                 f"  →  <b>{verdict}</b>"
-                f"<br><small>threshold {threshold:.1f}"
+                f"<br><small>sensitivity {self._clf.sensitivity:.2f}"
                 f"  |  mode: {self._clf.mode}</small>")
         if direction and not accepted:
             html += f"<br><small>nudge direction: <b>{direction}</b></small>"
