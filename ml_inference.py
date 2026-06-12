@@ -61,7 +61,15 @@ _BLOB_MIN_AREA     = 250    # ignore small contours — thick line edge-fragment
 # Near 1  → frame has significant non-horizontal energy (blobs, watermarks) → bad
 _FFT_H_BAND_FRAC  = 0.05    # fraction of the kx frequency range treated as "horizontal"
 _FFT_RESIDUAL_BAD = 0.45    # residual/original ratio above which is flagged as bad
-_FFT_RESIDUAL_CERTAIN = 0.65  # standalone bad flag without needing blob confirmation
+_FFT_RESIDUAL_CERTAIN = 0.72  # standalone bad flag without needing blob confirmation
+
+# Darkening gate: minimum fractional intensity drop (image_mean − contour_mean) / image_mean
+# required before a contour is treated as a defect.
+# Measured on real images:
+#   grey halos (unavoidable focus artifacts): 17–21% darker than background
+#   real defects (fibres, debris, solid blobs): 30–63% darker
+# A threshold of 0.25 sits cleanly between the two populations.
+_BLOB_MIN_DARKENING = 0.25
 
 
 def _fft_residual_ratio(gray: np.ndarray) -> float:
@@ -180,8 +188,21 @@ def _rule_predict(rgb_array: np.ndarray, sensitivity: float = 0.5) -> tuple[str,
         _, _, w, h = cv2.boundingRect(cnt)
         col_span = w / img_w
         aspect   = w / max(h, 1)
-        if col_span < blob_col_span and aspect < _BLOB_MAX_ASPECT:
-            worst_blob_frac = max(worst_blob_frac, area / img_pixels)
+        if not (col_span < blob_col_span and aspect < _BLOB_MAX_ASPECT):
+            continue
+
+        # Darkening gate: grey halos (focus/lens artifacts) are only 15–21%
+        # darker than the background.  Real defects (fibres, debris) are 30%+
+        # darker.  Compute the mean pixel value inside this contour and skip
+        # anything that isn't dark enough to be a genuine defect.
+        cnt_mask = np.zeros(gray.shape, np.uint8)
+        cv2.drawContours(cnt_mask, [cnt], -1, 255, -1)
+        mean_inside  = float(cv2.mean(gray, mask=cnt_mask)[0])
+        darkening    = (mean_v - mean_inside) / (mean_v + 1e-6)
+        if darkening < _BLOB_MIN_DARKENING:
+            continue   # soft grey halo — not a flaggable defect
+
+        worst_blob_frac = max(worst_blob_frac, area / img_pixels)
 
     blob_bad      = worst_blob_frac > 0.0005
     blob_bad_conf = round(min(worst_blob_frac / 0.005, 1.0), 4)

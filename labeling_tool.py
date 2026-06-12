@@ -670,8 +670,16 @@ def _defect_centroid(frame: np.ndarray) -> tuple[float, float]:
         _, _, cw, ch = cv2.boundingRect(cnt)
         col_span = cw / img_w
         aspect   = cw / max(ch, 1)
-        # Same gate as rule_predict: localised and not a thin elongated fragment
-        if col_span < 0.15 and aspect < 6.0 and area > best_area:
+        if not (col_span < 0.15 and aspect < 6.0):
+            continue
+        # Skip grey halos — only point at features that are genuinely dark
+        cnt_mask = np.zeros(gray.shape, np.uint8)
+        cv2.drawContours(cnt_mask, [cnt], -1, 255, -1)
+        mean_inside = float(cv2.mean(gray, mask=cnt_mask)[0])
+        darkening   = (float(mean) - mean_inside) / (float(mean) + 1e-6)
+        if darkening < 0.25:
+            continue
+        if area > best_area:
             best_cnt, best_area = cnt, area
 
     if best_cnt is None:
