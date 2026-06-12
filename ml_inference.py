@@ -48,12 +48,14 @@ _WORKER    = os.path.join(_HERE, "inference_worker.py")
 # Row-projection: fraction of feature pixels that must fall on horizontal rows.
 _HORIZONTAL_COVERAGE_GOOD = 0.40
 
-# Blob check: a dark contour is a "blob" (defect) if it spans less than this
-# fraction of the image width.  A real scratch always runs across many columns;
-# a dust spot is localised and narrow.
-_BLOB_MAX_COL_SPAN = 0.15   # must span < 15% of frame width to be a blob candidate
-_BLOB_MAX_ASPECT   = 6.0    # also must not be extremely elongated (which would be a scratch fragment)
-_BLOB_MIN_AREA     = 250    # ignore small contours — thick line edge-fragments are typically smaller
+# Blob / defect detection uses SHAPE (aspect ratio), not column span.
+# Physical invariant measured on real frames:
+#   horizontal scratch  → elongated, aspect (w/h) 16–53  (1-D line)
+#   defect (blob/fibre)  → 2-D extent, aspect 0.7–4.7
+# Anything with aspect ≥ this is treated as a horizontal line and ignored,
+# regardless of how wide or thick it is.  This is what lets a WIDE fibre be
+# detected (it has low aspect) instead of being mistaken for a scratch.
+_ASPECT_LINE_MIN = 8.0
 
 # FFT residual check: after zeroing near-zero horizontal frequencies, the
 # fraction of the remaining std vs the original std.
@@ -63,13 +65,13 @@ _FFT_H_BAND_FRAC  = 0.05    # fraction of the kx frequency range treated as "hor
 _FFT_RESIDUAL_BAD = 0.45    # residual/original ratio above which is flagged as bad
 _FFT_RESIDUAL_CERTAIN = 0.72  # standalone bad flag without needing blob confirmation
 
-# Darkening gate: minimum fractional intensity drop (image_mean − contour_mean) / image_mean
-# required before a contour is treated as a defect.
+# Darkening gate (sensitivity-scaled at call time): a contour is only a defect
+# if its interior is meaningfully darker than the background mean.
 # Measured on real images:
 #   grey halos (unavoidable focus artifacts): 17–21% darker than background
 #   real defects (fibres, debris, solid blobs): 30–63% darker
-# A threshold of 0.25 sits cleanly between the two populations.
-_BLOB_MIN_DARKENING = 0.25
+# The gate runs from 0.30 (lenient) down to 0.20 (strict); the lenient end sits
+# above the grey-halo band so halos are never flagged.
 
 
 def _fft_residual_ratio(gray: np.ndarray) -> float:
@@ -168,14 +170,18 @@ def _rule_predict(rgb_array: np.ndarray, sensitivity: float = 0.5) -> tuple[str,
     row_bad_conf = round(1.0 - horizontal_frac, 4)
 
     # ── Sensitivity-scaled thresholds ────────────────────────────────────────
-    # sensitivity 0.0 = lenient (only large obvious defects)
-    # sensitivity 1.0 = strict  (flag smaller, more subtle defects)
+    # sensitivity 0.0 = lenient (only large, clearly-dark defects)
+    # sensitivity 1.0 = strict  (flag smaller, fainter defects)
     s = max(0.0, min(1.0, sensitivity))
-    blob_min_area  = int(800 - 750 * s)    # lenient=800 px²  strict=50 px²
-    blob_col_span  = 0.10 + 0.15 * s       # lenient=0.10     strict=0.25
-    fft_gate       = 0.75 - 0.25 * s       # lenient=0.75     strict=0.50
+    blob_min_area = int(1600 - 1500 * s)   # lenient=1600 px²  strict=100 px²
+    min_dark      = 0.30 - 0.10 * s        # lenient=0.30      strict=0.20
+    fft_gate      = 0.75 - 0.25 * s        # lenient=0.75      strict=0.50
 
-    # ── Check 2: blob contour detection ──────────────────────────────────────
+    # ── Check 2: blob / fibre detection (shape-based) ────────────────────────
+    # Find dark contours, then keep only those that are NOT horizontal lines.
+    # A scratch is rejected by its high aspect ratio (elongated), so a wide
+    # fibre — which has a LOW aspect ratio despite being wide — is correctly
+    # flagged instead of being mistaken for a scratch (the old col_span bug).
     thr = max(0, int(mean_v - 1.5 * std_v))
     _, dark_mask = cv2.threshold(gray, thr, 255, cv2.THRESH_BINARY_INV)
     contours, _  = cv2.findContours(dark_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -186,20 +192,19 @@ def _rule_predict(rgb_array: np.ndarray, sensitivity: float = 0.5) -> tuple[str,
         if area < blob_min_area:
             continue
         _, _, w, h = cv2.boundingRect(cnt)
-        col_span = w / img_w
-        aspect   = w / max(h, 1)
-        if not (col_span < blob_col_span and aspect < _BLOB_MAX_ASPECT):
+        aspect = w / max(h, 1)
+        # Elongated horizontal line (scratch) → ignore, whatever its thickness
+        if aspect >= _ASPECT_LINE_MIN:
             continue
 
-        # Darkening gate: grey halos (focus/lens artifacts) are only 15–21%
+        # Darkening gate: grey halos (focus/lens artifacts) are only ~17–21%
         # darker than the background.  Real defects (fibres, debris) are 30%+
-        # darker.  Compute the mean pixel value inside this contour and skip
-        # anything that isn't dark enough to be a genuine defect.
+        # darker.  Skip anything not dark enough to be a genuine defect.
         cnt_mask = np.zeros(gray.shape, np.uint8)
         cv2.drawContours(cnt_mask, [cnt], -1, 255, -1)
-        mean_inside  = float(cv2.mean(gray, mask=cnt_mask)[0])
-        darkening    = (mean_v - mean_inside) / (mean_v + 1e-6)
-        if darkening < _BLOB_MIN_DARKENING:
+        mean_inside = float(cv2.mean(gray, mask=cnt_mask)[0])
+        darkening   = (mean_v - mean_inside) / (mean_v + 1e-6)
+        if darkening < min_dark:
             continue   # soft grey halo — not a flaggable defect
 
         worst_blob_frac = max(worst_blob_frac, area / img_pixels)

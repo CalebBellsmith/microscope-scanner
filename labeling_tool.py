@@ -331,8 +331,13 @@ class LabelingWindow(QMainWindow):
         self._clf_hint.setText(self._CLF_HINTS.get(mode, ""))
 
     def _on_sensitivity_changed(self, v: int):
-        """Map slider (1–9) to classifier sensitivity (0.0–1.0) and update label."""
-        sensitivity = (v - 1) / 8.0   # 1→0.0, 5→0.5, 9→1.0
+        """
+        Map slider (1–9) to classifier sensitivity (0.0–1.0) with a gamma curve.
+        Gamma 1.8 pulls the centre into the lenient zone (slider 5 → ~0.29), so
+        the default behaviour favours leniency and the strict end is reached
+        only near the far right of the track.
+        """
+        sensitivity = ((v - 1) / 8.0) ** 1.8
         self._clf.sensitivity = sensitivity
         self._thresh_val_lbl.setText(f"{sensitivity:.2f}")
 
@@ -668,9 +673,10 @@ def _defect_centroid(frame: np.ndarray) -> tuple[float, float]:
         if area < 250:
             continue
         _, _, cw, ch = cv2.boundingRect(cnt)
-        col_span = cw / img_w
-        aspect   = cw / max(ch, 1)
-        if not (col_span < 0.15 and aspect < 6.0):
+        aspect = cw / max(ch, 1)
+        # Skip elongated horizontal lines (scratches) — shape, not column span,
+        # so a wide fibre (low aspect) still qualifies as a defect.
+        if aspect >= 8.0:
             continue
         # Skip grey halos — only point at features that are genuinely dark
         cnt_mask = np.zeros(gray.shape, np.uint8)

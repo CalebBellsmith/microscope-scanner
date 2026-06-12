@@ -707,8 +707,12 @@ class MainWindow(QMainWindow):
     # ── Sensitivity ──────────────────────────────────────────────────────────
 
     def _on_sensitivity_changed(self, v: int):
-        """Map slider (1–9) to classifier sensitivity (0.0–1.0)."""
-        sensitivity = (v - 1) / 8.0   # 1→0.0  5→0.5  9→1.0
+        """
+        Map slider (1–9) to classifier sensitivity (0.0–1.0) with a gamma curve.
+        Gamma 1.8 keeps the centre lenient (slider 5 → ~0.29); strict is reached
+        only near the far right.
+        """
+        sensitivity = ((v - 1) / 8.0) ** 1.8
         self._clf.sensitivity = sensitivity
         self._thresh_val_lbl.setText(f"{sensitivity:.2f}")
 
@@ -737,12 +741,12 @@ class MainWindow(QMainWindow):
             if frame is not None:
                 frames.append(frame)
 
-        suggested = self._clf.calibrate(frames)   # returns 0.1–0.8
-        # Map suggested value to slider position using sensitivity scale (1→0.0, 9→1.0)
-        slider_val = max(1, min(9, round(suggested * 8) + 1))
+        suggested = self._clf.calibrate(frames)   # returns 0.1–0.8 sensitivity
+        # Invert the gamma-1.8 slider curve: v = 1 + 8 * suggested**(1/1.8)
+        slider_val = max(1, min(9, round(1 + 8 * (suggested ** (1 / 1.8)))))
         self._thresh_slider.setValue(slider_val)
 
-        sensitivity = (slider_val - 1) / 8.0
+        sensitivity = ((slider_val - 1) / 8.0) ** 1.8
         self._cal_btn.setEnabled(True)
         self._statusbar.showMessage(
             f"Calibrated: sensitivity set to {sensitivity:.2f} "
