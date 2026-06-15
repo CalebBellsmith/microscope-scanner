@@ -74,8 +74,20 @@ def _to_grey_adjusted(rgb_array: np.ndarray) -> np.ndarray:
     return _imadjust(grey)                  # imadjust(1 - grey)
 
 
+def _matlab_round(x: float) -> int:
+    """MATLAB round(): round half AWAY from zero (numpy rounds half to even)."""
+    return int(math.floor(abs(x) + 0.5)) * (1 if x >= 0 else -1)
+
+
 def _build_scratch_mask(grey: np.ndarray) -> np.ndarray:
-    """Per-column peak detection → binary mask (mirrors MATLAB findpeaks loop)."""
+    """
+    Per-column peak detection → binary mask, faithful to the MATLAB loop:
+        [~,loc,w,~] = findpeaks(grey(:,i),'MaxPeakWidth',100,'MinPeakProminence',0.1);
+        pixel = [loc(j)-round(w(j)/2) : loc(j)+round(w(j)/2)];   % per peak
+        pixel(pixel<=0)=[]; pixel(pixel>=m)=[];                  % keep 1..m-1
+    MATLAB indices are 1-based; loc=round(w/2) is applied BEFORE the offset and
+    rounds half away from zero — both differ from the previous translation.
+    """
     from scipy.signal import find_peaks
     m, n = grey.shape
     mask = np.zeros((m, n), dtype=np.float64)
@@ -87,15 +99,12 @@ def _build_scratch_mask(grey: np.ndarray) -> np.ndarray:
             prominence=MIN_PEAK_PROMINENCE,
         )
         widths = props["widths"]
-        pixels = []
         for peak, w in zip(peaks, widths):
-            lo_idx = int(round(peak - w / 2))
-            hi_idx = int(round(peak + w / 2))
-            pixels.extend(range(lo_idx, hi_idx + 1))
-        pixels = sorted(set(pixels))
-        for p in pixels:
-            if 0 < p < m:
-                mask[p, col] = 1.0
+            loc = int(peak) + 1                  # 0-based scipy → 1-based MATLAB
+            hw  = _matlab_round(w / 2.0)         # MATLAB round(w/2)
+            for px in range(loc - hw, loc + hw + 1):   # inclusive both ends
+                if 1 <= px <= m - 1:             # MATLAB drops <=0 and >=m
+                    mask[px - 1, col] = 1.0      # 1-based → 0-based row
     return mask
 
 
