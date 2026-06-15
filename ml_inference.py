@@ -54,6 +54,14 @@ _WORKER    = os.path.join(_HERE, "inference_worker.py")
 # detected (it has low aspect) instead of being mistaken for a scratch.
 _ASPECT_LINE_MIN = 8.0
 
+# Morphological opening kernel (px).  A second detection pass opens the dark
+# mask with this kernel to ERASE thin horizontal scratches while preserving
+# compact blobs.  This isolates a defect that sits ON a scratch line — which
+# would otherwise fuse with the line into one high-aspect contour and be
+# discarded as a "line", swallowing the blob.  7 px removes scratches up to a
+# few px thick while keeping blobs ≳ 20 px across.
+_BLOB_OPEN_KERNEL = 7
+
 # FFT residual check: after zeroing near-zero horizontal frequencies, the
 # fraction of the remaining std vs the original std.
 # Near 0  → frame is dominated by horizontal content (lines, scratches) → good
@@ -144,37 +152,40 @@ def _rule_predict(rgb_array: np.ndarray, sensitivity: float = 0.5) -> tuple[str,
     min_dark      = 0.30 - 0.10 * s        # lenient=0.30      strict=0.20
     fft_gate      = 0.75 - 0.25 * s        # lenient=0.75      strict=0.50
 
-    # ── Check 2: blob / fibre detection (shape-based) ────────────────────────
-    # Find dark contours, then keep only those that are NOT horizontal lines.
-    # A scratch is rejected by its high aspect ratio (elongated), so a wide
-    # fibre — which has a LOW aspect ratio despite being wide — is correctly
-    # flagged instead of being mistaken for a scratch (the old col_span bug).
+    # ── Check 2: blob / fibre detection (shape-based, two-pass) ──────────────
+    # A defect contour must be: large enough (area), NOT an elongated line
+    # (aspect), and genuinely dark (darkening gate skips soft grey halos).
+    def _scan(mask: np.ndarray) -> float:
+        worst = 0.0
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if area < blob_min_area:
+                continue
+            _, _, w, h = cv2.boundingRect(cnt)
+            if w / max(h, 1) >= _ASPECT_LINE_MIN:   # elongated horizontal line → ignore
+                continue
+            cnt_mask = np.zeros(gray.shape, np.uint8)
+            cv2.drawContours(cnt_mask, [cnt], -1, 255, -1)
+            mean_inside = float(cv2.mean(gray, mask=cnt_mask)[0])
+            if (mean_v - mean_inside) / (mean_v + 1e-6) < min_dark:
+                continue                            # soft grey halo → ignore
+            worst = max(worst, area / img_pixels)
+        return worst
+
     thr = max(0, int(mean_v - 1.5 * std_v))
     _, dark_mask = cv2.threshold(gray, thr, 255, cv2.THRESH_BINARY_INV)
-    contours, _  = cv2.findContours(dark_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-    worst_blob_frac = 0.0
-    for cnt in contours:
-        area = cv2.contourArea(cnt)
-        if area < blob_min_area:
-            continue
-        _, _, w, h = cv2.boundingRect(cnt)
-        aspect = w / max(h, 1)
-        # Elongated horizontal line (scratch) → ignore, whatever its thickness
-        if aspect >= _ASPECT_LINE_MIN:
-            continue
+    # Pass A — raw mask: catches isolated blobs/fibres (incl. elongated smudges).
+    worst_blob_frac = _scan(dark_mask)
 
-        # Darkening gate: grey halos (focus/lens artifacts) are only ~17–21%
-        # darker than the background.  Real defects (fibres, debris) are 30%+
-        # darker.  Skip anything not dark enough to be a genuine defect.
-        cnt_mask = np.zeros(gray.shape, np.uint8)
-        cv2.drawContours(cnt_mask, [cnt], -1, 255, -1)
-        mean_inside = float(cv2.mean(gray, mask=cnt_mask)[0])
-        darkening   = (mean_v - mean_inside) / (mean_v + 1e-6)
-        if darkening < min_dark:
-            continue   # soft grey halo — not a flaggable defect
-
-        worst_blob_frac = max(worst_blob_frac, area / img_pixels)
+    # Pass B — morphological opening erases thin scratches, isolating any blob
+    # that sits ON a line (which Pass A fuses with the line and discards as a
+    # high-aspect "line").  This is the fix for defects resting on a scratch.
+    kernel    = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
+                                          (_BLOB_OPEN_KERNEL, _BLOB_OPEN_KERNEL))
+    open_mask = cv2.morphologyEx(dark_mask, cv2.MORPH_OPEN, kernel)
+    worst_blob_frac = max(worst_blob_frac, _scan(open_mask))
 
     blob_bad      = worst_blob_frac > 0.0005
     blob_bad_conf = round(min(worst_blob_frac / 0.005, 1.0), 4)

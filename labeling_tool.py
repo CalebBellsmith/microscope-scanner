@@ -703,10 +703,11 @@ def _defect_centroid(frame: np.ndarray) -> tuple[float, float]:
     Returns (cx_frac, cy_frac) in 0–1 image coordinates,
     or (-1.0, -1.0) if no defect found.
 
-    Uses the same blob-candidate filter as _rule_predict: a contour must be
-    localised (column span < 15% of frame width) to qualify.  This excludes
-    horizontal scratches, which always span a large portion of the frame width,
-    so the crosshair only ever lands on actual defects.
+    Uses the same shape filter as _rule_predict: a contour is a defect if it is
+    NOT an elongated horizontal line (aspect < 8) and is genuinely dark.  The
+    dark mask is morphologically opened first so a blob resting ON a scratch
+    line is isolated from the line (matching the classifier's two-pass logic),
+    instead of fusing into one high-aspect contour and being missed.
     """
     import cv2
     gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
@@ -714,6 +715,9 @@ def _defect_centroid(frame: np.ndarray) -> tuple[float, float]:
     std  = float(gray.std())
     thr  = max(0, int(mean - 1.5 * std))
     _, mask = cv2.threshold(gray, thr, 255, cv2.THRESH_BINARY_INV)
+    # Erase thin scratches so blobs-on-lines stand alone (see _rule_predict).
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    mask   = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
 
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
