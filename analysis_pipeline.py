@@ -31,16 +31,47 @@ MIN_AREA_PIXELS    = 30     # bwareaopen equivalent
 
 # ── Low-level image processing helpers ───────────────────────────────────────
 
+def _stretchlim(img: np.ndarray, tol: float = 0.01, nbins: int = 256) -> tuple:
+    """
+    Faithful port of MATLAB stretchlim(img, tol) for a double image.
+    Builds a 256-bin histogram over [0,1] (values outside are clipped into the
+    end bins) and returns the [low, high] intensity limits that saturate `tol`
+    of the data at each end.
+    """
+    clipped = np.clip(img, 0.0, 1.0)
+    # imhist bin index for a double image: round(v*(nbins-1)) → 0..nbins-1
+    bins = np.round(clipped * (nbins - 1)).astype(np.int64)
+    counts = np.bincount(bins.ravel(), minlength=nbins).astype(np.float64)
+    cdf = np.cumsum(counts) / counts.sum()
+
+    tol_low, tol_high = tol, 1.0 - tol
+    ilow_arr  = np.nonzero(cdf > tol_low)[0]
+    ihigh_arr = np.nonzero(cdf >= tol_high)[0]
+    ilow  = int(ilow_arr[0])  if ilow_arr.size  else 0
+    ihigh = int(ihigh_arr[0]) if ihigh_arr.size else nbins - 1
+    if ilow == ihigh:                       # degenerate → full range
+        return 0.0, 1.0
+    return ilow / (nbins - 1), ihigh / (nbins - 1)
+
+
+def _imadjust(img: np.ndarray) -> np.ndarray:
+    """
+    Faithful port of MATLAB imadjust(I) (default args) for a double image:
+    saturate 1% at each end via stretchlim, then linearly map [low,high]→[0,1]
+    with gamma = 1.  Values outside [low,high] are clipped.
+    """
+    low, high = _stretchlim(img)
+    if high <= low:
+        return np.clip(img, 0.0, 1.0)
+    return np.clip((img - low) / (high - low), 0.0, 1.0)
+
+
 def _to_grey_adjusted(rgb_array: np.ndarray) -> np.ndarray:
     """rgb uint8 → float64 greyscale, inverted and contrast-stretched (imadjust)."""
     rgb = rgb_array.astype(np.float64) / 255.0
     grey = 0.2989 * rgb[:, :, 0] + 0.5870 * rgb[:, :, 1] + 0.1140 * rgb[:, :, 2]
-    grey = 1.0 - grey  # invert
-    # imadjust: clip bottom/top 1 % and rescale to [0,1]
-    lo, hi = np.percentile(grey, 1), np.percentile(grey, 99)
-    if hi > lo:
-        grey = np.clip((grey - lo) / (hi - lo), 0.0, 1.0)
-    return grey
+    grey = 1.0 - grey                       # invert
+    return _imadjust(grey)                  # imadjust(1 - grey)
 
 
 def _build_scratch_mask(grey: np.ndarray) -> np.ndarray:
@@ -69,17 +100,18 @@ def _build_scratch_mask(grey: np.ndarray) -> np.ndarray:
 
 
 def _remove_horizontal_particles(bw: np.ndarray, iterations: int = H_SIZE) -> np.ndarray:
-    """Gradient-based horizontal particle removal (mirrors MATLAB loop)."""
+    """
+    Gradient-based horizontal particle removal (mirrors the MATLAB loop):
+        for i=1:H_size
+            [dx,~] = gradient(bw);      % gradient along columns (x / axis=1)
+            dx = imadjust(dx);          % clips negatives to 0, stretches
+            bw = [bw(:,1), bw(:,2:end) - dx(:,1:end-1)];
+            bw(bw<0) = 0; bw = round(bw);
+    """
+    bw = bw.astype(np.float64)
     for _ in range(iterations):
-        # gradient along columns (axis=1)
-        dx = np.gradient(bw, axis=1)
-        # imadjust on dx: clip 1-99 percentile
-        lo, hi = np.percentile(dx, 1), np.percentile(dx, 99)
-        if hi > lo:
-            dx_adj = np.clip((dx - lo) / (hi - lo), 0.0, 1.0)
-        else:
-            dx_adj = dx.copy()
-        # bw(:,2:end) - dx(:,1:end-1)  [MATLAB 1-indexed, shifted by 1]
+        dx = np.gradient(bw, axis=1)        # MATLAB [dx,~]=gradient(bw)
+        dx_adj = _imadjust(dx)              # MATLAB imadjust(dx) — clips <0 to 0
         new_bw = bw.copy()
         new_bw[:, 1:] = bw[:, 1:] - dx_adj[:, :-1]
         new_bw[new_bw < 0] = 0.0
@@ -101,10 +133,10 @@ _BRIDGE_OFFSETS = [(0, 0), (0, 1), (0, 2), (1, 0), (1, 2), (2, 0), (2, 1), (2, 2
 def _bridge_lut() -> np.ndarray:
     """
     256-entry boolean table for MATLAB bwmorph(bw,'bridge').
-    For each 8-neighbour pattern, decide whether a BACKGROUND pixel becomes
-    foreground: set the centre to 1 and test whether the 3×3 neighbourhood then
-    forms a single 8-connected component (exactly the per-pixel rule this
-    replaces).  Built once, then applied vectorised.
+    A background pixel is set to 1 iff its foreground NEIGHBOURS (centre
+    excluded) form two or more separate 8-connected groups — i.e. the pixel
+    bridges a gap between otherwise-disconnected neighbours.  An isolated pixel
+    (0 or 1 neighbour, or neighbours already all connected) is left as 0.
     """
     from scipy.ndimage import label as nd_label
     struct = np.ones((3, 3), dtype=int)
@@ -114,9 +146,9 @@ def _bridge_lut() -> np.ndarray:
         for b, (rr, cc) in enumerate(_BRIDGE_OFFSETS):
             if idx & (1 << b):
                 hood[rr, cc] = 1
-        hood[1, 1] = 1
+        # centre stays 0: count connected components among the NEIGHBOURS only
         _, n = nd_label(hood, structure=struct)
-        lut[idx] = (n == 1)
+        lut[idx] = (n >= 2)
     return lut
 
 
@@ -140,21 +172,17 @@ def _bwmorph_bridge(bw_bool: np.ndarray) -> np.ndarray:
 
 def _render_overlay(rgb: np.ndarray, outlines: list) -> np.ndarray:
     """
-    Build a review overlay: the original frame in greyscale with each accepted
-    scratch outlined in red and labelled 'scratch_N'.  Visualisation only.
+    Build a review overlay: the original frame in greyscale with every detected
+    scratch outlined in red (no numbering).  Visualisation only.
     `outlines` is a list of (scratch_num, boundary) where boundary is an array
     of (row, col) contour points.
     """
     import cv2
     grey = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
     vis  = cv2.cvtColor(grey, cv2.COLOR_GRAY2RGB)
-    for snum, boundary in outlines:
+    for _snum, boundary in outlines:
         pts = np.fliplr(boundary.astype(np.int32)).reshape(-1, 1, 2)  # (col,row)
-        cv2.polylines(vis, [pts], isClosed=True, color=(255, 0, 0), thickness=2)
-        ry = int(boundary[:, 0].min())
-        rx = int(boundary[:, 1].min())
-        cv2.putText(vis, f"scratch_{snum}", (rx, max(12, ry - 4)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1, cv2.LINE_AA)
+        cv2.polylines(vis, [pts], isClosed=True, color=(255, 0, 0), thickness=1)
     return vis
 
 
@@ -187,8 +215,12 @@ def detect_scratches(image_path: str) -> dict:
     bw_float = bw_bool.astype(np.float64) * old_grey
     bw_bool = bw_float > IMBINARIZE_VALUE
 
-    # Find contours and compute per-object stats
-    from skimage.measure import label, regionprops, find_contours
+    # Find objects and compute per-object stats.  Boundary tracing mirrors
+    # MATLAB bwboundaries: an 8-connected pixel chain (cv2 CHAIN_APPROX_NONE)
+    # closed back to its start, so the perimeter — and thus the roundness
+    # metric — matches MATLAB's, unlike skimage find_contours (sub-pixel).
+    import cv2
+    from skimage.measure import label, regionprops
 
     labeled = label(bw_bool)
     props = regionprops(labeled)
@@ -198,20 +230,17 @@ def detect_scratches(image_path: str) -> dict:
     scratch_objects = []
     accepted_outlines = []   # (scratch_num, boundary coords) for the overlay
 
-    img_rows, img_cols = bw_bool.shape
     for prop in props:
         area = prop.area
-        # Trace the region boundary on a small cropped window instead of the
-        # full image (identical contour, far cheaper).  Expand the bbox by 1px
-        # but clamp to the image edge, so edge-touching regions keep the exact
-        # same boundary behaviour as find_contours on the full frame.
-        minr, minc, maxr, maxc = prop.bbox
-        r0, r1 = max(0, minr - 1), min(img_rows, maxr + 1)
-        c0, c1 = max(0, minc - 1), min(img_cols, maxc + 1)
-        contour_coords = find_contours(labeled[r0:r1, c0:c1] == prop.label, 0.5)
-        if not contour_coords:
+        minr, minc = prop.bbox[0], prop.bbox[1]
+        region = np.pad(prop.image.astype(np.uint8), 1)   # isolated region mask
+        cnts, _ = cv2.findContours(region, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+        if not cnts:
             continue
-        boundary = contour_coords[0] + np.array([r0, c0])  # back to full-image coords
+        c = cnts[0][:, 0, :]                               # (x=col, y=row) in padded crop
+        # → full-image (row, col); undo the pad (-1) and add bbox origin
+        boundary = np.column_stack([c[:, 1] + minr - 1, c[:, 0] + minc - 1]).astype(float)
+        boundary = np.vstack([boundary, boundary[0]])      # close the loop (bwboundaries)
         delta = np.diff(boundary, axis=0)
         perimeter = float(np.sum(np.sqrt((delta ** 2).sum(axis=1))))
         if perimeter == 0:
