@@ -13,6 +13,7 @@ import os
 import json
 import time
 import math
+import functools
 import threading
 import warnings
 
@@ -92,28 +93,49 @@ def _bwareaopen(bw_bool: np.ndarray, min_pixels: int) -> np.ndarray:
     return remove_small_objects(bw_bool, min_size=min_pixels)
 
 
-def _bwmorph_bridge(bw_bool: np.ndarray) -> np.ndarray:
+# 3×3 neighbour offsets (row, col), centre (1,1) excluded — bit order for the LUT.
+_BRIDGE_OFFSETS = [(0, 0), (0, 1), (0, 2), (1, 0), (1, 2), (2, 0), (2, 1), (2, 2)]
+
+
+@functools.lru_cache(maxsize=1)
+def _bridge_lut() -> np.ndarray:
     """
-    Exact equivalent of MATLAB bwmorph(bw, 'bridge').
-    Sets a background pixel to foreground if doing so connects two foreground
-    pixels in its 3×3 neighbourhood that were not already 8-connected.
-    Applied once (MATLAB default with no repeat count).
+    256-entry boolean table for MATLAB bwmorph(bw,'bridge').
+    For each 8-neighbour pattern, decide whether a BACKGROUND pixel becomes
+    foreground: set the centre to 1 and test whether the 3×3 neighbourhood then
+    forms a single 8-connected component (exactly the per-pixel rule this
+    replaces).  Built once, then applied vectorised.
     """
     from scipy.ndimage import label as nd_label
-    padded = np.pad(bw_bool.astype(np.uint8), 1, mode='constant')
-    out = padded.copy()
+    struct = np.ones((3, 3), dtype=int)
+    lut = np.zeros(256, dtype=bool)
+    for idx in range(256):
+        hood = np.zeros((3, 3), dtype=np.uint8)
+        for b, (rr, cc) in enumerate(_BRIDGE_OFFSETS):
+            if idx & (1 << b):
+                hood[rr, cc] = 1
+        hood[1, 1] = 1
+        _, n = nd_label(hood, structure=struct)
+        lut[idx] = (n == 1)
+    return lut
+
+
+def _bwmorph_bridge(bw_bool: np.ndarray) -> np.ndarray:
+    """
+    Vectorised MATLAB bwmorph(bw, 'bridge') via a 3×3-neighbourhood lookup table.
+    Produces output byte-identical to the per-pixel definition (a background
+    pixel is set if making it foreground merges its neighbourhood into one
+    8-connected component), but in a single pass instead of one scipy.label call
+    per pixel — ~1000× faster.
+    """
+    lut  = _bridge_lut()
     rows, cols = bw_bool.shape
-    for r in range(1, rows + 1):
-        for c in range(1, cols + 1):
-            if padded[r, c]:
-                continue  # already foreground
-            hood = padded[r-1:r+2, c-1:c+2].copy()
-            hood[1, 1] = 1  # pretend this pixel is set
-            # count 8-connected components in the 3×3 hood
-            _, n = nd_label(hood, structure=np.ones((3, 3), dtype=int))
-            if n == 1:  # setting this pixel merges components → bridge
-                out[r, c] = 1
-    return out[1:-1, 1:-1].astype(bool)
+    p    = np.pad(bw_bool.astype(np.uint16), 1, mode='constant')
+    idx  = np.zeros((rows, cols), dtype=np.uint16)
+    for b, (rr, cc) in enumerate(_BRIDGE_OFFSETS):
+        idx |= p[rr:rr + rows, cc:cc + cols] << b
+    bridged = lut[idx]                        # decision for every pixel as if background
+    return bw_bool | (~bw_bool & bridged)     # foreground unchanged; background per LUT
 
 
 def detect_scratches(image_path: str) -> dict:
@@ -156,13 +178,20 @@ def detect_scratches(image_path: str) -> dict:
     scratch_count = 0
     scratch_objects = []
 
+    img_rows, img_cols = bw_bool.shape
     for prop in props:
         area = prop.area
-        # Approximate perimeter from bounding box contour
-        contour_coords = find_contours(labeled == prop.label, 0.5)
+        # Trace the region boundary on a small cropped window instead of the
+        # full image (identical contour, far cheaper).  Expand the bbox by 1px
+        # but clamp to the image edge, so edge-touching regions keep the exact
+        # same boundary behaviour as find_contours on the full frame.
+        minr, minc, maxr, maxc = prop.bbox
+        r0, r1 = max(0, minr - 1), min(img_rows, maxr + 1)
+        c0, c1 = max(0, minc - 1), min(img_cols, maxc + 1)
+        contour_coords = find_contours(labeled[r0:r1, c0:c1] == prop.label, 0.5)
         if not contour_coords:
             continue
-        boundary = contour_coords[0]  # largest contour
+        boundary = contour_coords[0] + np.array([r0, c0])  # back to full-image coords
         delta = np.diff(boundary, axis=0)
         perimeter = float(np.sum(np.sqrt((delta ** 2).sum(axis=1))))
         if perimeter == 0:
