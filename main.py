@@ -469,7 +469,10 @@ class MainWindow(QMainWindow):
         ana_prev_lay.setSpacing(2)
         self._ana_prev_label = QLabel("(analysis previews appear here)")
         self._ana_prev_label.setAlignment(Qt.AlignCenter)
-        self._ana_prev_label.setMinimumHeight(150)
+        self._ana_prev_label.setFixedHeight(170)
+        # Ignored horizontal policy: the pixmap does NOT drive the label's size,
+        # so a scaled preview can't ratchet the panel (and window) wider.
+        self._ana_prev_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
         self._ana_prev_label.setStyleSheet(
             "background:#1a1a1a; color:#666; border:1px solid #333;"
         )
