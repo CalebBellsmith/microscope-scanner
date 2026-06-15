@@ -141,22 +141,31 @@ class CapturePipeline:
 
     # ── Frame quality & nudge ─────────────────────────────────────────────────
 
+    @staticmethod
+    def _goodness(label, conf):
+        """Signed quality score: +conf if good, −conf if bad.  Higher = better."""
+        return conf if label == "good" else -conf
+
     def _best_frame(self):
         """
-        Grab a frame and check its quality score against the threshold.
-        If it passes → return immediately.
-        If it fails  → run _centroid_nudge to find and move away from the
-                       defect, grab a second frame, compare scores, return
-                       the better one, then restore the stage position.
+        Grab a frame and classify it.
+        If the classifier calls it GOOD → return immediately.
+        If it calls it BAD  → run _centroid_nudge to move away from the defect,
+                              grab a second frame, return whichever scores higher,
+                              then restore the stage position.
+
+        Decision is made on the classifier's LABEL (which already reflects the
+        sensitivity setting), not on a raw confidence threshold — a confidently
+        BAD frame has high confidence too, so the old `conf >= threshold` test
+        wrongly accepted it.
         """
         frame = self._wait_for_frame()
         if frame is None:
             return None
 
-        # Ask the classifier how confident it is that this frame is good
-        _, conf = self._clf.predict(frame)
-        if conf >= self._threshold:
-            return frame   # good enough — no nudge needed
+        label, conf = self._clf.predict(frame)
+        if label == "good":
+            return frame   # clean frame — no nudge needed
 
         # Frame is bad — find the defect and nudge away from it
         nudge_x, nudge_y = _centroid_nudge(
@@ -185,10 +194,11 @@ class CapturePipeline:
         if candidate is None:
             return frame   # nudge gave no result — keep original
 
-        # Return whichever frame the classifier liked more
-        _, orig_conf = self._clf.predict(frame)
-        _, cand_conf = self._clf.predict(candidate)
-        return candidate if cand_conf > orig_conf else frame
+        # Return whichever frame the classifier liked more (signed goodness, so a
+        # GOOD candidate always beats a BAD original even if both are confident).
+        orig_score = self._goodness(label, conf)              # reuse top prediction
+        cand_score = self._goodness(*self._clf.predict(candidate))
+        return candidate if cand_score > orig_score else frame
 
     def _wait_for_frame(self, timeout=5.0):
         """

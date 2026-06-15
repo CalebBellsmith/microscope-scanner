@@ -45,9 +45,6 @@ _WORKER    = os.path.join(_HERE, "inference_worker.py")
 
 # ── Rule-based classifier ─────────────────────────────────────────────────────
 
-# Row-projection: fraction of feature pixels that must fall on horizontal rows.
-_HORIZONTAL_COVERAGE_GOOD = 0.40
-
 # Blob / defect detection uses SHAPE (aspect ratio), not column span.
 # Physical invariant measured on real frames:
 #   horizontal scratch  → elongated, aspect (w/h) 16–53  (1-D line)
@@ -106,39 +103,26 @@ def _fft_residual_ratio(gray: np.ndarray) -> float:
 
 def _rule_predict(rgb_array: np.ndarray, sensitivity: float = 0.5) -> tuple[str, float]:
     """
-    Three-check quality gate:
+    Two-check quality gate.  A frame is GOOD unless a check positively
+    identifies a defect — absence of features is good (a clean slide).
 
-    CHECK 1 — Row projection (catches frames with no horizontal features at all):
-      Pixels that deviate significantly from the mean (in either direction) are
-      "feature pixels".  If ≥ 40% of them fall on high-density rows the frame
-      is considered horizontally structured.  Works in both camera modes
-      (scratches appear dark when put_Negative is a no-op, bright otherwise).
+    CHECK 1 — Blob / fibre detection (shape-based):
+      Find dark contours, drop the ones that are elongated horizontal lines
+      (aspect ≥ 8 = scratch, ignored at any thickness/width).  Of the rest,
+      flag any that is large enough (area, sensitivity-scaled) and genuinely
+      dark (darkening gate — soft grey halos are skipped).  Catches blobs,
+      fibres and dust regardless of how wide they sprawl.
 
-    CHECK 2 — Blob contour detection (catches localised defects):
-      Find all dark contours.  Flag any contour that spans < 15% of image width
-      and is not extremely elongated.  A real scratch spans the full frame width;
-      a dust spot is compact.
-
-    CHECK 3 — FFT residual (thickness-agnostic horizontal test):
-      Strip horizontal frequency content from the 2D FFT.  Measure how much
-      signal remains.  Horizontal lines — regardless of thickness — leave almost
-      no residual.  Blobs and non-horizontal artefacts leave a large residual.
-
-      This is the primary fix for thick lines being over-flagged: even if their
-      edge-fragments trigger the blob check, the FFT will disagree (low residual)
-      so the two-check consensus won't fire.
+    CHECK 2 — FFT residual (diffuse non-horizontal signal):
+      Strip horizontal frequency content from the 2D FFT; horizontal lines —
+      any thickness — leave almost no residual, while diffuse non-horizontal
+      artefacts (watermarks, smears) leave a large one.  Flags frames whose
+      defect has no clean contour but still breaks horizontal symmetry.
 
     Logic:
-      • row_bad                    → bad (no horizontal structure at all)
-      • blob_bad                   → bad (localised dark contour found)
-      • fft_ratio > 0.65           → bad (very strong non-horizontal signal;
-                                         catches diffuse defects with no clear contour)
-      • otherwise                  → good
-
-    Note: thick lines do NOT trigger blob_bad because their bounding rect spans
-    the full frame width (col_span > 0.15) — they are correctly excluded by
-    the column-span test.  FFT confirmation is therefore NOT needed to protect
-    thick lines from the blob gate.
+      • blob_bad      → bad (localised dark non-line contour)
+      • fft_certain   → bad (strong diffuse non-horizontal signal)
+      • otherwise     → good   (clean frame, or horizontal scratches only)
     """
     import cv2
 
@@ -151,23 +135,6 @@ def _rule_predict(rgb_array: np.ndarray, sensitivity: float = 0.5) -> tuple[str,
 
     img_h, img_w = gray.shape
     img_pixels   = img_h * img_w
-
-    # ── Check 1: row projection ───────────────────────────────────────────────
-    deviation  = np.abs(gray.astype(np.int16) - int(mean_v))
-    feature    = deviation > (1.5 * std_v)
-    total_feat = int(feature.sum())
-
-    horizontal_frac = 1.0   # default: assume good if barely any features
-    if total_feat >= 50:
-        row_density = feature.mean(axis=1)
-        row_mean    = float(row_density.mean())
-        row_std     = float(row_density.std())
-        if row_std > 1e-6:
-            h_rows          = row_density > (row_mean + 0.5 * row_std)
-            horizontal_frac = int(feature[h_rows].sum()) / total_feat
-
-    row_bad      = horizontal_frac < _HORIZONTAL_COVERAGE_GOOD
-    row_bad_conf = round(1.0 - horizontal_frac, 4)
 
     # ── Sensitivity-scaled thresholds ────────────────────────────────────────
     # sensitivity 0.0 = lenient (only large, clearly-dark defects)
@@ -222,21 +189,19 @@ def _rule_predict(rgb_array: np.ndarray, sensitivity: float = 0.5) -> tuple[str,
     ) if fft_bad else 0.0
 
     # ── Combine ───────────────────────────────────────────────────────────────
-    # No horizontal structure at all
-    if row_bad:
-        return "bad", row_bad_conf
-
-    # Localised dark contour found (thick lines can't trigger this — they span
-    # the full width and fail the col_span < 0.15 guard)
+    # Localised dark non-line contour found (a blob/fibre/dust defect).
     if blob_bad:
         return "bad", blob_bad_conf
 
     # Strong non-horizontal FFT signal — catches diffuse defects that don't
-    # produce a clear contour (watermarks, gradients, texture anomalies)
+    # produce a clear contour (watermarks, gradients, texture anomalies).
     if fft_certain:
         return "bad", fft_bad_conf
 
-    # Good: all checks passed
+    # Good: a clean frame, or one whose only features are horizontal scratches.
+    # (The row-projection check was removed: it punished clean/sparse frames for
+    #  "lacking horizontal structure" and oscillated on the 0.40 boundary.
+    #  Absence of structure is GOOD here — defects are caught by blob + FFT.)
     good_conf = round(1.0 - max(blob_bad_conf * 0.5, fft_bad_conf * 0.5), 4)
     return "good", max(good_conf, 0.55)
 

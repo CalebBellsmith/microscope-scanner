@@ -502,10 +502,23 @@ class LabelingWindow(QMainWindow):
             return
         from PIL import Image
         target = GOOD_DIR if label == "good" else BAD_DIR
-        n      = len([f for f in os.listdir(target)
-                      if f.lower().endswith((".jpg", ".png"))])
-        path   = os.path.join(target, f"{n+1:05d}.jpg")
-        Image.fromarray(self._frozen_frame).save(path, quality=95)
+
+        # Robust next-index: one past the highest EXISTING number, so a save can
+        # never overwrite an earlier file even if the sequence has gaps (e.g. a
+        # file was deleted manually).  Count-based naming could collide and was
+        # the likely cause of "can't save past N".
+        path = os.path.join(target, f"{_next_index(target):05d}.jpg")
+
+        # Coerce to a clean contiguous uint8 RGB array.  Frames straight from the
+        # camera can be non-contiguous, greyscale, or RGBA, any of which makes
+        # PIL.Image.fromarray raise — which previously failed the save silently.
+        try:
+            frame = _to_rgb_uint8(self._frozen_frame)
+            Image.fromarray(frame).save(path, quality=95)
+        except Exception as e:
+            self._status.showMessage(f"⚠ SAVE FAILED ({label}): {e}")
+            return
+
         self._last_saved   = path
         self._frozen_frame = None
         self._refresh_counts()
@@ -529,8 +542,14 @@ class LabelingWindow(QMainWindow):
         ).start()
 
     def _run_predict(self, frame: np.ndarray):
-        label, conf      = self._clf.predict(frame)
-        cx_frac, cy_frac = _defect_centroid(frame)
+        try:
+            frame            = _to_rgb_uint8(frame)
+            label, conf      = self._clf.predict(frame)
+            cx_frac, cy_frac = _defect_centroid(frame)
+        except Exception as e:
+            self._sig.overlay_ready.emit(frame, -1.0, -1.0, "error", 0.0)
+            print(f"[labeling_tool] predict failed: {e}")
+            return
         self._sig.overlay_ready.emit(frame, cx_frac, cy_frac, label, conf)
 
     def _dismiss_prediction(self):
@@ -642,6 +661,41 @@ class LabelingWindow(QMainWindow):
 
 
 # ── Helpers (shared with capture_pipeline) ────────────────────────────────────
+
+def _next_index(target_dir: str) -> int:
+    """
+    Next file number for target_dir: one past the highest existing NNNNN.jpg.
+    Robust to gaps (manual deletes) and never overwrites an existing file,
+    unlike a plain file-count which collides whenever the sequence isn't
+    perfectly contiguous.
+    """
+    highest = 0
+    for f in os.listdir(target_dir):
+        stem, ext = os.path.splitext(f)
+        if ext.lower() in (".jpg", ".jpeg", ".png") and stem.isdigit():
+            highest = max(highest, int(stem))
+    return highest + 1
+
+
+def _to_rgb_uint8(frame: np.ndarray) -> np.ndarray:
+    """
+    Coerce an arbitrary camera frame into a contiguous uint8 HxWx3 RGB array
+    that PIL.Image.fromarray will always accept.  Handles greyscale (HxW),
+    RGBA (HxWx4), non-uint8 dtypes, and non-contiguous memory layouts — all of
+    which can otherwise make fromarray raise and fail the save silently.
+    """
+    import cv2
+    arr = np.asarray(frame)
+    if arr.dtype != np.uint8:
+        arr = np.clip(arr, 0, 255).astype(np.uint8)
+    if arr.ndim == 2:                       # greyscale → RGB
+        arr = cv2.cvtColor(arr, cv2.COLOR_GRAY2RGB)
+    elif arr.ndim == 3 and arr.shape[2] == 4:  # RGBA → RGB
+        arr = cv2.cvtColor(arr, cv2.COLOR_RGBA2RGB)
+    elif arr.ndim == 3 and arr.shape[2] == 1:  # single-channel → RGB
+        arr = cv2.cvtColor(arr, cv2.COLOR_GRAY2RGB)
+    return np.ascontiguousarray(arr)
+
 
 def _defect_centroid(frame: np.ndarray) -> tuple[float, float]:
     """
