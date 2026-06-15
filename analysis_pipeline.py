@@ -138,6 +138,26 @@ def _bwmorph_bridge(bw_bool: np.ndarray) -> np.ndarray:
     return bw_bool | (~bw_bool & bridged)     # foreground unchanged; background per LUT
 
 
+def _render_overlay(rgb: np.ndarray, outlines: list) -> np.ndarray:
+    """
+    Build a review overlay: the original frame in greyscale with each accepted
+    scratch outlined in red and labelled 'scratch_N'.  Visualisation only.
+    `outlines` is a list of (scratch_num, boundary) where boundary is an array
+    of (row, col) contour points.
+    """
+    import cv2
+    grey = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    vis  = cv2.cvtColor(grey, cv2.COLOR_GRAY2RGB)
+    for snum, boundary in outlines:
+        pts = np.fliplr(boundary.astype(np.int32)).reshape(-1, 1, 2)  # (col,row)
+        cv2.polylines(vis, [pts], isClosed=True, color=(255, 0, 0), thickness=2)
+        ry = int(boundary[:, 0].min())
+        rx = int(boundary[:, 1].min())
+        cv2.putText(vis, f"scratch_{snum}", (rx, max(12, ry - 4)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1, cv2.LINE_AA)
+    return vis
+
+
 def detect_scratches(image_path: str) -> dict:
     """
     Run the full scratch detection pipeline on one image.
@@ -173,10 +193,10 @@ def detect_scratches(image_path: str) -> dict:
     labeled = label(bw_bool)
     props = regionprops(labeled)
 
-    scratch_matrix = np.zeros(bw_bool.shape, dtype=np.float64)
     sum_scratch = 0
     scratch_count = 0
     scratch_objects = []
+    accepted_outlines = []   # (scratch_num, boundary coords) for the overlay
 
     img_rows, img_cols = bw_bool.shape
     for prop in props:
@@ -213,21 +233,12 @@ def detect_scratches(image_path: str) -> dict:
                 "length_px": length,
                 "area_px": area,
             })
-            # Mark boundary pixels in scratch matrix
-            for r, c in boundary.astype(int):
-                if 0 <= r < scratch_matrix.shape[0] and 0 <= c < scratch_matrix.shape[1]:
-                    scratch_matrix[r, c] = 1.0
+            accepted_outlines.append((scratch_count, boundary))
 
-    # Fill scratch outlines
-    from scipy.ndimage import binary_fill_holes
-    scratch_matrix = binary_fill_holes(scratch_matrix.astype(bool)).astype(np.float64)
-
-    # Save overlay: channel 0 = grey, channel 1 = scratch * 0.5
-    overlay = np.zeros((*bw_bool.shape, 3), dtype=np.float64)
-    overlay[:, :, 0] = old_grey
-    overlay[:, :, 1] = scratch_matrix * 0.5
-    overlay_uint8 = (np.clip(overlay, 0, 1) * 255).astype(np.uint8)
-
+    # ── Overlay: original frame in grey + red scratch outlines + numbers ──────
+    # Purely for human review (matches the old "scratch_N" labelled output); it
+    # does NOT affect any returned statistic.
+    overlay_uint8 = _render_overlay(rgb, accepted_outlines)
     base = os.path.splitext(image_path)[0]
     overlay_path = base + "_overlay.png"
     Image.fromarray(overlay_uint8).save(overlay_path)
@@ -584,11 +595,14 @@ class AnalysisPipeline:
     """
     def __init__(self, leg_dir,
                  on_progress=None, on_done=None, on_error=None,
-                 total_expected=None):
+                 on_image=None, total_expected=None):
         self._dir = leg_dir
         self._on_progress = on_progress or (lambda done, total: None)
         self._on_done = on_done or (lambda results: None)
         self._on_error = on_error or (lambda e: None)
+        # on_image(overlay_path, fname): fired after each image is analysed, for
+        # a live "last analysed" preview in the GUI.
+        self._on_image = on_image or (lambda overlay_path, fname: None)
         self._total = total_expected
         self._stop_event = threading.Event()
         self._thread = None
@@ -633,6 +647,8 @@ class AnalysisPipeline:
                                     "scratch_count": result["scratch_count"],
                                 }) + "\n")
                                 rf.flush()
+                                # Live preview of the annotated overlay
+                                self._on_image(result["overlay_path"], fname)
                             except Exception as e:
                                 rf.write(json.dumps({"file": fname, "error": str(e)}) + "\n")
                                 rf.flush()

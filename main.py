@@ -100,6 +100,7 @@ class Signals(QObject):
     analysis_progress   = pyqtSignal(int, int)         # (images_analysed, images_total)
     capture_done        = pyqtSignal()                  # grid scan finished
     leg_analysis_done   = pyqtSignal(str, list)        # (leg_name, result_list)
+    analysis_image      = pyqtSignal(str, str)          # (overlay_path, fname) live preview
     error               = pyqtSignal(str)               # error message to show in a dialog
     status_msg          = pyqtSignal(str)               # status bar text update
 
@@ -118,6 +119,7 @@ class MainWindow(QMainWindow):
         self._sig.analysis_progress.connect(self._on_analysis_progress)
         self._sig.capture_done.connect(self._on_capture_done)
         self._sig.leg_analysis_done.connect(self._on_leg_analysis_done)
+        self._sig.analysis_image.connect(self._on_analysis_image)
         self._sig.error.connect(self._on_error)
         self._sig.status_msg.connect(lambda m: self._statusbar.showMessage(m))
 
@@ -441,6 +443,25 @@ class MainWindow(QMainWindow):
         prog_lay.addWidget(self._ana_bar)
         right.addWidget(prog_box)
 
+        # ── Live analysis preview ─────────────────────────────────────────────
+        # Flashes each analysed frame with its red scratch outlines so the user
+        # can eyeball detection accuracy as the analysis runs.
+        ana_prev_box = QGroupBox("Last analyzed")
+        ana_prev_lay = QVBoxLayout(ana_prev_box)
+        ana_prev_lay.setSpacing(2)
+        self._ana_prev_label = QLabel("(analysis previews appear here)")
+        self._ana_prev_label.setAlignment(Qt.AlignCenter)
+        self._ana_prev_label.setMinimumHeight(150)
+        self._ana_prev_label.setStyleSheet(
+            "background:#1a1a1a; color:#666; border:1px solid #333;"
+        )
+        self._ana_prev_caption = QLabel("")
+        self._ana_prev_caption.setAlignment(Qt.AlignCenter)
+        self._ana_prev_caption.setStyleSheet("color:#888; font-size:10px;")
+        ana_prev_lay.addWidget(self._ana_prev_label)
+        ana_prev_lay.addWidget(self._ana_prev_caption)
+        right.addWidget(ana_prev_box)
+
         # ── Finish & Export ───────────────────────────────────────────────────
         self._finish_btn = QPushButton("Finish && Export Excel")
         self._finish_btn.setEnabled(False)
@@ -674,35 +695,66 @@ class MainWindow(QMainWindow):
     # ── Connection ────────────────────────────────────────────────────────────
 
     def _on_connect(self):
-        try:
-            if self._camera is None:
+        # ── 1. Camera (required for the live feed; fatal if it fails) ─────────
+        if self._camera is None:
+            try:
                 cam_txt = self._cam_port_edit.text().strip().lower()
-                # Pass camera index to OpenCV backend if user typed a digit
-                if cam_txt.isdigit():
+                if cam_txt.isdigit():           # OpenCV backend by index
                     from camera import OpenCVCamera
                     self._camera = OpenCVCamera(int(cam_txt))
                     self._camera.open()
                 else:
                     self._camera = open_camera()
+            except Exception as e:
+                self._camera = None
+                QMessageBox.critical(self, "Camera error",
+                                     f"Could not open the camera:\n{e}")
+                return
 
-            if self._motor is None:
+        # Start the live preview NOW — before the motor — so a missing/failed
+        # ESP32 can never abort the feed (it previously threw and skipped this).
+        self._set_analysis_mode(self._analysis_on)
+        QTimer.singleShot(2000, lambda: self._preview_timer.start(66))
+        self._cal_btn.setEnabled(True)
+
+        # ── 2. Classifier worker (no-op in rules mode) ───────────────────────
+        try:
+            self._clf.load()
+        except Exception as e:
+            print(f"[main] classifier load failed: {e}")
+
+        # ── 3. Motor (optional — warn but keep the camera alive on failure) ──
+        if self._motor is None:
+            try:
                 esp_txt = self._esp_port_edit.text().strip()
                 port = None if esp_txt.lower() == "auto" else esp_txt
                 self._motor = MotorController(port=port)
                 self._motor.open()
+            except Exception as e:
+                self._motor = None
+                QMessageBox.warning(
+                    self, "ESP32 not connected",
+                    f"The camera is live, but the motor controller could not "
+                    f"connect:\n{e}\n\nCapture/scan needs the ESP32 — connect it "
+                    f"and click Connect again.  Analyze-only mode still works.")
 
-            self._clf.load()
-            # Re-apply camera settings now that camera is open
-            self._set_analysis_mode(self._analysis_on)
-            # Delay preview so camera settles at new exposure before first frame shows
-            QTimer.singleShot(2000, lambda: self._preview_timer.start(66))
+        self._go_btn.setEnabled(True)
+        if self._motor is not None:
             self._connect_btn.setText("Connected ✓")
             self._connect_btn.setEnabled(False)
-            self._go_btn.setEnabled(True)
-            self._cal_btn.setEnabled(True)
             self._statusbar.showMessage("Connected — camera and ESP32 ready")
-        except Exception as e:
-            QMessageBox.critical(self, "Connection error", str(e))
+        else:
+            # Camera up but ESP missing — let the user reconnect it without restart
+            self._connect_btn.setText("Reconnect ESP32")
+            self._connect_btn.setEnabled(True)
+            self._statusbar.showMessage("Camera live — ESP32 not connected")
+
+    # ── Run-state helpers ──────────────────────────────────────────────────────
+
+    def _set_mode_enabled(self, on: bool):
+        """Lock/unlock the Mode radio buttons (locked while a run is active)."""
+        for btn in (self._btn_cap_analyze, self._btn_cap_only, self._btn_ana_only):
+            btn.setEnabled(on)
 
     # ── Sensitivity ──────────────────────────────────────────────────────────
 
@@ -775,6 +827,7 @@ class MainWindow(QMainWindow):
         self._ana_bar.setMaximum(total); self._ana_bar.setValue(0)
         self._go_btn.setEnabled(False)
         self._stop_btn.setEnabled(True)
+        self._set_mode_enabled(False)   # lock mode selection during the run
 
         # Temporary "Capturing" row — named after capture completes
         self._pending_leg_name = "__capturing__"
@@ -823,6 +876,7 @@ class MainWindow(QMainWindow):
                 import shutil
                 shutil.rmtree(tmp_dir, ignore_errors=True)
                 self._go_btn.setEnabled(True)
+                self._set_mode_enabled(True)
                 self._statusbar.showMessage("Capture cancelled.")
                 self._leg_table.removeRow(
                     self._find_leg_row("(capturing…)")
@@ -839,6 +893,7 @@ class MainWindow(QMainWindow):
             shutil.rmtree(tmp_dir, ignore_errors=True)
             self._leg_table.removeRow(self._find_leg_row("(capturing…)"))
             self._go_btn.setEnabled(True)
+            self._set_mode_enabled(True)
             self._statusbar.showMessage("Leg discarded — no name given.")
             return
         leg_name = leg_name.strip()
@@ -856,6 +911,7 @@ class MainWindow(QMainWindow):
                 shutil.rmtree(tmp_dir, ignore_errors=True)
                 self._leg_table.removeRow(self._find_leg_row("(capturing…)"))
                 self._go_btn.setEnabled(True)
+                self._set_mode_enabled(True)
                 return
             import shutil
             shutil.rmtree(final_dir, ignore_errors=True)
@@ -878,8 +934,10 @@ class MainWindow(QMainWindow):
 
         if self._capture_mode == MODE_CAPTURE_ANALYZE:
             self._start_leg_analysis(leg_name, final_dir, n_captured)
+            # modes stay locked — analysis is still running for this leg
         else:
             self._check_finish_eligibility()
+            self._set_mode_enabled(True)    # capture-only leg finished → unlock
 
     def _find_leg_row(self, leg_name: str) -> int:
         for row in range(self._leg_table.rowCount()):
@@ -895,15 +953,20 @@ class MainWindow(QMainWindow):
         self._analyzing_legs.add(leg_name)
         self._set_leg_status(leg_name, "Analyzing", img_count)
 
+        if not hasattr(self, "_analysis_pipelines"):
+            self._analysis_pipelines = []
+
         ap = AnalysisPipeline(
             leg_dir=leg_dir,
             total_expected=img_count,
             on_progress=lambda d, t: self._sig.analysis_progress.emit(d, t or img_count),
             on_done=lambda results, _n=leg_name: self._sig.leg_analysis_done.emit(_n, results),
+            on_image=lambda p, f: self._sig.analysis_image.emit(p, f),
             on_error=lambda e, _n=leg_name: self._sig.error.emit(
                 f"Analysis error on {_n}: {e}"
             ),
         )
+        self._analysis_pipelines.append(ap)
         ap.start()
 
     def _on_leg_analysis_done(self, leg_name: str, results: list):
@@ -913,8 +976,20 @@ class MainWindow(QMainWindow):
         self._statusbar.showMessage(f"Analysis complete: {leg_name}")
         self._check_finish_eligibility()
 
-        if self._finish_waiting and not self._analyzing_legs:
-            self._do_export()
+        # Advance the global (serialized) progress offset by this leg's images
+        if getattr(self, "_ana_serialized", False):
+            self._ana_completed += len(results)
+            self._ana_bar.setValue(self._ana_completed)
+
+        if not self._analyzing_legs:
+            # This leg finished — start the next queued leg, if any.
+            if not self._launch_next_pending_analysis():
+                # Whole run is complete → unlock mode selection.
+                self._ana_serialized = False
+                self._set_mode_enabled(True)
+                self._stop_btn.setEnabled(False)
+                if self._finish_waiting:
+                    self._do_export()
 
     def _check_finish_eligibility(self):
         ready = any(v is not None for v in self._leg_results.values())
@@ -971,27 +1046,52 @@ class MainWindow(QMainWindow):
                  if f.endswith(".jpg") and "overlay" not in f])
             for lg in found
         )
-        self._ana_bar.setMaximum(total); self._ana_bar.setValue(0)
+        self._ana_bar.setMaximum(max(total, 1)); self._ana_bar.setValue(0)
         self._go_btn.setEnabled(False)
         self._stop_btn.setEnabled(True)
+        self._set_mode_enabled(False)   # lock mode selection during the run
 
-        done_count = [0]
+        # Process legs ONE AT A TIME.  Launching every leg's analysis thread at
+        # once made them contend on the GIL for the heavy scipy work, so the
+        # first result could take minutes (the "progress bar never moved" bug).
+        # A serial queue keeps one CPU-bound worker active and the bar moving.
+        self._ana_serialized = True
+        self._ana_completed  = 0          # images finished in prior legs (global bar)
+        self._analysis_queue = []
         for lg in found:
             lg_dir = os.path.join(self._set_dir, lg)
             n = len([f for f in os.listdir(lg_dir)
                      if f.endswith(".jpg") and "overlay" not in f])
-            self._upsert_leg_row(lg, n, "Analyzing")
-            self._start_leg_analysis(lg, lg_dir, n)
+            self._upsert_leg_row(lg, n, "Queued")
+            self._analysis_queue.append((lg, lg_dir, n))
 
-        self._statusbar.showMessage(f"Analyzing {len(found)} leg(s)…")
+        self._statusbar.showMessage(f"Analyzing {len(found)} leg(s) sequentially…")
+        self._launch_next_pending_analysis()
+
+    def _launch_next_pending_analysis(self) -> bool:
+        """Start the next queued analyze-only leg.  Returns True if one started."""
+        queue = getattr(self, "_analysis_queue", None)
+        if not queue:
+            return False
+        lg, lg_dir, n = queue.pop(0)
+        self._start_leg_analysis(lg, lg_dir, n)
+        return True
 
     # ── Stop ─────────────────────────────────────────────────────────────────
 
     def _on_stop(self):
         if self._capture_pipeline:
             self._capture_pipeline.stop()
+        # Stop running analysis and drop any queued (serialized) legs so they
+        # don't keep launching after the user aborts.
+        for ap in getattr(self, "_analysis_pipelines", []):
+            ap.stop()
+        self._analysis_queue = []
+        self._ana_serialized = False
+        self._analyzing_legs.clear()
         self._stop_btn.setEnabled(False)
         self._go_btn.setEnabled(True)
+        self._set_mode_enabled(True)    # unlock — run aborted
         self._statusbar.showMessage("Stopped")
 
     # ── Finish & Export ───────────────────────────────────────────────────────
@@ -1048,7 +1148,22 @@ class MainWindow(QMainWindow):
         self._cap_bar.setMaximum(total); self._cap_bar.setValue(done)
 
     def _on_analysis_progress(self, done, total):
-        self._ana_bar.setMaximum(max(total, 1)); self._ana_bar.setValue(done)
+        if getattr(self, "_ana_serialized", False):
+            # Global bar across serialized legs: offset + current-leg progress.
+            self._ana_bar.setValue(self._ana_completed + done)
+        else:
+            self._ana_bar.setMaximum(max(total, 1)); self._ana_bar.setValue(done)
+
+    def _on_analysis_image(self, overlay_path, fname):
+        """Show the just-analysed frame (with red scratch outlines) in the panel."""
+        pix = QPixmap(overlay_path)
+        if pix.isNull():
+            return
+        self._ana_prev_label.setPixmap(pix.scaled(
+            self._ana_prev_label.width(), self._ana_prev_label.height(),
+            Qt.KeepAspectRatio, Qt.SmoothTransformation,
+        ))
+        self._ana_prev_caption.setText(fname)
 
     def _on_error(self, msg):
         QMessageBox.critical(self, "Error", msg)
