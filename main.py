@@ -265,6 +265,24 @@ class MainWindow(QMainWindow):
         self._mode_group.buttonToggled.connect(self._on_mode_changed)
         right.addWidget(mode_box)
 
+        # ── Analysis method ───────────────────────────────────────────────────
+        method_box = QGroupBox("Analysis method")
+        method_lay = QVBoxLayout(method_box)
+        method_lay.setSpacing(3)
+        self._method_combo = QComboBox()
+        self._method_combo.addItem("Legacy  (MATLAB-faithful)", "legacy")
+        self._method_combo.addItem("Accurate  (defect-aware)",  "accurate")
+        self._method_combo.currentIndexChanged.connect(self._on_method_changed)
+        method_lay.addWidget(self._method_combo)
+        self._method_hint = QLabel(
+            "Legacy reproduces the original MATLAB numbers (±5%)."
+        )
+        self._method_hint.setWordWrap(True)
+        self._method_hint.setStyleSheet("color:#888; font-size:10px;")
+        method_lay.addWidget(self._method_hint)
+        right.addWidget(method_box)
+        self._analysis_method = "legacy"
+
         # ── Connection ────────────────────────────────────────────────────────
         self._conn_box = QGroupBox("Connection")
         conn_lay = QVBoxLayout(self._conn_box)
@@ -597,6 +615,18 @@ class MainWindow(QMainWindow):
 
     # ── Mode visibility ───────────────────────────────────────────────────────
 
+    def _on_method_changed(self, *_):
+        self._analysis_method = self._method_combo.currentData()
+        if self._analysis_method == "accurate":
+            self._method_hint.setText(
+                "Independent detector — measures only horizontal scratches, "
+                "rejecting specs, grey halos and non-horizontal defects."
+            )
+        else:
+            self._method_hint.setText(
+                "Legacy reproduces the original MATLAB numbers (±5%)."
+            )
+
     def _on_mode_changed(self, *_):
         mode    = self._mode_group.checkedId()
         capture = mode in (MODE_CAPTURE_ONLY, MODE_CAPTURE_ANALYZE)
@@ -752,9 +782,10 @@ class MainWindow(QMainWindow):
     # ── Run-state helpers ──────────────────────────────────────────────────────
 
     def _set_mode_enabled(self, on: bool):
-        """Lock/unlock the Mode radio buttons (locked while a run is active)."""
+        """Lock/unlock Mode radios + analysis-method selector during a run."""
         for btn in (self._btn_cap_analyze, self._btn_cap_only, self._btn_ana_only):
             btn.setEnabled(on)
+        self._method_combo.setEnabled(on)
 
     # ── Sensitivity ──────────────────────────────────────────────────────────
 
@@ -965,6 +996,7 @@ class MainWindow(QMainWindow):
             on_error=lambda e, _n=leg_name: self._sig.error.emit(
                 f"Analysis error on {_n}: {e}"
             ),
+            mode=getattr(self, "_analysis_method", "legacy"),
         )
         self._analysis_pipelines.append(ap)
         ap.start()

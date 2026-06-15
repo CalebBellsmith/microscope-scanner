@@ -195,16 +195,43 @@ def _render_overlay(rgb: np.ndarray, outlines: list) -> np.ndarray:
     return vis
 
 
-def detect_scratches(image_path: str) -> dict:
+def detect_scratches(image_path: str, mode: str = "legacy") -> dict:
     """
-    Run the full scratch detection pipeline on one image.
+    Run scratch detection on one image and save its overlay.
 
-    Returns a dict with:
+    mode = "legacy"   → faithful port of the MATLAB pipeline (~95% of MATLAB).
+    mode = "accurate" → independent detector tuned to measure only genuine
+                        horizontal scratches, rejecting specs, grey halos and
+                        non-horizontal defects (reuses the scanner's logic).
+
+    Both return the same schema:
       scratch_area   : int   total pixel area of detected scratches
       scratch_count  : int   number of distinct scratch objects
+      scratches      : list  per-scratch dicts
       overlay_path   : str   path to the saved overlay PNG
     """
     rgb = np.array(Image.open(image_path).convert("RGB"))
+
+    if mode == "accurate":
+        area, count, objs, outlines = _detect_accurate(rgb)
+    else:
+        area, count, objs, outlines = _detect_legacy(rgb)
+
+    overlay_uint8 = _render_overlay(rgb, outlines)
+    base = os.path.splitext(image_path)[0]
+    overlay_path = base + "_overlay.png"
+    Image.fromarray(overlay_uint8).save(overlay_path)
+
+    return {
+        "scratch_area": int(round(area)),
+        "scratch_count": count,
+        "scratches": objs,
+        "overlay_path": overlay_path,
+    }
+
+
+def _detect_legacy(rgb: np.ndarray):
+    """MATLAB-faithful detector. Returns (area, count, objects, outlines)."""
     grey = _to_grey_adjusted(rgb)
     old_grey = grey.copy()
 
@@ -273,20 +300,76 @@ def detect_scratches(image_path: str) -> dict:
             })
             accepted_outlines.append((scratch_count, boundary))
 
-    # ── Overlay: original frame in grey + red scratch outlines + numbers ──────
-    # Purely for human review (matches the old "scratch_N" labelled output); it
-    # does NOT affect any returned statistic.
-    overlay_uint8 = _render_overlay(rgb, accepted_outlines)
-    base = os.path.splitext(image_path)[0]
-    overlay_path = base + "_overlay.png"
-    Image.fromarray(overlay_uint8).save(overlay_path)
+    return sum_scratch, scratch_count, scratch_objects, accepted_outlines
 
-    return {
-        "scratch_area": int(round(sum_scratch)),
-        "scratch_count": scratch_count,
-        "scratches": scratch_objects,
-        "overlay_path": overlay_path,
-    }
+
+def _detect_accurate(rgb: np.ndarray):
+    """
+    Independent, accuracy-first scratch detector (no MATLAB constraint).
+
+    Strategy — measure only genuine HORIZONTAL scratches and reject the
+    artefacts the scanner already knows about (round specs, grey dots/halos,
+    non-horizontal fibres/blobs):
+
+      1. Estimate the bright background and take each pixel's DARKNESS below it
+         (scratches are darker than the slide).  Working on local darkness makes
+         detection robust to uneven lighting.
+      2. Threshold by CONTRAST (darkness vs. background noise) — soft grey
+         halos are low-contrast and fall out here.
+      3. Morphologically OPEN with a horizontal line element — only pixels that
+         belong to a horizontal run survive, erasing round specs/dust and
+         vertical/diagonal features.
+      4. Keep dark components that overlap a horizontal seed AND are wider than
+         tall (aspect gate) — the same shape logic the scanner uses to tell a
+         scratch from a blob.  Their dark-pixel area is the scratch area.
+
+    Returns (area, count, objects, outlines).
+    """
+    import cv2
+    grey = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    H, W = grey.shape
+
+    # 1. Background (bright) via a large morphological close, then darkness below it
+    bg_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (31, 31))
+    background = cv2.morphologyEx(grey, cv2.MORPH_CLOSE, bg_kernel)
+    darkness   = cv2.subtract(background, grey)          # >0 where darker than bg
+
+    # 2. Contrast threshold — grey halos / gradients are weak here and excluded
+    d_mean, d_std = float(darkness.mean()), float(darkness.std())
+    thr = max(8.0, d_mean + 1.0 * d_std)
+    dark_mask = (darkness > thr).astype(np.uint8)
+
+    # 3. Horizontal seeds — open with a wide-short element to keep only h-runs
+    h_kernel   = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 1))
+    horiz_seed = cv2.morphologyEx(dark_mask, cv2.MORPH_OPEN, h_kernel)
+
+    # 4. Keep dark components that are horizontal scratches
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(dark_mask, connectivity=8)
+    area = 0
+    count = 0
+    objs = []
+    outlines = []
+    for i in range(1, n):
+        x, y, w, h, a = stats[i]
+        if a < 30:                       # ignore tiny dust specks
+            continue
+        comp = labels[y:y + h, x:x + w] == i
+        if not horiz_seed[y:y + h, x:x + w][comp].any():
+            continue                     # no horizontal core → spec / blob / halo
+        if w <= h:                       # must be wider than tall (horizontal)
+            continue
+        area += int(a)
+        count += 1
+        objs.append({"scratch_num": count, "width_px": int(h),
+                     "length_px": int(w), "area_px": int(a)})
+        # outline for the overlay (contour of this component)
+        cm = (labels == i).astype(np.uint8)
+        cnts, _ = cv2.findContours(cm, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if cnts:
+            c = cnts[0][:, 0, :]
+            outlines.append((count, np.column_stack([c[:, 1], c[:, 0]]).astype(float)))
+
+    return area, count, objs, outlines
 
 
 # ── Excel export ──────────────────────────────────────────────────────────────
@@ -633,7 +716,7 @@ class AnalysisPipeline:
     """
     def __init__(self, leg_dir,
                  on_progress=None, on_done=None, on_error=None,
-                 on_image=None, total_expected=None):
+                 on_image=None, total_expected=None, mode="legacy"):
         self._dir = leg_dir
         self._on_progress = on_progress or (lambda done, total: None)
         self._on_done = on_done or (lambda results: None)
@@ -642,6 +725,7 @@ class AnalysisPipeline:
         # a live "last analysed" preview in the GUI.
         self._on_image = on_image or (lambda overlay_path, fname: None)
         self._total = total_expected
+        self._mode = mode               # "legacy" (MATLAB) or "accurate"
         self._stop_event = threading.Event()
         self._thread = None
         self._results_path = os.path.join(leg_dir, "results.jsonl")
@@ -676,7 +760,7 @@ class AnalysisPipeline:
                                 break
                             path = os.path.join(self._dir, fname)
                             try:
-                                result = detect_scratches(path)
+                                result = detect_scratches(path, mode=self._mode)
                                 result["file"] = fname
                                 all_results.append(result)
                                 rf.write(json.dumps({
