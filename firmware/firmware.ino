@@ -6,124 +6,147 @@
   Replies "OK\n" on success or "ERR <reason>\n" on failure.
 
   Supported commands:
-    MOVE X <steps>    — drive X stepper ± <steps> half-steps (28BYJ-48 via ULN2003)
-    MOVE Y <units>    — rotate Y continuous servo ± <units> (1 unit ≈ 50 ms burst)
-    HOME              — acknowledge only — resets logical position in Python
+    MOVE X <steps>          — drive X stepper ± <steps> half-steps (fast axis)
+    MOVE Y <steps>          — drive Y stepper ± <steps> half-steps (slow axis)
+    MOVE XY <xsteps> <ysteps> — drive BOTH steppers concurrently (interleaved)
+    HOME                    — acknowledge only; Python resets logical position
 
-  Hardware wiring (update these constants to match your build):
-    Stepper IN1-IN4 coils: GPIO 16, 17, 18, 19   (via ULN2003 driver board)
-    Continuous servo signal: GPIO 21              (e.g. MG996R or similar)
+  Both axes are 28BYJ-48 unipolar steppers driven through ULN2003 boards.
+  Half-stepping (8 phases) gives smoother motion and doubles resolution:
+    4096 half-steps = 1 full revolution of the output shaft.
 
-  Motor notes:
-    28BYJ-48 is a 4-phase unipolar stepper.  Half-stepping (8 phases) gives
-    smoother motion than full-step (4 phases) and doubles effective resolution.
-    4096 half-steps ≈ 1 full revolution of the output shaft.
-    Coils are de-energised after each move to prevent heat build-up.
+  Calibration (measured on this build):
+    X axis: 1 rotation (4096 half-steps) = 0.8 cm  →  5120 half-steps / cm
+    Y axis: 1 rotation (4096 half-steps) = 1.4 cm  →  2925.7 half-steps / cm
+  Step rate (delay between half-steps) does NOT affect distance — only speed —
+  so calibration holds at any rate that does not skip steps.
+  Coils are de-energised after each move to prevent heat build-up.
+
+  Hardware wiring (IN1-IN4 on each ULN2003 driver board):
+    X stepper: GPIO 19, 18, 5, 17
+    Y stepper: GPIO 27, 26, 25, 33
 */
 
-#include <ESP32Servo.h>     // ESP32-compatible servo library (not the Arduino built-in)
+// ── Stepper pin assignments ───────────────────────────────────────────────
+const int X_PINS[4] = {19, 18, 5, 17};
+const int Y_PINS[4] = {27, 26, 25, 33};
 
-// ── X axis: 28BYJ-48 stepper via ULN2003 ──────────────────────────────────
-// Four output pins drive the four coil phases.
-const int STEP_PINS[4] = {16, 17, 18, 19};
-
-// Half-step sequence: each row is one step, columns are coil states (HIGH/LOW).
-// 8 steps per electrical cycle; cycling through these drives the motor smoothly.
+// Half-step sequence: 8 rows, each row drives one electrical step.
 const int STEP_SEQ[8][4] = {
   {1,0,0,0}, {1,1,0,0}, {0,1,0,0}, {0,1,1,0},
   {0,0,1,0}, {0,0,1,1}, {0,0,0,1}, {1,0,0,1}
 };
-const int STEP_DELAY_US = 1200;  // delay between half-steps in µs (lower = faster, may skip steps)
-int stepIndex = 0;               // current position in the 8-step sequence
 
-// Step the motor once in the given direction (+1 forward, -1 backward)
-void stepOnce(int direction) {
-  stepIndex = (stepIndex + direction + 8) % 8;   // wrap 0-7
-  for (int i = 0; i < 4; i++)
-    digitalWrite(STEP_PINS[i], STEP_SEQ[stepIndex][i]);
-  delayMicroseconds(STEP_DELAY_US);
+// Per-axis step delay (µs between half-steps).  X is pushed fast because it
+// does 10 moves per rung; Y stays conservative since it only steps twice per
+// leg.  If a motor stalls or the scan drifts, RAISE the offending delay —
+// skipped steps silently corrupt registration.  (Prior validated X rate was
+// 1200 µs; 900 µs is the fast target — back off toward 1200 if it skips.)
+const int X_STEP_DELAY_US = 900;
+const int Y_STEP_DELAY_US = 1500;
+
+int xStepIndex = 0;   // current position in the 8-step table for X
+int yStepIndex = 0;   // current position in the 8-step table for Y
+
+// Advance one stepper a single half-step in the given direction (no delay,
+// no de-energise — callers handle pacing and coil shutdown).
+inline void stepAxisOnce(const int pins[4], int &stepIndex, int dir) {
+  stepIndex = (stepIndex + dir + 8) % 8;
+  for (int p = 0; p < 4; p++)
+    digitalWrite(pins[p], STEP_SEQ[stepIndex][p]);
 }
 
-// Move n half-steps (positive = forward, negative = reverse)
-void stepN(int n) {
+inline void deenergise(const int pins[4]) {
+  for (int p = 0; p < 4; p++) digitalWrite(pins[p], LOW);
+}
+
+// Drive a single stepper n half-steps at the given delay.
+void stepN(const int pins[4], int &stepIndex, int n, int delayUs) {
   int dir   = (n >= 0) ? 1 : -1;
-  int count = abs(n);
-  for (int i = 0; i < count; i++) stepOnce(dir);
-  // De-energise all coils — prevents motor getting hot when idle
-  for (int i = 0; i < 4; i++) digitalWrite(STEP_PINS[i], LOW);
+  long count = abs((long)n);
+  for (long i = 0; i < count; i++) {
+    stepAxisOnce(pins, stepIndex, dir);
+    delayMicroseconds(delayUs);
+  }
+  deenergise(pins);
 }
 
-// ── Y axis: continuous rotation servo ─────────────────────────────────────
-// A continuous servo spins rather than holding an angle.
-// Pulse width controls direction and speed:
-//   1500 µs = stop
-//   < 1500  = clockwise (speed proportional to deviation from 1500)
-//   > 1500  = counter-clockwise
-Servo yServo;
-const int SERVO_PIN    = 21;
-const int SERVO_CW_US  = 1350;   // moderate CW speed
-const int SERVO_CCW_US = 1650;   // moderate CCW speed
-const int SERVO_STOP_US = 1500;  // standstill
-const int UNIT_MS = 50;          // milliseconds of movement per "unit"
+// Drive BOTH steppers concurrently.  A Bresenham distribution spreads the
+// smaller move evenly across the larger one, so both finish together and the
+// stage travels a straight diagonal.  Paced at the X (fast) delay; since Y is
+// far shorter it ends up stepping sparsely and therefore well within its safe
+// rate, so accuracy is preserved on both axes.
+void moveXY(int nx, int ny) {
+  int  dirx = (nx >= 0) ? 1 : -1;
+  int  diry = (ny >= 0) ? 1 : -1;
+  long ax = abs((long)nx);
+  long ay = abs((long)ny);
+  long steps = max(ax, ay);
+  long errx = 0, erry = 0;
 
-// Rotate the servo for abs(units)*UNIT_MS milliseconds in the given direction
-void moveServo(int units) {
-  if (units == 0) return;
-  int pulse    = (units > 0) ? SERVO_CW_US : SERVO_CCW_US;
-  int duration = abs(units) * UNIT_MS;   // total run time in ms
-  yServo.writeMicroseconds(pulse);       // start spinning
-  delay(duration);                        // run for the required time
-  yServo.writeMicroseconds(SERVO_STOP_US); // stop
+  for (long i = 0; i < steps; i++) {
+    errx += ax;
+    if (errx >= steps) { errx -= steps; stepAxisOnce(X_PINS, xStepIndex, dirx); }
+    erry += ay;
+    if (erry >= steps) { erry -= steps; stepAxisOnce(Y_PINS, yStepIndex, diry); }
+    delayMicroseconds(X_STEP_DELAY_US);
+  }
+  deenergise(X_PINS);
+  deenergise(Y_PINS);
 }
 
 // ── Serial command parser ─────────────────────────────────────────────────
 String inputLine = "";   // accumulates characters until a newline arrives
 
 void handleCommand(String cmd) {
-  cmd.trim();   // remove whitespace / CR
+  cmd.trim();
 
-  // HOME: Python resets its logical position — no physical movement needed here
   if (cmd == "HOME") {
     Serial.println("OK");
     return;
   }
 
-  // MOVE X <steps>: drive stepper the requested number of half-steps
-  if (cmd.startsWith("MOVE X ")) {
-    int n = cmd.substring(7).toInt();   // parse integer after "MOVE X "
-    stepN(n);
+  // MOVE XY <xsteps> <ysteps>  (check before "MOVE X " so the prefix matches)
+  if (cmd.startsWith("MOVE XY ")) {
+    String rest = cmd.substring(8);
+    rest.trim();
+    int sp = rest.indexOf(' ');
+    if (sp < 0) { Serial.println("ERR MOVE XY needs two values"); return; }
+    int nx = rest.substring(0, sp).toInt();
+    int ny = rest.substring(sp + 1).toInt();
+    moveXY(nx, ny);
     Serial.println("OK");
     return;
   }
 
-  // MOVE Y <units>: spin servo for <units> × UNIT_MS milliseconds
+  if (cmd.startsWith("MOVE X ")) {
+    int n = cmd.substring(7).toInt();
+    stepN(X_PINS, xStepIndex, n, X_STEP_DELAY_US);
+    Serial.println("OK");
+    return;
+  }
+
   if (cmd.startsWith("MOVE Y ")) {
     int n = cmd.substring(7).toInt();
-    moveServo(n);
+    stepN(Y_PINS, yStepIndex, n, Y_STEP_DELAY_US);
     Serial.println("OK");
     return;
   }
 
-  // Unknown command — report back so Python can surface the error
   Serial.print("ERR unknown command: ");
   Serial.println(cmd);
 }
 
 // ── Initialisation ────────────────────────────────────────────────────────
 void setup() {
-  Serial.begin(115200);   // must match _BAUD in motor.py
+  Serial.begin(115200);
 
-  // Initialise stepper pins as outputs, start LOW (coils off)
-  for (int i = 0; i < 4; i++) {
-    pinMode(STEP_PINS[i], OUTPUT);
-    digitalWrite(STEP_PINS[i], LOW);
+  for (int p = 0; p < 4; p++) {
+    pinMode(X_PINS[p], OUTPUT); digitalWrite(X_PINS[p], LOW);
+    pinMode(Y_PINS[p], OUTPUT); digitalWrite(Y_PINS[p], LOW);
   }
 
-  // Attach servo and make sure it starts stopped
-  yServo.attach(SERVO_PIN);
-  yServo.writeMicroseconds(SERVO_STOP_US);
-
-  Serial.println("READY");   // signals to Python that firmware is booted
+  Serial.println("READY");
 }
 
 // ── Main loop — read serial bytes and build commands ──────────────────────
@@ -131,11 +154,10 @@ void loop() {
   while (Serial.available()) {
     char c = Serial.read();
     if (c == '\n') {
-      // Newline terminates a command — process and clear the buffer
       handleCommand(inputLine);
       inputLine = "";
     } else {
-      inputLine += c;   // append character to current command
+      inputLine += c;
     }
   }
 }

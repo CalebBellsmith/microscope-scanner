@@ -40,7 +40,7 @@ from PyQt5.QtWidgets import (
     QComboBox, QLineEdit, QFileDialog, QMessageBox, QStatusBar,
     QRadioButton, QButtonGroup, QInputDialog, QTableWidget,
     QTableWidgetItem, QHeaderView, QSizePolicy, QFrame,
-    QScrollArea, QCheckBox, QSlider,
+    QScrollArea, QCheckBox, QSlider, QDialog,
 )
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject
 from PyQt5.QtGui import QImage, QPixmap, QColor, QFont
@@ -72,6 +72,58 @@ _CUSTOM_IDX = len(PROFILES) - 1   # index of the "Custom" entry in the combo box
 MODE_CAPTURE_ONLY    = 0   # capture images but skip analysis
 MODE_ANALYZE_ONLY    = 1   # run analysis on an existing folder
 MODE_CAPTURE_ANALYZE = 2   # capture then analyze automatically
+
+class PrezeroDialog(QDialog):
+    """
+    Brief modal reminder shown right after the user starts a leg, telling them
+    the stage must be pre-zeroed at the leg origin.  It auto-dismisses after a
+    short countdown (a "flash"), and Enter dismisses it immediately.  Returns
+    QDialog.Accepted to proceed with the scan, Rejected (Esc) to abort.
+    """
+    def __init__(self, parent=None, seconds=3):
+        super().__init__(parent)
+        self.setWindowTitle("Ready to scan")
+        self.setModal(True)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(28, 22, 28, 18)
+
+        msg = QLabel("⚠  Make sure the stage is pre-zeroed to the\n"
+                     "leg origin before this scan begins.")
+        msg.setAlignment(Qt.AlignCenter)
+        f = QFont(); f.setPointSize(12); f.setBold(True); msg.setFont(f)
+        lay.addWidget(msg)
+
+        self._remaining = int(seconds)
+        self._hint = QLabel()
+        self._hint.setAlignment(Qt.AlignCenter)
+        self._hint.setStyleSheet("color:#888; font-size:10px;")
+        lay.addWidget(self._hint)
+        self._refresh_hint()
+
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._tick)
+        self._timer.start(1000)
+
+    def _refresh_hint(self):
+        self._hint.setText(
+            f"Starting in {self._remaining}…   (press Enter to start now, Esc to cancel)"
+        )
+
+    def _tick(self):
+        self._remaining -= 1
+        if self._remaining <= 0:
+            self._timer.stop()
+            self.accept()
+        else:
+            self._refresh_hint()
+
+    def keyPressEvent(self, e):
+        if e.key() in (Qt.Key_Return, Qt.Key_Enter):
+            self._timer.stop()
+            self.accept()
+        else:
+            super().keyPressEvent(e)   # Esc → reject (cancel the scan)
+
 
 # Column indices for the leg status table (QTableWidget)
 COL_LEG    = 0   # leg name (FR / FL / etc.)
@@ -125,7 +177,7 @@ class MainWindow(QMainWindow):
 
         self._camera  = None               # camera object (ToupTekCamera / OpenCVCamera)
         self._motor   = None               # MotorController for ESP32
-        self._clf     = QualityClassifier()   # ML quality classifier (uses inference_worker subprocess)
+        self._clf     = QualityClassifier(mode="rules")  # rules-only: pure CV, no torch/worker needed
         self._capture_pipeline  = None     # currently running CapturePipeline (or None)
         self._preview_timer = QTimer()     # fires every ~66 ms to refresh the live feed
         self._preview_timer.timeout.connect(self._update_preview)
@@ -341,8 +393,10 @@ class MainWindow(QMainWindow):
 
         self._rows_spin = QSpinBox(); self._rows_spin.setRange(1, 50); self._rows_spin.setValue(3)
         self._cols_spin = QSpinBox(); self._cols_spin.setRange(1, 50); self._cols_spin.setValue(10)
-        self._x_spin    = QSpinBox(); self._x_spin.setRange(1, 5000); self._x_spin.setValue(200)
-        self._y_spin    = QSpinBox(); self._y_spin.setRange(1, 500);  self._y_spin.setValue(50)
+        # Calibrated defaults: X-step 0.53 cm = 2714 half-steps,
+        # Y rung 0.5 cm = 1463 half-steps (28BYJ-48, 4096 half-steps/rotation).
+        self._x_spin    = QSpinBox(); self._x_spin.setRange(1, 20000); self._x_spin.setValue(2714)
+        self._y_spin    = QSpinBox(); self._y_spin.setRange(1, 20000); self._y_spin.setValue(1463)
         self._rows_spin.valueChanged.connect(self._on_spinbox_changed)
         self._cols_spin.valueChanged.connect(self._on_spinbox_changed)
         self._total_label = QLabel()
@@ -350,8 +404,8 @@ class MainWindow(QMainWindow):
 
         profile_lay.addLayout(_row("Rows:", self._rows_spin))
         profile_lay.addLayout(_row("Columns:", self._cols_spin))
-        profile_lay.addLayout(_row("X spacing (steps):", self._x_spin))
-        profile_lay.addLayout(_row("Y spacing (units):", self._y_spin))
+        profile_lay.addLayout(_row("X spacing (half-steps):", self._x_spin))
+        profile_lay.addLayout(_row("Y spacing (half-steps):", self._y_spin))
         profile_lay.addWidget(self._total_label)
 
         # Detection sensitivity slider
@@ -850,6 +904,12 @@ class MainWindow(QMainWindow):
 
         if mode == MODE_ANALYZE_ONLY:
             self._run_analyze_only()
+            return
+
+        # Brief reminder that the stage must start at the leg origin.  Enter or
+        # the countdown proceeds; Esc aborts before any motion happens.
+        if PrezeroDialog(self).exec_() != QDialog.Accepted:
+            self._statusbar.showMessage("Scan cancelled — stage not zeroed.")
             return
 
         rows  = self._rows_spin.value()

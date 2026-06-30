@@ -24,10 +24,10 @@
 #define IN4_X 17
 
 // ── Y-axis stepper pin assignments ────────────────────────────────────────
-#define IN1_Y 16
-#define IN2_Y 4
-#define IN3_Y 2
-#define IN4_Y 15
+#define IN1_Y 27
+#define IN2_Y 26
+#define IN3_Y 25
+#define IN4_Y 33
 
 // Half-step sequence: 8 rows, each row drives one electrical step.
 // Energising pairs of coils produces smoother motion and more torque.

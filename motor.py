@@ -5,9 +5,10 @@ The ESP32 runs firmware/firmware.ino which listens for plain-text commands
 over USB serial at 115200 baud and replies with OK or ERR.
 
 Supported commands:
-    MOVE X <steps>   — move X stepper <steps> steps (negative = reverse)
-    MOVE Y <steps>   — move Y stepper <steps> steps
-    HOME             — move both axes to their home position
+    MOVE X <steps>            — move X stepper <steps> half-steps (negative = reverse)
+    MOVE Y <steps>            — move Y stepper <steps> half-steps
+    MOVE XY <xsteps> <ysteps> — move both steppers concurrently (interleaved)
+    HOME                      — reset the logical home position
 
 A threading.Lock prevents two threads sending commands simultaneously,
 which would corrupt the serial stream.
@@ -71,6 +72,27 @@ class MotorController:
 
         if resp != "OK":
             raise RuntimeError(f"Motor error on MOVE {axis} {amount}: {resp!r}")
+
+    def move_xy(self, x_amount: int, y_amount: int):
+        """
+        Move BOTH axes concurrently via the firmware's interleaved MOVE XY.
+        x_amount / y_amount : half-steps (positive = forward, negative = reverse).
+        The stage travels a straight diagonal and both axes finish together,
+        which is faster than two sequential moves for the rung repositioning.
+        Raises RuntimeError if the firmware replies with an error.
+        """
+        x_amount = int(x_amount)
+        y_amount = int(y_amount)
+        cmd = f"MOVE XY {x_amount} {y_amount}\n"
+
+        with self._lock:                   # prevent concurrent commands
+            self._ser.write(cmd.encode())
+            resp = self._ser.readline().decode().strip()
+
+        if resp != "OK":
+            raise RuntimeError(
+                f"Motor error on MOVE XY {x_amount} {y_amount}: {resp!r}"
+            )
 
     def home(self):
         """Send HOME command — moves both axes to their origin position."""

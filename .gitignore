@@ -29,3 +29,6 @@ desktop.ini
 toupcam.py
 toupcam.dll
 libtoupcam.dylib
+
+# Redundant source archive
+abrasion.zip

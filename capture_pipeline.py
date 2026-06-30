@@ -6,16 +6,26 @@ flags a frame as bad (dust/debris in frame).
 Output folder structure:
     output_dir / set_name / leg / 001.jpg … 030.jpg
 
-Image numbers are positional (row * cols + col + 1), always left-to-right
-regardless of capture direction, so filenames match what the MATLAB
-analysis script expects when it does dir('*.jpg').
+Image numbers are positional (row * cols + col + 1), always left-to-right,
+so filenames match what the MATLAB analysis script expects when it does
+dir('*.jpg').
 
-Grid traversal pattern (boustrophedon / snake scan):
-    Row 0: → positions  0  1  2  3 … (left to right)
-    Row 1: ← positions  9  8  7  6 … (right to left — reverses direction)
-    Row 2: → positions 20 21 22 23 … (left to right again)
-    …
-This minimises total stage travel distance.
+Grid traversal pattern (calibrated raster with half-step stagger):
+    Every rung scans FORWARD in X (capture, then step one X-step), then the
+    stage rapidly returns in X while advancing one Y rung.  The returns are
+    deliberately asymmetric so that odd rungs are offset by half an X-step,
+    interleaving their samples with the even rungs for finer X coverage:
+
+        Rung 0:  capture at X-steps 0,1,…,9  (start offset 0.0)
+          ↩ X return −9.5 steps,  Y +1 rung
+        Rung 1:  capture at X-steps 0.5,1.5,…,9.5  (start offset 0.5)
+          ↩ X return −10.5 steps,  Y +1 rung
+        Rung 2:  capture at X-steps 0,1,…,9  (start offset 0.0)
+
+    With the measured calibration (1 X-step = 0.53 cm = 2714 half-steps,
+    1 Y rung = 0.5 cm = 1463 half-steps) the half-step stagger is exact
+    because 2714 is even.  After the final capture the stage returns to the
+    leg origin so the next leg starts from a known position.
 
 Nudge strategy when a frame is bad:
     1. Find the largest dark blob (dust) in the frame using OpenCV.
@@ -85,54 +95,94 @@ class CapturePipeline:
 
     # ── Grid scan ─────────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _rung_start(row):
+        """X start offset of a rung, in whole X-steps.  Odd rungs are
+        staggered half a step so their samples interleave with even rungs."""
+        return 0.5 if (row % 2 == 1) else 0.0
+
     def _run(self):
         """
         Main capture loop — runs in a background thread.
-        Iterates over every grid position, moves the stage, grabs a frame,
-        and saves it.  Calls on_progress after each image.
+        Scans each rung forward in X (capture-then-step), rapidly returns in X
+        while advancing one Y rung between rungs, then returns to the leg
+        origin.  Calls on_progress after each image.
         """
         try:
-            total = self._rows * self._cols
-            done  = 0
+            total  = self._rows * self._cols
+            cols   = self._cols
+            x_step = self._x_spacing            # half-steps per 0.53 cm X move
+            y_step = self._y_spacing            # half-steps per 0.5 cm Y rung
+            done   = 0
+
+            # Track net deliberate stage travel so we can return to origin at
+            # the end (centroid nudges restore themselves, so they net zero and
+            # are not counted here).
+            abs_x = 0
+            abs_y = 0
+
+            def grid_move(axis, amount):
+                nonlocal abs_x, abs_y
+                amount = int(amount)
+                if amount == 0:
+                    return
+                self._motor.move(axis, amount)
+                if axis == "X":
+                    abs_x += amount
+                else:
+                    abs_y += amount
 
             for row in range(self._rows):
                 if self._stop_event.is_set():
                     break
 
-                # Move to the next row (skip for row 0 — already at start)
+                # Reposition between rungs: rapid X return WHILE advancing one Y
+                # rung, performed concurrently for speed.  The X return distance
+                # = (next start) − (prev start + cols) in whole X-steps, e.g.
+                # row 0→1: 0.5 − 10 = −9.5 steps;  row 1→2: 0 − 10.5 = −10.5.
                 if row > 0:
-                    self._motor.move("Y", self._y_spacing)
-                    time.sleep(0.3)   # brief pause for stage to settle
+                    x_return = self._rung_start(row) - self._rung_start(row - 1) - cols
+                    x_amt = round(x_return * x_step)
+                    if hasattr(self._motor, "move_xy"):
+                        self._motor.move_xy(x_amt, y_step)
+                        abs_x += x_amt
+                        abs_y += y_step
+                    else:   # fall back to sequential moves if firmware lacks MOVE XY
+                        grid_move("X", x_amt)
+                        grid_move("Y", y_step)
+                    time.sleep(0.3)   # settle after the reposition
 
-                # Boustrophedon: even rows go left→right, odd rows right→left
-                col_range = (
-                    range(self._cols)
-                    if row % 2 == 0
-                    else range(self._cols - 1, -1, -1)
-                )
-
-                for col in col_range:
+                for col in range(cols):
                     if self._stop_event.is_set():
                         break
 
-                    # Move one column in the current direction (skip for col 0)
-                    if col > 0:
-                        direction = 1 if row % 2 == 0 else -1
-                        self._motor.move("X", direction * self._x_spacing)
-                        time.sleep(0.1)
-
-                    # Capture the best available frame for this position
+                    # Capture FIRST (capture-then-step) at this X position.
                     frame = self._best_frame()
                     if frame is not None:
-                        # Positional filename: always left-to-right, 1-indexed
-                        # e.g. row=1, col=3 → image 14 of a 10-col grid
-                        img_num = row * self._cols + col + 1
+                        # Positional filename: every rung is left-to-right.
+                        img_num = row * cols + col + 1
                         path = os.path.join(self._out, f"{img_num:03d}.jpg")
                         self._save(frame, path)
                         self._on_frame(frame)
 
                     done += 1
                     self._on_progress(done, total)
+
+                    # Step forward one X position after every capture EXCEPT the
+                    # very last one of the scan (no rung follows it).  For
+                    # non-final rungs this final step is the start of the return.
+                    last_overall = (row == self._rows - 1) and (col == cols - 1)
+                    if not last_overall:
+                        grid_move("X", x_step)
+                        time.sleep(0.1)
+
+            # Return the stage to the leg origin so the next leg starts clean
+            # (concurrently when the firmware supports it).
+            if hasattr(self._motor, "move_xy"):
+                self._motor.move_xy(-abs_x, -abs_y)
+            else:
+                grid_move("X", -abs_x)
+                grid_move("Y", -abs_y)
 
             self._on_done()
 
