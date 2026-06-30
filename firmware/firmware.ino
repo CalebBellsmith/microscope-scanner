@@ -42,13 +42,12 @@ const int STEP_SEQ[8][4] = {
 // firmware Y and the RUNG axis (indexes twice/leg) is firmware X.  The SWEEP
 // axis also moves the FARTHEST per step (≈3000 half-steps vs the rung's
 // ≈1350), so at equal rates a sweep move takes ~2× longer in wall-clock and
-// feels slower.  We can't fully equalise that without an unsafe rate, but we
-// run the sweep axis (Y) faster than the rung axis to narrow the gap.
-// Lower = faster but risks skipped steps, which silently corrupt registration:
-// if rung 0 and rung 2 images don't line up, RAISE Y_STEP_DELAY_US back toward
-// 900 (prior validated-safe rate was ~1200 µs).
+// feels slower — but 700 µs on the Y motor skipped steps and made the sweep
+// jumpy/inaccurate, so it is back at the validated-safe 900 µs.  The sweep's
+// extra runtime is inherent to its longer travel, not the rate; don't drop
+// below 900 (prior validated-safe rate was ~1200 µs).
 const int X_STEP_DELAY_US = 900;   // rung axis (short moves)
-const int Y_STEP_DELAY_US = 700;   // sweep axis — faster: long moves dominate runtime
+const int Y_STEP_DELAY_US = 900;   // sweep axis — 900 is the safe floor (700 skips)
 
 int xStepIndex = 0;   // current position in the 8-step table for X
 int yStepIndex = 0;   // current position in the 8-step table for Y
