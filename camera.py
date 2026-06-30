@@ -29,11 +29,16 @@ class ToupTekCamera:
     which stores the frame in self._frame for grab() to return.
     """
 
-    # Two exposure times are used:
-    #   PREVIEW  — short (100ms) keeps the live GUI feed smooth at ~10fps
-    #   CAPTURE  — long  (1300ms) gives full quality for saved images
-    PREVIEW_EXPOSURE_US = 100_000     # 100ms  in microseconds
-    CAPTURE_EXPOSURE_US = 1_300_000   # 1300ms in microseconds
+    # Two exposure times are used, and they are DECOUPLED on purpose:
+    #   PREVIEW  — short (80ms) keeps the live GUI feed fast/smooth so the
+    #              operator can follow along while the stage scans.
+    #   CAPTURE  — long  (1300ms) gives full quality for the SAVED images only.
+    # The live feed always runs at the preview exposure; grab_fresh() briefly
+    # switches to the capture exposure for each saved frame, then switches back.
+    # (Previously the GUI feed inherited the 1300ms capture exposure → ~0.8fps
+    #  and a constantly-blurry screen.)
+    PREVIEW_EXPOSURE_US = 80_000      # 80ms   in microseconds (live feed)
+    CAPTURE_EXPOSURE_US = 1_300_000   # 1300ms in microseconds (saved images)
 
     def __init__(self):
         import toupcam
@@ -58,7 +63,8 @@ class ToupTekCamera:
         self._analysis_mode     = True   # True = analysis settings active
         self._negative_fallback = False  # True = invert in software (SDK put_Negative failed)
         self._frame_count       = 0      # incremented each time a new frame arrives
-        self._preview_expo_us   = self.PREVIEW_EXPOSURE_US  # tracks current live exposure
+        self._preview_expo_us   = self.PREVIEW_EXPOSURE_US  # live-feed exposure (fast)
+        self._capture_expo_us   = self.CAPTURE_EXPOSURE_US  # saved-image exposure (slow)
 
         # Apply analysis settings (exposure, gain, negative, white balance)
         self._apply_settings(analysis=True)
@@ -139,34 +145,43 @@ class ToupTekCamera:
         """Return the most recently received frame (used by the live preview timer)."""
         return self._frame
 
-    def grab_fresh(self, timeout=5.0):
+    def grab_fresh(self, timeout=5.0, skip=1):
         """
         Capture a full-quality frame for saving to disk:
-          1. Switch to long capture exposure (1300ms)
-          2. Wait until _frame_count increases (new frame at correct exposure)
-          3. Restore the user's chosen preview exposure
+          1. Switch to long capture exposure
+          2. DISCARD the next `skip` frame(s), then return the one after.
+          3. Restore the preview (live-feed) exposure
           4. Return the fresh frame
 
-        Used by capture_pipeline instead of grab() so saved images are
-        taken at the correct exposure even while the live preview runs faster.
+        Why discard frames (the crispness fix): when we change ExpoTime the
+        camera is usually mid-integration, so the very first frame delivered
+        afterward straddles the exposure switch — and, just after a stage move,
+        can also catch the tail end of mechanical settling — which shows up as a
+        slightly blurry/smeared saved image.  Skipping it guarantees the
+        returned frame integrated ENTIRELY at the capture exposure with the
+        stage fully still, so saved images are crisp.
+
+        Used by capture_pipeline instead of grab() so saved images use the long
+        capture exposure even while the live preview keeps running fast.
         """
         import time
         if self._cam is None:
             return None
 
-        # Switch to long exposure for the saved image
-        self._cam.put_ExpoTime(self.CAPTURE_EXPOSURE_US)
-        count_before = self._frame_count
+        capture_us = getattr(self, "_capture_expo_us", self.CAPTURE_EXPOSURE_US)
 
-        # Wait for the camera to deliver one new frame at the new exposure
-        deadline = time.time() + timeout
+        # Switch to long exposure for the saved image
+        self._cam.put_ExpoTime(capture_us)
+        target = self._frame_count + 1 + max(0, int(skip))   # frame to keep
+
+        # Allow enough time for the skipped frame(s) + the kept frame to expose.
+        deadline = time.time() + timeout + (skip + 1) * (capture_us / 1e6)
         while time.time() < deadline:
-            if self._frame_count > count_before:
+            if self._frame_count >= target:
                 frame = self._frame
-                # Restore preview exposure (user's chosen value, not hardcoded)
-                self._cam.put_ExpoTime(self._preview_expo_us)
+                self._cam.put_ExpoTime(self._preview_expo_us)   # back to fast feed
                 return frame
-            time.sleep(0.05)
+            time.sleep(0.02)
 
         # Timed out — restore exposure and return whatever frame we have
         self._cam.put_ExpoTime(self._preview_expo_us)

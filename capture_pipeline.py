@@ -56,6 +56,8 @@ class CapturePipeline:
                  output_dir, set_name, leg,
                  rows, cols, x_spacing, y_spacing,
                  quality_threshold=0.5,
+                 review_mode="none", review_fn=None, blur_threshold=80.0,
+                 good_dir=None, bad_dir=None,
                  on_progress=None, on_frame=None, on_done=None, on_error=None):
         """
         camera            : camera object (ToupTekCamera / OpenCVCamera)
@@ -69,6 +71,17 @@ class CapturePipeline:
         quality_threshold : classifier confidence required to skip nudge
                             (0.1 = lenient / accept almost anything,
                              0.9 = strict / nudge unless very confident)
+        review_mode       : "none"   — fully automatic (classify + auto-nudge)
+                            "auto"   — auto-keep sharp+good frames, else ask the
+                                       operator (used for non-uniform focus)
+                            "manual" — ask the operator on every frame
+        review_fn(frame, reason) -> "good"|"bad"
+                            blocking callback into the GUI for auto/manual modes;
+                            "good" keeps the frame, "bad" logs it and retakes.
+        blur_threshold    : Laplacian-variance floor below which a frame is
+                            considered out of focus (auto mode only).
+        good_dir / bad_dir: if set, reviewed frames are copied here (kept→good,
+                            rejected→bad) to grow the ML training dataset.
         on_progress(done, total) : called after each image is captured
         on_frame(frame)          : called with each saved frame (for GUI display)
         on_done()                : called when all images have been captured
@@ -83,6 +96,11 @@ class CapturePipeline:
         self._x_spacing = x_spacing
         self._y_spacing = y_spacing
         self._threshold = quality_threshold
+        self._review_mode = review_mode
+        self._review_fn   = review_fn or (lambda frame, reason: "good")
+        self._blur_thresh = blur_threshold
+        self._good_dir    = good_dir
+        self._bad_dir     = bad_dir
         self._on_progress = on_progress or (lambda done, total: None)
         self._on_frame    = on_frame    or (lambda img: None)
         self._on_done     = on_done     or (lambda: None)
@@ -171,7 +189,7 @@ class CapturePipeline:
                         break
 
                     # Capture FIRST (capture-then-step) at this sweep position.
-                    frame = self._best_frame()
+                    frame = self._acquire_keeper()
                     if frame is not None:
                         img_num = row * cols + col + 1   # positional filename
                         path = os.path.join(self._out, f"{img_num:03d}.jpg")
@@ -208,6 +226,77 @@ class CapturePipeline:
     def _goodness(label, conf):
         """Signed quality score: +conf if good, −conf if bad.  Higher = better."""
         return conf if label == "good" else -conf
+
+    # ── Review-aware capture (focus / operator gate) ──────────────────────────
+
+    @staticmethod
+    def _sharpness(frame) -> float:
+        """Focus metric: variance of the Laplacian.  Low = blurry/out of focus."""
+        import cv2
+        gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+        return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+
+    def _acquire_keeper(self):
+        """
+        Grab the frame to save for this position, honouring the review mode:
+          none   — classify + auto-nudge (the original automatic behaviour).
+          auto   — keep the frame if it's sharp AND the classifier likes it;
+                   otherwise hand it to the operator (blurry/flagged review).
+          manual — always hand the frame to the operator.
+        """
+        if self._review_mode == "none":
+            return self._best_frame()
+
+        frame = self._wait_for_frame()
+        if frame is None:
+            return None
+
+        if self._review_mode == "auto":
+            sharp = self._sharpness(frame) >= self._blur_thresh
+            label = self._clf.predict(frame)[0]
+            if sharp and label == "good":
+                return frame      # clean and in focus — no need to bother anyone
+            reason = "blurry" if not sharp else "flagged bad"
+            return self._operator_review(frame, reason)
+
+        # manual: every frame goes to the operator
+        return self._operator_review(frame, "manual")
+
+    def _operator_review(self, frame, reason):
+        """
+        Show `frame` to the operator and act on Enter (good) / Space (bad).
+        Enter keeps the frame; Space logs it as bad, then RE-captures the same
+        position (the operator adjusts focus during the pause) and asks again.
+        Loops until kept or the run stops.  Reviewed frames are copied to the
+        training dataset (kept→good, rejected→bad).
+        """
+        while not self._stop_event.is_set():
+            decision = self._review_fn(frame, reason)
+            if self._stop_event.is_set():
+                return frame
+            if decision == "good":
+                self._save_training(frame, self._good_dir)
+                return frame
+            # bad → log it and retake at the same spot (focus was adjusted)
+            self._save_training(frame, self._bad_dir)
+            retake = self._wait_for_frame()
+            if retake is None:
+                return frame
+            frame  = retake
+            reason = "retake"
+        return frame
+
+    def _save_training(self, frame, dest_dir):
+        """Copy a reviewed frame into the ML training dataset (best-effort)."""
+        if not dest_dir:
+            return
+        try:
+            os.makedirs(dest_dir, exist_ok=True)
+            stamp = time.strftime("%Y%m%d_%H%M%S")
+            ms    = int(time.time() * 1000) % 1000
+            self._save(frame, os.path.join(dest_dir, f"{stamp}_{ms:03d}.jpg"))
+        except Exception:
+            pass   # never let dataset bookkeeping break a scan
 
     def _best_frame(self):
         """

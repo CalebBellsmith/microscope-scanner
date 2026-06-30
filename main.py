@@ -88,6 +88,12 @@ MODE_CAPTURE_ONLY    = 0   # capture images but skip analysis
 MODE_ANALYZE_ONLY    = 1   # run analysis on an existing folder
 MODE_CAPTURE_ANALYZE = 2   # capture then analyze automatically
 
+# ML training dataset (manual / auto-pause reviews drop labelled frames here so
+# the good/bad model can be retrained on real operator decisions).
+TRAINING_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "training_data")
+TRAINING_GOOD_DIR = os.path.join(TRAINING_DIR, "good")
+TRAINING_BAD_DIR  = os.path.join(TRAINING_DIR, "bad")
+
 class PrezeroDialog(QDialog):
     """
     Brief modal reminder shown right after the user starts a leg, telling them
@@ -171,6 +177,7 @@ class Signals(QObject):
     analysis_image      = pyqtSignal(str, str)          # (overlay_path, fname) live preview
     error               = pyqtSignal(str)               # error message to show in a dialog
     status_msg          = pyqtSignal(str)               # status bar text update
+    review_request      = pyqtSignal(np.ndarray, str)   # (frame, reason) operator review
 
 
 # ── Main Window ───────────────────────────────────────────────────────────────
@@ -191,6 +198,12 @@ class MainWindow(QMainWindow):
         self._sig.analysis_image.connect(self._on_analysis_image)
         self._sig.error.connect(self._on_error)
         self._sig.status_msg.connect(lambda m: self._statusbar.showMessage(m))
+        self._sig.review_request.connect(self._on_review_request)
+
+        # Operator-review (manual / auto-pause) cross-thread handshake
+        self._review_event    = threading.Event()
+        self._review_decision = "good"
+        self._review_active   = False
 
         self._camera  = None               # camera object (ToupTekCamera / OpenCVCamera)
         self._motor   = None               # MotorController for ESP32
@@ -245,9 +258,12 @@ class MainWindow(QMainWindow):
         self._analysis_off_btn.clicked.connect(lambda: self._set_analysis_mode(False))
         left.addLayout(mode_row)
 
-        # Exposure / gain / negative adjusters (enabled only in analysis mode)
+        # Exposure / gain / negative adjusters (enabled only in analysis mode).
+        # Capture exposure = the long exposure used for SAVED images.
+        # Preview exposure = the short exposure used for the LIVE feed (decoupled
+        # so the screen stays fast/sharp even while saves use a long exposure).
         adj_row = QHBoxLayout()
-        adj_row.addWidget(QLabel("Exposure (ms):"))
+        adj_row.addWidget(QLabel("Capture exp:"))
         self._expo_spin = _NoScrollSpinBox()
         self._expo_spin.setFocusPolicy(Qt.NoFocus)
         self._expo_spin.setRange(10, 5000)
@@ -256,6 +272,16 @@ class MainWindow(QMainWindow):
         self._expo_spin.setFixedWidth(90)
         self._expo_spin.valueChanged.connect(self._apply_analysis_settings)
         adj_row.addWidget(self._expo_spin)
+        adj_row.addSpacing(8)
+        adj_row.addWidget(QLabel("Preview exp:"))
+        self._preview_expo_spin = _NoScrollSpinBox()
+        self._preview_expo_spin.setFocusPolicy(Qt.NoFocus)
+        self._preview_expo_spin.setRange(10, 1000)
+        self._preview_expo_spin.setValue(80)        # fast live feed (~12 fps)
+        self._preview_expo_spin.setSuffix(" ms")
+        self._preview_expo_spin.setFixedWidth(85)
+        self._preview_expo_spin.valueChanged.connect(self._apply_analysis_settings)
+        adj_row.addWidget(self._preview_expo_spin)
         adj_row.addSpacing(12)
         adj_row.addWidget(QLabel("Gain:"))
         self._gain_spin = _NoScrollSpinBox()
@@ -275,7 +301,8 @@ class MainWindow(QMainWindow):
         adj_row.addStretch()
         left.addLayout(adj_row)
 
-        self._adj_widgets = [self._expo_spin, self._gain_spin, self._negative_chk]
+        self._adj_widgets = [self._expo_spin, self._preview_expo_spin,
+                             self._gain_spin, self._negative_chk]
         self._set_analysis_mode(True)
 
         root.addLayout(left, stretch=3)
@@ -333,6 +360,62 @@ class MainWindow(QMainWindow):
             mode_lay.addWidget(btn)
         self._mode_group.buttonToggled.connect(self._on_mode_changed)
         right.addWidget(mode_box)
+
+        # ── Capture classifier ────────────────────────────────────────────────
+        # Which good/bad detector runs on each captured frame (rules = pure CV,
+        # no ML needed; hybrid = rules + ML model; ml = model only).
+        clf_box = QGroupBox("Capture classifier")
+        clf_lay = QVBoxLayout(clf_box)
+        clf_lay.setSpacing(3)
+        self._clf_combo = _NoScrollComboBox()
+        self._clf_combo.addItem("Rules  (fast, no ML)",  "rules")
+        self._clf_combo.addItem("Hybrid (rules + ML)",   "hybrid")
+        self._clf_combo.addItem("ML  (model only)",      "ml")
+        self._clf_combo.currentIndexChanged.connect(self._on_classifier_changed)
+        clf_lay.addWidget(self._clf_combo)
+        right.addWidget(clf_box)
+
+        # ── Review during capture ─────────────────────────────────────────────
+        # How the operator is involved while images are captured.  Applies to
+        # any capture mode and is how non-uniform-focus slides are handled
+        # (pause, adjust the focus knob, retake).
+        #   None       — fully automatic (classifier decides + auto-nudges).
+        #   Auto-pause — auto-keep frames that are sharp AND pass the classifier;
+        #                pause only on blurry/flagged frames for Enter/Space.
+        #   Manual     — pause on every frame for Enter (good) / Space (bad,retake).
+        # In Auto-pause/Manual, accepted frames are copied to training_data/good
+        # and rejected ones to training_data/bad to grow the ML dataset.
+        review_box = QGroupBox("Review during capture")
+        review_lay = QVBoxLayout(review_box)
+        review_lay.setSpacing(3)
+        self._review_group = QButtonGroup(self)
+        self._btn_review_none = QRadioButton("None  (fully automatic)")
+        self._btn_review_auto = QRadioButton("Auto-pause  (only when blurry/bad)")
+        self._btn_review_man  = QRadioButton("Manual  (Enter=good · Space=bad/retake)")
+        self._btn_review_none.setChecked(True)
+        for b in (self._btn_review_none, self._btn_review_auto, self._btn_review_man):
+            b.setFocusPolicy(Qt.NoFocus)
+            self._review_group.addButton(b)
+            review_lay.addWidget(b)
+        blur_row = QHBoxLayout()
+        blur_row.addWidget(QLabel("Blur threshold:"))
+        self._blur_spin = _NoScrollSpinBox()
+        self._blur_spin.setFocusPolicy(Qt.NoFocus)
+        self._blur_spin.setRange(0, 5000)
+        self._blur_spin.setValue(80)          # Laplacian-variance floor for "sharp"
+        self._blur_spin.setToolTip(
+            "Auto-pause: frames whose sharpness (Laplacian variance) is below "
+            "this are treated as out of focus.  Higher = stricter (pauses more)."
+        )
+        blur_row.addWidget(self._blur_spin)
+        blur_row.addStretch()
+        review_lay.addLayout(blur_row)
+        # Blur threshold only matters in Auto-pause mode.
+        self._btn_review_auto.toggled.connect(
+            lambda on: self._blur_spin.setEnabled(on)
+        )
+        self._blur_spin.setEnabled(False)
+        right.addWidget(review_box)
 
         # ── Analysis method ───────────────────────────────────────────────────
         method_box = QGroupBox("Analysis method")
@@ -637,14 +720,16 @@ class MainWindow(QMainWindow):
         cam = self._camera
         if cam is None or not hasattr(cam, "_cam") or cam._cam is None:
             return
-        expo_us = self._expo_spin.value() * 1000
-        gain    = self._gain_spin.value()
-        neg     = self._negative_chk.isChecked()
+        capture_us = self._expo_spin.value() * 1000          # saved images (long)
+        preview_us = self._preview_expo_spin.value() * 1000  # live feed   (short)
+        gain       = self._gain_spin.value()
+        neg        = self._negative_chk.isChecked()
         try:
             cam._cam.put_AutoExpoEnable(False)
-            cam._cam.put_ExpoTime(expo_us)
+            cam._cam.put_ExpoTime(preview_us)    # live feed runs at the fast exposure
             cam._cam.put_ExpoAGain(gain)
-            cam._preview_expo_us = expo_us   # keep grab_fresh in sync
+            cam._preview_expo_us = preview_us    # grab_fresh restores this after a save
+            cam._capture_expo_us = capture_us    # grab_fresh switches to this to save
         except Exception:
             pass
         try:
@@ -652,6 +737,53 @@ class MainWindow(QMainWindow):
             cam._negative_fallback = False
         except Exception:
             cam._negative_fallback = neg
+
+    # ── Capture classifier / review ───────────────────────────────────────────
+
+    def _on_classifier_changed(self, _idx):
+        """Switch the good/bad detector used on each captured frame."""
+        mode = self._clf_combo.currentData()
+        self._clf.mode = mode
+        if mode in ("hybrid", "ml"):
+            self._clf.load()   # pre-warm the ML worker (no-op in rules mode)
+        self._statusbar.showMessage(f"Capture classifier: {mode}")
+
+    def _review_mode(self) -> str:
+        """Return the selected review mode: 'none', 'auto', or 'manual'."""
+        if self._btn_review_man.isChecked():
+            return "manual"
+        if self._btn_review_auto.isChecked():
+            return "auto"
+        return "none"
+
+    def _request_review(self, frame, reason: str) -> str:
+        """
+        Called FROM the capture thread.  Posts the frame to the GUI and BLOCKS
+        until the operator presses Enter (good) or Space (bad/retake), then
+        returns "good" or "bad".  Returns "good" immediately if the run is being
+        aborted, so a Stop never deadlocks the capture thread here.
+        """
+        if getattr(self, "_run_aborted", False):
+            return "good"
+        self._review_decision = None
+        self._review_event.clear()
+        self._sig.review_request.emit(frame, reason)
+        self._review_event.wait()
+        return self._review_decision or "good"
+
+    def _on_review_request(self, frame, reason: str):
+        """GUI thread: show the frame under review and arm the key handler."""
+        self._review_active = True
+        self._on_frame(frame)
+        self._statusbar.showMessage(
+            f"REVIEW ({reason}) — Enter = good / keep   ·   Space = bad / retake"
+        )
+
+    def _resolve_review(self, decision: str):
+        """GUI thread: record the operator's decision and release the capture thread."""
+        self._review_decision = decision
+        self._review_active   = False
+        self._review_event.set()
 
     # ── Manual joystick ──────────────────────────────────────────────────────
 
@@ -661,6 +793,16 @@ class MainWindow(QMainWindow):
         # while the joystick is enabled, and never steals keys from a text or
         # spin field the user might be editing.
         from PyQt5.QtCore import QEvent
+        # Operator review (manual / auto-pause): Enter = good, Space = bad/retake.
+        # Takes priority over the joystick while a frame is awaiting review.
+        if self._review_active and event.type() == QEvent.KeyPress:
+            key = event.key()
+            if key in (Qt.Key_Return, Qt.Key_Enter):
+                self._resolve_review("good")
+                return True
+            if key == Qt.Key_Space:
+                self._resolve_review("bad")
+                return True
         if (event.type() == QEvent.KeyPress
                 and self._manual_chk.isChecked()
                 and not isinstance(QApplication.focusWidget(), (QLineEdit, QSpinBox))):
@@ -844,7 +986,7 @@ class MainWindow(QMainWindow):
         # Start the live preview NOW — before the motor — so a missing/failed
         # ESP32 can never abort the feed (it previously threw and skipped this).
         self._set_analysis_mode(self._analysis_on)
-        QTimer.singleShot(2000, lambda: self._preview_timer.start(66))
+        QTimer.singleShot(2000, lambda: self._preview_timer.start(50))
         self._cal_btn.setEnabled(True)
 
         # ── 2. Classifier worker (no-op in rules mode) ───────────────────────
@@ -1024,6 +1166,11 @@ class MainWindow(QMainWindow):
             x_spacing=self._x_spin.value(),
             y_spacing=self._y_spin.value(),
             quality_threshold=self._thresh_slider.value() / 10.0,
+            review_mode=self._review_mode(),
+            review_fn=self._request_review,
+            blur_threshold=self._blur_spin.value(),
+            good_dir=TRAINING_GOOD_DIR,
+            bad_dir=TRAINING_BAD_DIR,
             on_progress=lambda d, t: self._sig.capture_progress.emit(d, t),
             on_frame=lambda f: self._sig.frame_ready.emit(f),
             on_done=lambda: self._sig.capture_done.emit(),
@@ -1310,6 +1457,11 @@ class MainWindow(QMainWindow):
 
     def _on_stop(self):
         self._run_aborted = True
+        # Release the capture thread if it's blocked waiting for an operator
+        # review, so Stop takes effect immediately instead of deadlocking.
+        self._review_active   = False
+        self._review_decision = "good"
+        self._review_event.set()
         if self._capture_pipeline:
             self._capture_pipeline.stop()
         # Stop running analysis (incl. the streaming one) and drop any queued
@@ -1408,6 +1560,10 @@ class MainWindow(QMainWindow):
         # A capture/analysis error aborts the in-progress run — stop the
         # streaming analysis so its watcher doesn't keep polling the temp folder.
         self._run_aborted = True
+        # Release any pending operator review so the capture thread can unwind.
+        self._review_active   = False
+        self._review_decision = "good"
+        self._review_event.set()
         if getattr(self, "_stream_ap", None):
             self._stream_ap.stop()
             self._stream_ap = None
