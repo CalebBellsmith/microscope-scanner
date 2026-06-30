@@ -916,14 +916,40 @@ class MainWindow(QMainWindow):
             return
 
         self._cal_btn.setEnabled(False)
-        self._statusbar.showMessage("Calibrating — grabbing 6 frames…")
         QApplication.processEvents()
 
-        frames = []
-        for _ in range(6):
-            frame = self._camera.grab_fresh()
-            if frame is not None:
+        # Collect as many DISTINCT live-preview frames as we can in ~5 s, rather
+        # than a fixed handful.  Sampling many frames from the surrounding area
+        # means a single funky frame (a passing fibre, a momentary glare) can't
+        # swing the result — calibrate() needs the slide's *typical* look.  We
+        # use grab() (the fast preview path) instead of grab_fresh(): no exposure
+        # switching, so we get far more frames per second, and they only need to
+        # be representative, not save-quality.  A new frame is detected via the
+        # camera's frame counter when available, else by object identity.
+        import time as _time
+        frames    = []
+        last_id   = None
+        deadline  = _time.time() + 5.0
+        MAX_FRAMES = 120          # safety cap so a fast camera can't run away
+        while _time.time() < deadline and len(frames) < MAX_FRAMES:
+            frame = self._camera.grab()
+            fid = getattr(self._camera, "_frame_count", None)
+            # New frame if the camera has no counter (every grab() is a fresh
+            # read, e.g. OpenCV) or its counter advanced since we last sampled.
+            is_new = (fid is None) or (fid != last_id)
+            if frame is not None and is_new:
                 frames.append(frame)
+                last_id = fid
+            self._statusbar.showMessage(
+                f"Calibrating — sampling frames… ({len(frames)})"
+            )
+            QApplication.processEvents()
+            _time.sleep(0.03)     # ~30 ms: keeps the UI live, paces the sampling
+
+        if not frames:
+            self._cal_btn.setEnabled(True)
+            self._statusbar.showMessage("Calibration failed — no frames captured.")
+            return
 
         suggested = self._clf.calibrate(frames)   # returns 0.0–1.0 sensitivity
         # Invert the gamma-1.8 slider curve: v = 1 + 8 * suggested**(1/1.8)
