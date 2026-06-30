@@ -45,6 +45,21 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject
 from PyQt5.QtGui import QImage, QPixmap, QColor, QFont
 
+
+# ── Widgets that ignore mouse-wheel scrolling ───────────────────────────────
+# Spin boxes / combos / sliders change value on wheel-scroll by default, which
+# makes it easy to nudge a number by accident while scrolling the panel.  These
+# subclasses ignore the wheel (the event propagates to the scroll area, so the
+# panel still scrolls) — values change only via typing or the up/down arrows.
+class _NoScrollSpinBox(QSpinBox):
+    def wheelEvent(self, e): e.ignore()
+
+class _NoScrollComboBox(QComboBox):
+    def wheelEvent(self, e): e.ignore()
+
+class _NoScrollSlider(QSlider):
+    def wheelEvent(self, e): e.ignore()
+
 from camera import open_camera
 from motor import MotorController
 from ml_inference import QualityClassifier
@@ -152,6 +167,7 @@ class Signals(QObject):
     analysis_progress   = pyqtSignal(int, int)         # (images_analysed, images_total)
     capture_done        = pyqtSignal()                  # grid scan finished
     leg_analysis_done   = pyqtSignal(str, list)        # (leg_name, result_list)
+    stream_analysis_done = pyqtSignal(list)            # streaming (capture+analyze) finished
     analysis_image      = pyqtSignal(str, str)          # (overlay_path, fname) live preview
     error               = pyqtSignal(str)               # error message to show in a dialog
     status_msg          = pyqtSignal(str)               # status bar text update
@@ -171,6 +187,7 @@ class MainWindow(QMainWindow):
         self._sig.analysis_progress.connect(self._on_analysis_progress)
         self._sig.capture_done.connect(self._on_capture_done)
         self._sig.leg_analysis_done.connect(self._on_leg_analysis_done)
+        self._sig.stream_analysis_done.connect(self._on_stream_analysis_done)
         self._sig.analysis_image.connect(self._on_analysis_image)
         self._sig.error.connect(self._on_error)
         self._sig.status_msg.connect(lambda m: self._statusbar.showMessage(m))
@@ -231,7 +248,7 @@ class MainWindow(QMainWindow):
         # Exposure / gain / negative adjusters (enabled only in analysis mode)
         adj_row = QHBoxLayout()
         adj_row.addWidget(QLabel("Exposure (ms):"))
-        self._expo_spin = QSpinBox()
+        self._expo_spin = _NoScrollSpinBox()
         self._expo_spin.setFocusPolicy(Qt.NoFocus)
         self._expo_spin.setRange(10, 5000)
         self._expo_spin.setValue(1300)
@@ -241,7 +258,7 @@ class MainWindow(QMainWindow):
         adj_row.addWidget(self._expo_spin)
         adj_row.addSpacing(12)
         adj_row.addWidget(QLabel("Gain:"))
-        self._gain_spin = QSpinBox()
+        self._gain_spin = _NoScrollSpinBox()
         self._gain_spin.setFocusPolicy(Qt.NoFocus)
         self._gain_spin.setRange(100, 3200)
         self._gain_spin.setValue(300)
@@ -321,7 +338,7 @@ class MainWindow(QMainWindow):
         method_box = QGroupBox("Analysis method")
         method_lay = QVBoxLayout(method_box)
         method_lay.setSpacing(3)
-        self._method_combo = QComboBox()
+        self._method_combo = _NoScrollComboBox()
         self._method_combo.addItem("Legacy  (MATLAB-faithful)", "legacy")
         self._method_combo.addItem("Accurate  (defect-aware)",  "accurate")
         self._method_combo.currentIndexChanged.connect(self._on_method_changed)
@@ -361,13 +378,13 @@ class MainWindow(QMainWindow):
         self._manual_chk = QCheckBox("Enable arrow-key joystick")
         self._manual_chk.setFocusPolicy(Qt.NoFocus)
         self._manual_chk.setToolTip(
-            "When checked: ← → jog the Y stepper, ↑ ↓ jog the X stepper"
+            "When checked: ← → jog the Sweep axis (10/row), ↑ ↓ jog the Rung axis"
         )
         manual_lay.addWidget(self._manual_chk)
 
         step_row = QHBoxLayout()
         step_row.addWidget(QLabel("Step size:"))
-        self._manual_step_spin = QSpinBox()
+        self._manual_step_spin = _NoScrollSpinBox()
         self._manual_step_spin.setFocusPolicy(Qt.NoFocus)
         self._manual_step_spin.setRange(1, 2048)
         self._manual_step_spin.setValue(100)
@@ -377,7 +394,7 @@ class MainWindow(QMainWindow):
         manual_lay.addLayout(step_row)
 
         manual_lay.addWidget(QLabel(
-            "← → = Y axis    ↑ ↓ = X axis",
+            "← → = Sweep    ↑ ↓ = Rung",
         ))
         right.addWidget(manual_box)
         # Jog keys must work regardless of which widget holds keyboard focus
@@ -389,20 +406,22 @@ class MainWindow(QMainWindow):
         self._profile_box = QGroupBox("Scan profile")
         profile_lay = QVBoxLayout(self._profile_box)
         profile_lay.setSpacing(4)
-        self._profile_combo = QComboBox()
+        self._profile_combo = _NoScrollComboBox()
         for label, _, _ in PROFILES:
             self._profile_combo.addItem(label)
         self._profile_combo.currentIndexChanged.connect(self._on_profile_changed)
         profile_lay.addWidget(self._profile_combo)
 
-        self._rows_spin = QSpinBox(); self._rows_spin.setRange(1, 50); self._rows_spin.setValue(3)
-        self._cols_spin = QSpinBox(); self._cols_spin.setRange(1, 50); self._cols_spin.setValue(10)
-        # Calibrated defaults (axes swapped: fast sweep on firmware Y, slow rung
-        # on firmware X; 28BYJ-48, 4096 half-steps/rotation):
-        #   firmware X = rung 0.5 cm on 0.8 cm/rot motor  = 2560 half-steps
-        #   firmware Y = sweep 0.53 cm on 1.4 cm/rot motor = 1551 half-steps
-        self._x_spin    = QSpinBox(); self._x_spin.setRange(1, 20000); self._x_spin.setValue(2560)
-        self._y_spin    = QSpinBox(); self._y_spin.setRange(1, 20000); self._y_spin.setValue(1551)
+        self._rows_spin = _NoScrollSpinBox(); self._rows_spin.setRange(1, 50); self._rows_spin.setValue(3)
+        self._cols_spin = _NoScrollSpinBox(); self._cols_spin.setRange(1, 50); self._cols_spin.setValue(10)
+        # Spacing defaults (axes swapped: fast sweep on firmware Y, slow rung on
+        # firmware X).  Tuned on the rig — sweep (Y) step halved and rung (X)
+        # step doubled vs the nominal calibration so captures tile the field.
+        # Adjustable live via the X/Y spacing fields below.
+        #   firmware X = rung step  = 5120 half-steps
+        #   firmware Y = sweep step =  776 half-steps
+        self._x_spin    = _NoScrollSpinBox(); self._x_spin.setRange(1, 20000); self._x_spin.setValue(5120)
+        self._y_spin    = _NoScrollSpinBox(); self._y_spin.setRange(1, 20000); self._y_spin.setValue(776)
         self._rows_spin.valueChanged.connect(self._on_spinbox_changed)
         self._cols_spin.valueChanged.connect(self._on_spinbox_changed)
         self._total_label = QLabel()
@@ -410,8 +429,13 @@ class MainWindow(QMainWindow):
 
         profile_lay.addLayout(_row("Rows:", self._rows_spin))
         profile_lay.addLayout(_row("Columns:", self._cols_spin))
-        profile_lay.addLayout(_row("X spacing (half-steps):", self._x_spin))
-        profile_lay.addLayout(_row("Y spacing (half-steps):", self._y_spin))
+        # Labelled by ROLE, not X/Y, to avoid confusion: the SWEEP axis takes
+        # the 10 small steps across each row; the RUNG axis takes the 2 big
+        # jumps between the 3 rows.  (Internally sweep = firmware Y spin, rung
+        # = firmware X spin — the two motors have different lead screws, which
+        # is why their half-step counts differ.)
+        profile_lay.addLayout(_row("Sweep step ½-steps (10/row):", self._y_spin))
+        profile_lay.addLayout(_row("Rung step ½-steps (×2/leg):",  self._x_spin))
         profile_lay.addWidget(self._total_label)
 
         # Detection sensitivity slider
@@ -419,7 +443,7 @@ class MainWindow(QMainWindow):
         thresh_row = QHBoxLayout()
         self._thresh_label_lo = QLabel("Lenient")
         self._thresh_label_lo.setStyleSheet("color:#888; font-size:10px;")
-        self._thresh_slider = QSlider(Qt.Horizontal)
+        self._thresh_slider = _NoScrollSlider(Qt.Horizontal)
         self._thresh_slider.setRange(1, 9)   # maps to 0.1 – 0.9
         self._thresh_slider.setValue(5)       # default 0.5
         self._thresh_slider.setTickPosition(QSlider.TicksBelow)
@@ -958,99 +982,143 @@ class MainWindow(QMainWindow):
             on_done=lambda: self._sig.capture_done.emit(),
             on_error=lambda e: self._sig.error.emit(str(e)),
         )
-        # Override output dir: images go to a temp folder until the user names the leg
+        # Override output dir: images go to a temp folder until the user names
+        # the leg.  Clear it first so a previously aborted run can't contaminate
+        # this set (analysis now streams straight from this folder).
+        import shutil
         self._tmp_capture_dir = os.path.join(self._set_dir, "__tmp__")
-        self._capture_pipeline._out = self._tmp_capture_dir
+        shutil.rmtree(self._tmp_capture_dir, ignore_errors=True)
         os.makedirs(self._tmp_capture_dir, exist_ok=True)
+        self._capture_pipeline._out = self._tmp_capture_dir
 
         self._capture_mode = mode
         self._capture_total = total
+        self._run_aborted = False
         self._statusbar.showMessage(f"Capturing {rows}×{cols} images…")
         self._capture_pipeline.start()
 
+        # Capture + Analyze: analyse images AS they are captured (the watcher
+        # runs on the temp folder concurrently) instead of waiting for the whole
+        # set.  Naming + move happen once the streaming analysis finishes.
+        self._stream_ap = None
+        if mode == MODE_CAPTURE_ANALYZE:
+            self._start_streaming_analysis(self._tmp_capture_dir, total)
+
     def _on_capture_done(self):
         self._stop_btn.setEnabled(False)
+        if getattr(self, "_run_aborted", False):
+            return   # Stop was pressed — _on_stop handled cleanup.
 
-        # Count captured images
+        # Capture + Analyze streams analysis alongside capture.  The watcher is
+        # still draining the last few images, so don't name/move yet — tell it
+        # capture is finished and finalize in _on_stream_analysis_done.
+        if self._capture_mode == MODE_CAPTURE_ANALYZE and getattr(self, "_stream_ap", None):
+            self._set_leg_status("(capturing…)", "Analyzing")
+            self._statusbar.showMessage("Capture done — finishing analysis…")
+            self._stream_ap.mark_capture_done()
+            return
+
+        # Capture-only: no analysis, so name + move right away.
+        leg_name, final_dir, n = self._name_and_move_capture()
+        if leg_name is None:
+            return
+        self._upsert_leg_row(leg_name, n, "—")
+        self._go_btn.setEnabled(True)
+        self._statusbar.showMessage(f"Captured {n} images → {leg_name}")
+        self._check_finish_eligibility()
+        self._set_mode_enabled(True)    # capture-only leg finished → unlock
+
+    def _name_and_move_capture(self):
+        """Count-check, prompt for a leg name, and move the temp capture folder
+        to set_dir/<leg>/.  Returns (leg_name, final_dir, n_captured), or
+        (None, None, 0) if the user cancelled — in which case the temp folder
+        and the "(capturing…)" row are cleaned up and Go/modes are re-enabled."""
+        import shutil
         tmp_dir = self._tmp_capture_dir
-        jpegs = sorted(f for f in os.listdir(tmp_dir) if f.endswith(".jpg"))
-        n_captured = len(jpegs)
+        n_captured = len(sorted(f for f in os.listdir(tmp_dir) if f.endswith(".jpg")))
 
-        # Check image count
-        expected = self._capture_total
-        if n_captured != expected:
-            result = QMessageBox.warning(
-                self, "Image count mismatch",
-                f"Expected {expected} images but captured {n_captured}.\n\n"
-                "This leg may be incomplete. Continue anyway?",
-                QMessageBox.Yes | QMessageBox.No,
-            )
-            if result == QMessageBox.No:
-                import shutil
-                shutil.rmtree(tmp_dir, ignore_errors=True)
-                self._go_btn.setEnabled(True)
-                self._set_mode_enabled(True)
-                self._statusbar.showMessage("Capture cancelled.")
-                self._leg_table.removeRow(
-                    self._find_leg_row("(capturing…)")
-                )
-                return
-
-        # Ask user to name this leg
-        leg_name, ok = QInputDialog.getText(
-            self, "Name this leg",
-            "Enter leg name  (e.g. FR, FL, BR, BL):",
-        )
-        if not ok or not leg_name.strip():
-            import shutil
+        def _discard(msg):
             shutil.rmtree(tmp_dir, ignore_errors=True)
-            self._leg_table.removeRow(self._find_leg_row("(capturing…)"))
+            row = self._find_leg_row("(capturing…)")
+            if row >= 0:
+                self._leg_table.removeRow(row)
             self._go_btn.setEnabled(True)
             self._set_mode_enabled(True)
-            self._statusbar.showMessage("Leg discarded — no name given.")
-            return
+            if msg:
+                self._statusbar.showMessage(msg)
+
+        if n_captured != self._capture_total:
+            if QMessageBox.warning(
+                self, "Image count mismatch",
+                f"Expected {self._capture_total} images but captured {n_captured}.\n\n"
+                "This leg may be incomplete. Continue anyway?",
+                QMessageBox.Yes | QMessageBox.No,
+            ) == QMessageBox.No:
+                _discard("Capture cancelled.")
+                return None, None, 0
+
+        leg_name, ok = QInputDialog.getText(
+            self, "Name this leg", "Enter leg name  (e.g. FR, FL, BR, BL):",
+        )
+        if not ok or not leg_name.strip():
+            _discard("Leg discarded — no name given.")
+            return None, None, 0
         leg_name = leg_name.strip()
 
-        # Confirm overwrite if leg already exists
         final_dir = os.path.join(self._set_dir, leg_name)
         if os.path.isdir(final_dir) and leg_name in self._leg_results:
-            result = QMessageBox.question(
+            if QMessageBox.question(
                 self, "Overwrite?",
                 f"Leg '{leg_name}' already has results. Overwrite?",
                 QMessageBox.Yes | QMessageBox.No,
-            )
-            if result == QMessageBox.No:
-                import shutil
-                shutil.rmtree(tmp_dir, ignore_errors=True)
-                self._leg_table.removeRow(self._find_leg_row("(capturing…)"))
-                self._go_btn.setEnabled(True)
-                self._set_mode_enabled(True)
-                return
-            import shutil
+            ) == QMessageBox.No:
+                _discard(None)
+                return None, None, 0
             shutil.rmtree(final_dir, ignore_errors=True)
-            if leg_name in self._leg_results:
-                del self._leg_results[leg_name]
+            self._leg_results.pop(leg_name, None)
             self._analyzing_legs.discard(leg_name)
 
-        # Move tmp folder to final name
-        import shutil
         shutil.move(tmp_dir, final_dir)
+        row = self._find_leg_row("(capturing…)")
+        if row >= 0:
+            self._leg_table.removeRow(row)
+        return leg_name, final_dir, n_captured
 
-        # Remove temp row and add real one
-        tmp_row = self._find_leg_row("(capturing…)")
-        if tmp_row >= 0:
-            self._leg_table.removeRow(tmp_row)
-        self._upsert_leg_row(leg_name, n_captured, "—")
+    def _start_streaming_analysis(self, tmp_dir, total):
+        """Analyse images live, as capture writes them into tmp_dir."""
+        self._ana_serialized = False
+        self._ana_bar.setMaximum(total); self._ana_bar.setValue(0)
+        ap = AnalysisPipeline(
+            leg_dir=tmp_dir,
+            total_expected=total,
+            live_capture=True,
+            on_progress=lambda d, t: self._sig.analysis_progress.emit(d, t or total),
+            on_done=lambda results: self._sig.stream_analysis_done.emit(results),
+            on_image=lambda p, f: self._sig.analysis_image.emit(p, f),
+            on_error=lambda e: self._sig.error.emit(f"Analysis error: {e}"),
+            mode=getattr(self, "_analysis_method", "legacy"),
+        )
+        if not hasattr(self, "_analysis_pipelines"):
+            self._analysis_pipelines = []
+        self._analysis_pipelines.append(ap)
+        self._stream_ap = ap
+        ap.start()
 
+    def _on_stream_analysis_done(self, results):
+        """Streaming analysis finished (capture already done): now name + move
+        the leg, attach the results, and unlock."""
+        self._stream_ap = None
+        if getattr(self, "_run_aborted", False):
+            return   # aborted — _on_stop cleaned up the temp folder.
+        leg_name, final_dir, n = self._name_and_move_capture()
+        if leg_name is None:
+            return
+        self._leg_results[leg_name] = results
+        self._upsert_leg_row(leg_name, n, "Done")
         self._go_btn.setEnabled(True)
-        self._statusbar.showMessage(f"Captured {n_captured} images → {leg_name}")
-
-        if self._capture_mode == MODE_CAPTURE_ANALYZE:
-            self._start_leg_analysis(leg_name, final_dir, n_captured)
-            # modes stay locked — analysis is still running for this leg
-        else:
-            self._check_finish_eligibility()
-            self._set_mode_enabled(True)    # capture-only leg finished → unlock
+        self._set_mode_enabled(True)
+        self._check_finish_eligibility()
+        self._statusbar.showMessage(f"Captured + analyzed {n} images → {leg_name}")
 
     def _find_leg_row(self, leg_name: str) -> int:
         for row in range(self._leg_table.rowCount()):
@@ -1194,15 +1262,24 @@ class MainWindow(QMainWindow):
     # ── Stop ─────────────────────────────────────────────────────────────────
 
     def _on_stop(self):
+        self._run_aborted = True
         if self._capture_pipeline:
             self._capture_pipeline.stop()
-        # Stop running analysis and drop any queued (serialized) legs so they
-        # don't keep launching after the user aborts.
+        # Stop running analysis (incl. the streaming one) and drop any queued
+        # (serialized) legs so they don't keep launching after the user aborts.
         for ap in getattr(self, "_analysis_pipelines", []):
             ap.stop()
+        self._stream_ap = None
         self._analysis_queue = []
         self._ana_serialized = False
         self._analyzing_legs.clear()
+        # Discard the in-progress capture (partial temp folder + its table row).
+        import shutil
+        if getattr(self, "_tmp_capture_dir", None):
+            shutil.rmtree(self._tmp_capture_dir, ignore_errors=True)
+        row = self._find_leg_row("(capturing…)")
+        if row >= 0:
+            self._leg_table.removeRow(row)
         self._stop_btn.setEnabled(False)
         self._go_btn.setEnabled(True)
         self._set_mode_enabled(True)    # unlock — run aborted
@@ -1281,8 +1358,15 @@ class MainWindow(QMainWindow):
 
     def _on_error(self, msg):
         QMessageBox.critical(self, "Error", msg)
+        # A capture/analysis error aborts the in-progress run — stop the
+        # streaming analysis so its watcher doesn't keep polling the temp folder.
+        self._run_aborted = True
+        if getattr(self, "_stream_ap", None):
+            self._stream_ap.stop()
+            self._stream_ap = None
         self._stop_btn.setEnabled(False)
         self._go_btn.setEnabled(True)
+        self._set_mode_enabled(True)
 
     # ── Cleanup ───────────────────────────────────────────────────────────────
 

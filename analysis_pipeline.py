@@ -716,7 +716,8 @@ class AnalysisPipeline:
     """
     def __init__(self, leg_dir,
                  on_progress=None, on_done=None, on_error=None,
-                 on_image=None, total_expected=None, mode="legacy"):
+                 on_image=None, total_expected=None, mode="legacy",
+                 live_capture=False):
         self._dir = leg_dir
         self._on_progress = on_progress or (lambda done, total: None)
         self._on_done = on_done or (lambda results: None)
@@ -727,8 +728,19 @@ class AnalysisPipeline:
         self._total = total_expected
         self._mode = mode               # "legacy" (MATLAB) or "accurate"
         self._stop_event = threading.Event()
+        # live_capture=True: images are still being captured into leg_dir, so
+        # the watcher must NOT stop on an idle gap between shots — only once
+        # mark_capture_done() is called (and the backlog is drained).  This lets
+        # analysis run concurrently with capture instead of waiting for the set.
+        self._live_capture = live_capture
+        self._capture_done = threading.Event()
         self._thread = None
         self._results_path = os.path.join(leg_dir, "results.jsonl")
+
+    def mark_capture_done(self):
+        """Signal that no more images will be captured — the watcher may finish
+        the remaining backlog and then stop."""
+        self._capture_done.set()
 
     def start(self):
         os.makedirs(self._dir, exist_ok=True)
@@ -779,7 +791,12 @@ class AnalysisPipeline:
                             self._on_progress(done, self._total)
                     else:
                         idle_ticks += 1
-                        if done > 0 and idle_ticks > 10:
+                        # While capture is still live, never stop on an idle gap
+                        # between shots — wait for more images (or stop()).
+                        waiting_for_capture = (
+                            self._live_capture and not self._capture_done.is_set()
+                        )
+                        if (not waiting_for_capture) and done > 0 and idle_ticks > 10:
                             break
                         time.sleep(0.5)
 

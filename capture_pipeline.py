@@ -229,20 +229,26 @@ class CapturePipeline:
             # Couldn't localise the defect — keep the original frame
             return frame
 
-        # Move toward the clean side of the frame
-        if nudge_x != 0:
-            self._motor.move("X", nudge_x)
-        if nudge_y != 0:
-            self._motor.move("Y", nudge_y)
-        time.sleep(0.2)   # let stage settle
-
-        candidate = self._wait_for_frame()
-
-        # Always return stage to the nominal grid position
-        if nudge_x != 0:
-            self._motor.move("X", -nudge_x)
-        if nudge_y != 0:
-            self._motor.move("Y", -nudge_y)
+        # Move toward the clean side of the frame, capture, then ALWAYS move
+        # back by the EXACT amount applied.  applied_* records what actually
+        # moved, and the finally block reverses precisely that — so a failed
+        # capture (or a move that only half-completed) can't leave the stage
+        # nudged, which would accumulate as drift across the 30-image scan.
+        applied_x = applied_y = 0
+        candidate = None
+        try:
+            if nudge_x != 0:
+                self._motor.move("X", nudge_x); applied_x = nudge_x
+            if nudge_y != 0:
+                self._motor.move("Y", nudge_y); applied_y = nudge_y
+            time.sleep(self.SETTLE_S)   # settle before the nudged shot
+            candidate = self._wait_for_frame()
+        finally:
+            # Reverse exactly what was applied (equal magnitude, opposite sign).
+            if applied_y != 0:
+                self._motor.move("Y", -applied_y)
+            if applied_x != 0:
+                self._motor.move("X", -applied_x)
 
         if candidate is None:
             return frame   # nudge gave no result — keep original
