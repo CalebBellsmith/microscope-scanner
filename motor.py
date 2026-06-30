@@ -54,6 +54,29 @@ class MotorController:
         if self._ser and self._ser.is_open:
             self._ser.close()
 
+    def _command(self, cmd: str, expected_steps: int = 0) -> str:
+        """
+        Send one command and return the firmware's reply line.
+
+        The firmware blocks for the WHOLE move before replying OK, so a large
+        move can take far longer than the default 5 s.  We therefore scale the
+        read timeout to the move size (budget 3 ms / half-step + margin) — a
+        fixed 5 s timeout was cutting long sweeps/returns short and reporting a
+        false "Motor error", which then left the late OK in the buffer and
+        desynced every subsequent command (Python ran one move ahead of the
+        stage → captures fired mid-motion → blurry photos).
+
+        We also flush the input buffer before writing, so any stale/late reply
+        from a previous hiccup can't be mistaken for this command's response.
+        """
+        read_timeout = 5.0 + abs(int(expected_steps)) * 0.003
+
+        with self._lock:                       # one command at a time
+            self._ser.reset_input_buffer()     # resync: drop any stale reply
+            self._ser.timeout = read_timeout
+            self._ser.write(cmd.encode())      # newline already in cmd
+            return self._ser.readline().decode(errors="ignore").strip()
+
     def move(self, axis: str, amount: int):
         """
         Send a MOVE command and block until the ESP32 replies OK.
@@ -64,12 +87,7 @@ class MotorController:
         axis = axis.upper()
         assert axis in ("X", "Y"), f"Unknown axis {axis}"
 
-        cmd = f"MOVE {axis} {amount}\n"    # newline terminates the command
-
-        with self._lock:                   # prevent concurrent commands
-            self._ser.write(cmd.encode())
-            resp = self._ser.readline().decode().strip()   # wait for "OK" or "ERR ..."
-
+        resp = self._command(f"MOVE {axis} {amount}\n", expected_steps=amount)
         if resp != "OK":
             raise RuntimeError(f"Motor error on MOVE {axis} {amount}: {resp!r}")
 
@@ -83,12 +101,10 @@ class MotorController:
         """
         x_amount = int(x_amount)
         y_amount = int(y_amount)
-        cmd = f"MOVE XY {x_amount} {y_amount}\n"
-
-        with self._lock:                   # prevent concurrent commands
-            self._ser.write(cmd.encode())
-            resp = self._ser.readline().decode().strip()
-
+        resp = self._command(
+            f"MOVE XY {x_amount} {y_amount}\n",
+            expected_steps=max(abs(x_amount), abs(y_amount)),
+        )
         if resp != "OK":
             raise RuntimeError(
                 f"Motor error on MOVE XY {x_amount} {y_amount}: {resp!r}"
@@ -96,8 +112,6 @@ class MotorController:
 
     def home(self):
         """Send HOME command — moves both axes to their origin position."""
-        with self._lock:
-            self._ser.write(b"HOME\n")
-            resp = self._ser.readline().decode().strip()
+        resp = self._command(b"HOME\n".decode())
         if resp != "OK":
             raise RuntimeError(f"HOME failed: {resp!r}")

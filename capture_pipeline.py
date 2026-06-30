@@ -105,6 +105,11 @@ class CapturePipeline:
     SWEEP_AXIS = "Y"   # fast: 10 captures per rung  (firmware Y stepper)
     RUNG_AXIS  = "X"   # slow: 3 rungs per leg       (firmware X stepper)
 
+    # Pause after a move, before capturing, so the stage stops vibrating before
+    # the (long-exposure) photo is taken.  Raise if photos still look smeared;
+    # lower to shave time once you know the stage settles quickly.
+    SETTLE_S = 0.5
+
     @staticmethod
     def _rung_start(row):
         """Sweep-axis start offset of a rung, in whole sweep-steps.  Odd rungs
@@ -151,7 +156,7 @@ class CapturePipeline:
                     sweep_return = self._rung_start(row) - self._rung_start(row - 1) - cols
                     move(self.SWEEP_AXIS, round(sweep_return * sweep_step))
                     move(self.RUNG_AXIS, rung_step)
-                    time.sleep(0.3)   # settle after the reposition
+                    time.sleep(self.SETTLE_S)   # let the stage stop ringing
 
                 for col in range(cols):
                     if self._stop_event.is_set():
@@ -174,7 +179,7 @@ class CapturePipeline:
                     last_overall = (row == self._rows - 1) and (col == cols - 1)
                     if not last_overall:
                         move(self.SWEEP_AXIS, sweep_step)
-                        time.sleep(0.1)
+                        time.sleep(self.SETTLE_S)   # settle before next capture
 
             # On a clean finish, walk back to the leg origin (sequential).  On a
             # STOP, leave the stage where it is — the operator re-zeroes anyway.

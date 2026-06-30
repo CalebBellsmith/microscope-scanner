@@ -37,13 +37,14 @@ const int STEP_SEQ[8][4] = {
   {0,0,1,0}, {0,0,1,1}, {0,0,0,1}, {1,0,0,1}
 };
 
-// Per-axis step delay (µs between half-steps).  X is pushed fast because it
-// does 10 moves per rung; Y stays conservative since it only steps twice per
-// leg.  If a motor stalls or the scan drifts, RAISE the offending delay —
-// skipped steps silently corrupt registration.  (Prior validated X rate was
-// 1200 µs; 900 µs is the fast target — back off toward 1200 if it skips.)
+// Per-axis step delay (µs between half-steps).  THIS IS THE SPEED KNOB.
+// After the X/Y swap the heavily-used SWEEP axis (10 captures/rung) is
+// firmware Y and the RUNG axis (indexes twice/leg) is firmware X, so both run
+// at the same fast rate.  Lower = faster but risks skipped steps, which
+// silently corrupt registration: if rung 0 and rung 2 images don't line up,
+// RAISE these (prior validated-safe rate was ~1200 µs).
 const int X_STEP_DELAY_US = 900;
-const int Y_STEP_DELAY_US = 1500;
+const int Y_STEP_DELAY_US = 900;
 
 int xStepIndex = 0;   // current position in the 8-step table for X
 int yStepIndex = 0;   // current position in the 8-step table for Y
