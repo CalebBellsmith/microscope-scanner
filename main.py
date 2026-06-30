@@ -415,13 +415,13 @@ class MainWindow(QMainWindow):
         self._rows_spin = _NoScrollSpinBox(); self._rows_spin.setRange(1, 50); self._rows_spin.setValue(3)
         self._cols_spin = _NoScrollSpinBox(); self._cols_spin.setRange(1, 50); self._cols_spin.setValue(10)
         # Spacing defaults (axes swapped: fast sweep on firmware Y, slow rung on
-        # firmware X).  Tuned on the rig — sweep (Y) step halved and rung (X)
-        # step doubled vs the nominal calibration so captures tile the field.
-        # Adjustable live via the X/Y spacing fields below.
-        #   firmware X = rung step  = 5120 half-steps
-        #   firmware Y = sweep step =  776 half-steps
-        self._x_spin    = _NoScrollSpinBox(); self._x_spin.setRange(1, 20000); self._x_spin.setValue(5120)
-        self._y_spin    = _NoScrollSpinBox(); self._y_spin.setRange(1, 20000); self._y_spin.setValue(776)
+        # firmware X).  Both steps are ~0.5 cm — they differ by ~1000 half-steps
+        # only because the two motors have different lead screws:
+        #   firmware Y = sweep 0.53 cm on 1.4 cm/rot motor = 1552 half-steps
+        #   firmware X = rung  0.5 cm on 0.8 cm/rot motor  = 2560 half-steps
+        # Adjustable live via the Sweep/Rung spacing fields below.
+        self._x_spin    = _NoScrollSpinBox(); self._x_spin.setRange(1, 20000); self._x_spin.setValue(2560)
+        self._y_spin    = _NoScrollSpinBox(); self._y_spin.setRange(1, 20000); self._y_spin.setValue(1552)
         self._rows_spin.valueChanged.connect(self._on_spinbox_changed)
         self._cols_spin.valueChanged.connect(self._on_spinbox_changed)
         self._total_label = QLabel()
