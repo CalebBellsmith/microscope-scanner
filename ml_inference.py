@@ -389,30 +389,45 @@ class QualityClassifier:
 
     def calibrate(self, frames: list) -> float:
         """
-        Given a list of RGB frames captured from the current slide, suggest a
-        quality threshold tailored to this slide's typical appearance.
+        Suggest a detection SENSITIVITY tuned to this slide.
 
-        Algorithm: classify each frame, collect confidence scores of frames that
-        classify as "good", then return the 25th-percentile score minus a small
-        safety margin.  This sets the bar just below the weakest good frame so
-        that most frames on this slide pass while still flagging clear defects.
+        The operator points the camera at a clean, representative region, then we
+        sweep sensitivity from lenient → strict and, at each level, measure what
+        fraction of the sample frames still read as "good".  We pick the
+        STRICTEST sensitivity at which the clean reference still passes (≥ 80% of
+        frames good) — the tightest defect gate this slide tolerates without
+        false-flagging its own normal texture.
 
-        Returns a threshold in [0.1, 0.8].  Returns 0.5 if no good frames found.
+        Why not the old algorithm: it took the 25th-percentile "good" confidence
+        and backed off 15%.  But a clean frame's good-confidence is essentially
+        always ~1.0 here (see _rule_predict), so that figure saturated at the 0.8
+        clamp every run → the slider always landed on 8 → the readout was 0.79
+        no matter what the slide looked like.  Sweeping the actual decision
+        boundary makes the result genuinely slide-specific and varies as it
+        should.
+
+        Returns a sensitivity in [0.0, 1.0]; 0.5 if no frames are supplied.
         """
         if not frames:
             return 0.5
-        good_confs = []
-        for frame in frames:
-            label, conf = self.predict(frame)
-            if label == "good":
-                good_confs.append(conf)
-        if not good_confs:
-            return 0.5
-        good_confs.sort()
-        # 25th percentile of good-frame confidences, backed off 15%
-        p25 = good_confs[max(0, len(good_confs) // 4)]
-        suggested = round(max(0.1, min(0.8, p25 * 0.85)), 1)
-        return suggested
+
+        STEPS     = 20          # sensitivity grid: 0.00, 0.05, … 0.95
+        PASS_FRAC = 0.8         # clean reference must still read ≥80% good
+
+        saved = self.sensitivity
+        best  = 0.0
+        try:
+            for i in range(STEPS):
+                s = i / STEPS
+                self.sensitivity = s
+                good = sum(1 for f in frames if self.predict(f)[0] == "good")
+                if good >= PASS_FRAC * len(frames):
+                    best = s        # still clean at this strictness — try stricter
+                else:
+                    break           # this level starts false-flagging — stop here
+        finally:
+            self.sensitivity = saved
+        return round(best, 2)
 
     def load(self):
         """

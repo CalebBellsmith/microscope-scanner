@@ -420,8 +420,8 @@ class MainWindow(QMainWindow):
         #   firmware Y = sweep 0.53 cm on 1.4 cm/rot motor = 1552 half-steps
         #   firmware X = rung  0.5 cm on 0.8 cm/rot motor  = 2560 half-steps
         # Adjustable live via the Sweep/Rung spacing fields below.
-        self._x_spin    = _NoScrollSpinBox(); self._x_spin.setRange(1, 20000); self._x_spin.setValue(2560)
-        self._y_spin    = _NoScrollSpinBox(); self._y_spin.setRange(1, 20000); self._y_spin.setValue(1552)
+        self._x_spin    = _NoScrollSpinBox(); self._x_spin.setRange(1, 20000); self._x_spin.setValue(1350)
+        self._y_spin    = _NoScrollSpinBox(); self._y_spin.setRange(1, 20000); self._y_spin.setValue(3000)
         self._rows_spin.valueChanged.connect(self._on_spinbox_changed)
         self._cols_spin.valueChanged.connect(self._on_spinbox_changed)
         self._total_label = QLabel()
@@ -908,8 +908,9 @@ class MainWindow(QMainWindow):
 
         Point the camera at a representative area of the slide (ideally a clean
         region with horizontal scratches) before clicking.  The calibration
-        finds the 25th-percentile good-frame confidence and backs off 15%, so
-        the threshold sits just below the weakest acceptable frame on this slide.
+        sweeps detection sensitivity and picks the strictest level at which this
+        clean reference still reads clean, so the result adapts to the slide
+        instead of saturating at a fixed value every run.
         """
         if self._camera is None:
             return
@@ -924,7 +925,7 @@ class MainWindow(QMainWindow):
             if frame is not None:
                 frames.append(frame)
 
-        suggested = self._clf.calibrate(frames)   # returns 0.1–0.8 sensitivity
+        suggested = self._clf.calibrate(frames)   # returns 0.0–1.0 sensitivity
         # Invert the gamma-1.8 slider curve: v = 1 + 8 * suggested**(1/1.8)
         slider_val = max(1, min(9, round(1 + 8 * (suggested ** (1 / 1.8)))))
         self._thresh_slider.setValue(slider_val)

@@ -18,14 +18,19 @@ Grid traversal pattern (calibrated raster with half-step stagger):
     interleaving their samples with the even rungs for finer coverage:
 
         Rung 0:  capture at sweep-steps 0,1,…,9   (start offset 0.0)
-          ↩ sweep return −9.5 steps,  rung +1
+          ↩ sweep return −8.5 steps,  rung +1
         Rung 1:  capture at sweep-steps 0.5,1.5,…,9.5  (start offset 0.5)
-          ↩ sweep return −10.5 steps,  rung +1
+          ↩ sweep return −9.5 steps,  rung +1
         Rung 2:  capture at sweep-steps 0,1,…,9   (start offset 0.0)
 
+    Each rung stops ON its last capture — 10 captures use 9 inter-capture steps,
+    NOT 10 — so the stage never overshoots one step past the final photo; the
+    return distances above already account for ending on capture 9 (not 10).
+
     Axis roles (see SWEEP_AXIS / RUNG_AXIS below): the fast 10-per-rung SWEEP
-    axis is firmware Y (1.4 cm/rot → 0.53 cm = 1551 half-steps); the slow
-    3-rung RUNG axis is firmware X (0.8 cm/rot → 0.5 cm = 2560 half-steps).
+    axis is firmware Y (1.4 cm/rot, default 3000 half-steps ≈ 1.0 cm/step); the
+    slow 3-rung RUNG axis is firmware X (0.8 cm/rot, default 1350 half-steps
+    ≈ 0.26 cm/step).
     On a clean finish the stage walks back to the leg origin; on STOP it halts
     in place (the operator re-zeroes before the next run).
 
@@ -149,11 +154,14 @@ class CapturePipeline:
                     break
 
                 # Reposition between rungs (sequential): SWEEP axis returns, then
-                # RUNG axis advances one step.  SWEEP return distance = (next
-                # start) − (prev start + cols) in whole sweep-steps, e.g.
-                # row 0→1: 0.5 − 10 = −9.5 steps;  row 1→2: 0 − 10.5 = −10.5.
+                # RUNG axis advances one step.  The previous rung ended ON its
+                # last capture (no trailing step), at sweep position
+                # prev_start + (cols − 1).  So the return distance to the next
+                # rung's start = next_start − (prev_start + cols − 1), e.g.
+                # row 0→1: 0.5 − (0 + 9) = −8.5 steps;  row 1→2: 0 − (0.5 + 9) = −9.5.
                 if row > 0:
-                    sweep_return = self._rung_start(row) - self._rung_start(row - 1) - cols
+                    sweep_return = (self._rung_start(row)
+                                    - self._rung_start(row - 1) - (cols - 1))
                     move(self.SWEEP_AXIS, round(sweep_return * sweep_step))
                     move(self.RUNG_AXIS, rung_step)
                     time.sleep(self.SETTLE_S)   # let the stage stop ringing
@@ -173,11 +181,13 @@ class CapturePipeline:
                     done += 1
                     self._on_progress(done, total)
 
-                    # Step the SWEEP axis one position after every capture except
-                    # the very last of the scan.  For non-final rungs this final
-                    # step is the start of the return.
-                    last_overall = (row == self._rows - 1) and (col == cols - 1)
-                    if not last_overall:
+                    # Step the SWEEP axis one position between captures only —
+                    # 10 captures need 9 steps, so we DON'T step after the last
+                    # capture of a rung.  Counting the start position as the first
+                    # capture, this keeps the rung from overshooting one step past
+                    # its final photo; the inter-rung return (above) covers the
+                    # distance back instead.
+                    if col < cols - 1:
                         move(self.SWEEP_AXIS, sweep_step)
                         time.sleep(self.SETTLE_S)   # settle before next capture
 

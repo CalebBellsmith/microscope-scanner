@@ -39,12 +39,16 @@ const int STEP_SEQ[8][4] = {
 
 // Per-axis step delay (µs between half-steps).  THIS IS THE SPEED KNOB.
 // After the X/Y swap the heavily-used SWEEP axis (10 captures/rung) is
-// firmware Y and the RUNG axis (indexes twice/leg) is firmware X, so both run
-// at the same fast rate.  Lower = faster but risks skipped steps, which
-// silently corrupt registration: if rung 0 and rung 2 images don't line up,
-// RAISE these (prior validated-safe rate was ~1200 µs).
-const int X_STEP_DELAY_US = 900;
-const int Y_STEP_DELAY_US = 900;
+// firmware Y and the RUNG axis (indexes twice/leg) is firmware X.  The SWEEP
+// axis also moves the FARTHEST per step (≈3000 half-steps vs the rung's
+// ≈1350), so at equal rates a sweep move takes ~2× longer in wall-clock and
+// feels slower.  We can't fully equalise that without an unsafe rate, but we
+// run the sweep axis (Y) faster than the rung axis to narrow the gap.
+// Lower = faster but risks skipped steps, which silently corrupt registration:
+// if rung 0 and rung 2 images don't line up, RAISE Y_STEP_DELAY_US back toward
+// 900 (prior validated-safe rate was ~1200 µs).
+const int X_STEP_DELAY_US = 900;   // rung axis (short moves)
+const int Y_STEP_DELAY_US = 700;   // sweep axis — faster: long moves dominate runtime
 
 int xStepIndex = 0;   // current position in the 8-step table for X
 int yStepIndex = 0;   // current position in the 8-step table for Y
