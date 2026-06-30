@@ -265,7 +265,7 @@ class MainWindow(QMainWindow):
         adj_row = QHBoxLayout()
         adj_row.addWidget(QLabel("Capture exp:"))
         self._expo_spin = _NoScrollSpinBox()
-        self._expo_spin.setFocusPolicy(Qt.NoFocus)
+        self._expo_spin.setFocusPolicy(Qt.ClickFocus)
         self._expo_spin.setRange(10, 5000)
         self._expo_spin.setValue(1300)
         self._expo_spin.setSuffix(" ms")
@@ -275,9 +275,9 @@ class MainWindow(QMainWindow):
         adj_row.addSpacing(8)
         adj_row.addWidget(QLabel("Preview exp:"))
         self._preview_expo_spin = _NoScrollSpinBox()
-        self._preview_expo_spin.setFocusPolicy(Qt.NoFocus)
-        self._preview_expo_spin.setRange(10, 1000)
-        self._preview_expo_spin.setValue(80)        # fast live feed (~12 fps)
+        self._preview_expo_spin.setFocusPolicy(Qt.ClickFocus)
+        self._preview_expo_spin.setRange(10, 2000)
+        self._preview_expo_spin.setValue(900)       # live feed exposure
         self._preview_expo_spin.setSuffix(" ms")
         self._preview_expo_spin.setFixedWidth(85)
         self._preview_expo_spin.valueChanged.connect(self._apply_analysis_settings)
@@ -285,7 +285,7 @@ class MainWindow(QMainWindow):
         adj_row.addSpacing(12)
         adj_row.addWidget(QLabel("Gain:"))
         self._gain_spin = _NoScrollSpinBox()
-        self._gain_spin.setFocusPolicy(Qt.NoFocus)
+        self._gain_spin.setFocusPolicy(Qt.ClickFocus)
         self._gain_spin.setRange(100, 3200)
         self._gain_spin.setValue(300)
         self._gain_spin.setSingleStep(50)
@@ -368,9 +368,9 @@ class MainWindow(QMainWindow):
         clf_lay = QVBoxLayout(clf_box)
         clf_lay.setSpacing(3)
         self._clf_combo = _NoScrollComboBox()
-        self._clf_combo.addItem("Rules  (fast, no ML)",  "rules")
-        self._clf_combo.addItem("Hybrid (rules + ML)",   "hybrid")
-        self._clf_combo.addItem("ML  (model only)",      "ml")
+        self._clf_combo.addItem("Rules",  "rules")
+        self._clf_combo.addItem("Hybrid", "hybrid")
+        self._clf_combo.addItem("ML",     "ml")
         self._clf_combo.currentIndexChanged.connect(self._on_classifier_changed)
         clf_lay.addWidget(self._clf_combo)
         right.addWidget(clf_box)
@@ -389,32 +389,41 @@ class MainWindow(QMainWindow):
         review_lay = QVBoxLayout(review_box)
         review_lay.setSpacing(3)
         self._review_group = QButtonGroup(self)
-        self._btn_review_none = QRadioButton("None  (fully automatic)")
-        self._btn_review_auto = QRadioButton("Auto-pause  (only when blurry/bad)")
-        self._btn_review_man  = QRadioButton("Manual  (Enter=good · Space=bad/retake)")
+        self._btn_review_none = QRadioButton("None")
+        self._btn_review_auto = QRadioButton("Auto-pause")
+        self._btn_review_man  = QRadioButton("Manual")
         self._btn_review_none.setChecked(True)
         for b in (self._btn_review_none, self._btn_review_auto, self._btn_review_man):
             b.setFocusPolicy(Qt.NoFocus)
             self._review_group.addButton(b)
             review_lay.addWidget(b)
-        blur_row = QHBoxLayout()
+
+        # Blur-threshold control — only shown for the pausing modes (Manual /
+        # Auto-pause).  Wrapped in a container so the whole row can hide in None.
+        self._blur_container = QWidget()
+        blur_row = QHBoxLayout(self._blur_container)
+        blur_row.setContentsMargins(0, 0, 0, 0)
         blur_row.addWidget(QLabel("Blur threshold:"))
         self._blur_spin = _NoScrollSpinBox()
-        self._blur_spin.setFocusPolicy(Qt.NoFocus)
+        self._blur_spin.setFocusPolicy(Qt.ClickFocus)
         self._blur_spin.setRange(0, 5000)
-        self._blur_spin.setValue(80)          # Laplacian-variance floor for "sharp"
+        self._blur_spin.setValue(60)          # focus-score floor for in-focus scratches
         self._blur_spin.setToolTip(
-            "Auto-pause: frames whose sharpness (Laplacian variance) is below "
-            "this are treated as out of focus.  Higher = stricter (pauses more)."
+            "Frames whose horizontal scratches score below this focus value are "
+            "treated as out of focus.  Higher = stricter (pauses more)."
         )
         blur_row.addWidget(self._blur_spin)
         blur_row.addStretch()
-        review_lay.addLayout(blur_row)
-        # Blur threshold only matters in Auto-pause mode.
-        self._btn_review_auto.toggled.connect(
-            lambda on: self._blur_spin.setEnabled(on)
-        )
-        self._blur_spin.setEnabled(False)
+        review_lay.addWidget(self._blur_container)
+
+        # Contextual hint for the pausing modes (e.g. the Enter/Space keys).
+        self._review_hint = QLabel("")
+        self._review_hint.setWordWrap(True)
+        self._review_hint.setStyleSheet("color:#888; font-size:10px;")
+        review_lay.addWidget(self._review_hint)
+
+        self._review_group.buttonToggled.connect(self._update_review_ui)
+        self._update_review_ui()
         right.addWidget(review_box)
 
         # ── Analysis method ───────────────────────────────────────────────────
@@ -468,7 +477,7 @@ class MainWindow(QMainWindow):
         step_row = QHBoxLayout()
         step_row.addWidget(QLabel("Step size:"))
         self._manual_step_spin = _NoScrollSpinBox()
-        self._manual_step_spin.setFocusPolicy(Qt.NoFocus)
+        self._manual_step_spin.setFocusPolicy(Qt.ClickFocus)
         self._manual_step_spin.setRange(1, 2048)
         self._manual_step_spin.setValue(100)
         self._manual_step_spin.setSuffix(" steps")
@@ -504,7 +513,7 @@ class MainWindow(QMainWindow):
         #   firmware X = rung  0.5 cm on 0.8 cm/rot motor  = 2560 half-steps
         # Adjustable live via the Sweep/Rung spacing fields below.
         self._x_spin    = _NoScrollSpinBox(); self._x_spin.setRange(1, 20000); self._x_spin.setValue(1350)
-        self._y_spin    = _NoScrollSpinBox(); self._y_spin.setRange(1, 20000); self._y_spin.setValue(3000)
+        self._y_spin    = _NoScrollSpinBox(); self._y_spin.setRange(1, 20000); self._y_spin.setValue(2900)
         self._rows_spin.valueChanged.connect(self._on_spinbox_changed)
         self._cols_spin.valueChanged.connect(self._on_spinbox_changed)
         self._total_label = QLabel()
@@ -589,15 +598,6 @@ class MainWindow(QMainWindow):
         self._leg_table.setSelectionMode(QTableWidget.NoSelection)
         self._leg_table.setFixedHeight(150)
         leg_lay.addWidget(self._leg_table)
-
-        self._leg_placeholder = QLabel(
-            "After each slide is captured you will be prompted\n"
-            "to name the leg (FR / FL / BR / BL).\n"
-            "Progress and re-run controls appear here."
-        )
-        self._leg_placeholder.setAlignment(Qt.AlignCenter)
-        self._leg_placeholder.setStyleSheet("color:#888; font-size:11px;")
-        leg_lay.addWidget(self._leg_placeholder)
         right.addWidget(leg_box)
 
         # ── Export format ─────────────────────────────────────────────────────
@@ -606,7 +606,7 @@ class MainWindow(QMainWindow):
         export_lay.setSpacing(3)
         self._export_group = QButtonGroup(self)
         self._btn_new_fmt    = QRadioButton("New — single workbook, 5 tabs")
-        self._btn_legacy_fmt = QRadioButton("Legacy — 3 files (MATLAB-compatible)")
+        self._btn_legacy_fmt = QRadioButton("Legacy — 3 files")
         self._btn_new_fmt.setChecked(True)
         self._export_group.addButton(self._btn_new_fmt,    0)
         self._export_group.addButton(self._btn_legacy_fmt, 1)
@@ -676,7 +676,6 @@ class MainWindow(QMainWindow):
             self._leg_results.clear()
             self._analyzing_legs.clear()
             self._leg_table.setRowCount(0)
-            self._leg_placeholder.setVisible(True)
             self._finish_btn.setEnabled(False)
             self._statusbar.showMessage(f"Set folder: {path}")
             mode = self._mode_group.checkedId()
@@ -747,6 +746,23 @@ class MainWindow(QMainWindow):
         if mode in ("hybrid", "ml"):
             self._clf.load()   # pre-warm the ML worker (no-op in rules mode)
         self._statusbar.showMessage(f"Capture classifier: {mode}")
+
+    def _update_review_ui(self, *_):
+        """Show the blur control + a key hint only for the pausing modes."""
+        mode = self._review_mode()
+        if mode == "manual":
+            self._review_hint.setText(
+                "After each photo: Enter = good / keep · Space = bad → adjust "
+                "focus and retake."
+            )
+        elif mode == "auto":
+            self._review_hint.setText(
+                "Sharp frames are kept automatically; blurry ones pause for "
+                "Enter = keep · Space = retake."
+            )
+        else:
+            self._review_hint.setText("")
+        self._blur_container.setVisible(mode in ("auto", "manual"))
 
     def _review_mode(self) -> str:
         """Return the selected review mode: 'none', 'auto', or 'manual'."""
@@ -896,7 +912,6 @@ class MainWindow(QMainWindow):
         row = self._leg_table.rowCount()
         self._leg_table.insertRow(row)
         self._set_leg_row(row, leg_name, image_count, status)
-        self._leg_placeholder.setVisible(False)
 
     def _set_leg_row(self, row: int, leg_name: str, image_count: int, status: str):
         name_item = QTableWidgetItem(leg_name)

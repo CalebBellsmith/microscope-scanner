@@ -28,7 +28,7 @@ Grid traversal pattern (calibrated raster with half-step stagger):
     return distances above already account for ending on capture 9 (not 10).
 
     Axis roles (see SWEEP_AXIS / RUNG_AXIS below): the fast 10-per-rung SWEEP
-    axis is firmware Y (1.4 cm/rot, default 3000 half-steps ≈ 1.0 cm/step); the
+    axis is firmware Y (1.4 cm/rot, default 2900 half-steps ≈ 1.0 cm/step); the
     slow 3-rung RUNG axis is firmware X (0.8 cm/rot, default 1350 half-steps
     ≈ 0.26 cm/step).
     On a clean finish the stage walks back to the leg origin; on STOP it halts
@@ -56,7 +56,7 @@ class CapturePipeline:
                  output_dir, set_name, leg,
                  rows, cols, x_spacing, y_spacing,
                  quality_threshold=0.5,
-                 review_mode="none", review_fn=None, blur_threshold=80.0,
+                 review_mode="none", review_fn=None, blur_threshold=60.0,
                  good_dir=None, bad_dir=None,
                  on_progress=None, on_frame=None, on_done=None, on_error=None):
         """
@@ -229,12 +229,55 @@ class CapturePipeline:
 
     # ── Review-aware capture (focus / operator gate) ──────────────────────────
 
+    # Minimum horizontal-scratch pixels before a focus score is trustworthy;
+    # below this there's nothing to judge and the frame is treated as in focus.
+    _FOCUS_MIN_PIXELS = 150
+
     @staticmethod
-    def _sharpness(frame) -> float:
-        """Focus metric: variance of the Laplacian.  Low = blurry/out of focus."""
+    def _horizontal_scratch_mask(gray):
+        """
+        Isolate straight HORIZONTAL scratch structures — the thing we actually
+        want in focus — reusing the 'accurate' detector's logic: darkness below
+        a local background, a contrast threshold, then keep only connected dark
+        regions that are clearly WIDER THAN TALL (a real horizontal scratch).
+        Round dust/blobs (width ≈ height) and vertical features are rejected by
+        the aspect gate, so they can't drive the focus score.  Returns a uint8
+        0/255 mask, slightly dilated so the line edges show.
+        """
+        import cv2
+        bg       = cv2.morphologyEx(
+            gray, cv2.MORPH_CLOSE,
+            cv2.getStructuringElement(cv2.MORPH_RECT, (31, 31)))
+        darkness = cv2.subtract(bg, gray)
+        thr      = max(8.0, float(darkness.mean()) + float(darkness.std()))
+        dark     = (darkness > thr).astype(np.uint8)
+
+        n, labels, stats, _ = cv2.connectedComponentsWithStats(dark, connectivity=8)
+        mask = np.zeros_like(dark)
+        for i in range(1, n):
+            x, y, w, h, a = stats[i]
+            if a < 40:           continue   # too small to be a scratch
+            if w < 2 * h:        continue   # not clearly horizontal (rejects round dust)
+            if w < 30:           continue   # too short to be a scratch
+            mask[labels == i] = 255
+
+        return cv2.dilate(mask, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)))
+
+    def _focus_score(self, frame) -> float:
+        """
+        Focus quality of the HORIZONTAL SCRATCHES only.  We mask the frame to
+        straight horizontal lines (so defects/dust are excluded) and take the
+        Laplacian variance there — crisp scratch edges score high, blurry ones
+        low.  Returns +inf when no horizontal scratch is present (nothing to
+        judge, so auto-pause won't fire on blank or defect-only frames).
+        """
         import cv2
         gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
-        return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+        mask = self._horizontal_scratch_mask(gray)
+        if int((mask > 0).sum()) < self._FOCUS_MIN_PIXELS:
+            return float("inf")
+        vals = cv2.Laplacian(gray, cv2.CV_64F)[mask > 0]
+        return float(vals.var()) if vals.size else float("inf")
 
     def _acquire_keeper(self):
         """
@@ -252,12 +295,13 @@ class CapturePipeline:
             return None
 
         if self._review_mode == "auto":
-            sharp = self._sharpness(frame) >= self._blur_thresh
-            label = self._clf.predict(frame)[0]
-            if sharp and label == "good":
-                return frame      # clean and in focus — no need to bother anyone
-            reason = "blurry" if not sharp else "flagged bad"
-            return self._operator_review(frame, reason)
+            # Pause only when the horizontal scratches are out of focus.  The
+            # focus score is measured ONLY along straight horizontal lines, so
+            # dust/blobs/defects don't trip auto-pause (they did when this was a
+            # whole-frame sharpness test — sharp dust read as "in focus").
+            if self._focus_score(frame) >= self._blur_thresh:
+                return frame
+            return self._operator_review(frame, "blurry")
 
         # manual: every frame goes to the operator
         return self._operator_review(frame, "manual")
