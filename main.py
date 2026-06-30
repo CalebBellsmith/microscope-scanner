@@ -901,16 +901,26 @@ class MainWindow(QMainWindow):
 
     # ── Auto-calibrate ────────────────────────────────────────────────────────
 
+    # Auto-calibrate stage tour: hop size (half-steps/axis) and the ring of
+    # offsets visited around the start.  Centre first, then a box of 8
+    # neighbours — each is a spatially distinct field of the slide.  Small
+    # enough to stay local; the whole tour is bounded by a 4 s budget below and
+    # ALWAYS walks back to the start position.
+    _CAL_HOP   = 400
+    _CAL_RING  = [(0, 0), (1, 0), (1, 1), (0, 1), (-1, 1),
+                  (-1, 0), (-1, -1), (0, -1), (1, -1)]
+    _CAL_BUDGET_S = 4.0
+
     def _on_auto_calibrate(self):
         """
-        Grab 6 frames from the live camera, run the classifier on each, and
-        set the threshold slider to the suggested value.
+        Tour a small area around the current stage position, capturing one frame
+        at each spot, then return to where we started.  Each frame is a NEW spot
+        on the slide, so the classifier gets a sense of the slide's overall look
+        (not one field repeated) and a single funky spot can't swing the result.
 
-        Point the camera at a representative area of the slide (ideally a clean
-        region with horizontal scratches) before clicking.  The calibration
-        sweeps detection sensitivity and picks the strictest level at which this
-        clean reference still reads clean, so the result adapts to the slide
-        instead of saturating at a fixed value every run.
+        The calibration then sweeps detection sensitivity and picks the strictest
+        level at which this sampled area still reads clean, so the result adapts
+        to the slide instead of saturating at a fixed value every run.
         """
         if self._camera is None:
             return
@@ -918,33 +928,43 @@ class MainWindow(QMainWindow):
         self._cal_btn.setEnabled(False)
         QApplication.processEvents()
 
-        # Collect as many DISTINCT live-preview frames as we can in ~5 s, rather
-        # than a fixed handful.  Sampling many frames from the surrounding area
-        # means a single funky frame (a passing fibre, a momentary glare) can't
-        # swing the result — calibrate() needs the slide's *typical* look.  We
-        # use grab() (the fast preview path) instead of grab_fresh(): no exposure
-        # switching, so we get far more frames per second, and they only need to
-        # be representative, not save-quality.  A new frame is detected via the
-        # camera's frame counter when available, else by object identity.
         import time as _time
-        frames    = []
-        last_id   = None
-        deadline  = _time.time() + 5.0
-        MAX_FRAMES = 120          # safety cap so a fast camera can't run away
-        while _time.time() < deadline and len(frames) < MAX_FRAMES:
-            frame = self._camera.grab()
-            fid = getattr(self._camera, "_frame_count", None)
-            # New frame if the camera has no counter (every grab() is a fresh
-            # read, e.g. OpenCV) or its counter advanced since we last sampled.
-            is_new = (fid is None) or (fid != last_id)
-            if frame is not None and is_new:
-                frames.append(frame)
-                last_id = fid
-            self._statusbar.showMessage(
-                f"Calibrating — sampling frames… ({len(frames)})"
-            )
-            QApplication.processEvents()
-            _time.sleep(0.03)     # ~30 ms: keeps the UI live, paces the sampling
+        SETTLE   = 0.15                              # brief settle before each grab
+        cur      = [0, 0]                            # offset from start, in hops (X, Y)
+        frames   = []
+        # Stop touring at 80% of the budget so there's time to walk home; the
+        # finally block returns to start no matter where we stopped.
+        deadline = _time.time() + self._CAL_BUDGET_S * 0.8
+
+        def goto(tx, ty):
+            """Move the stage to ring offset (tx, ty) and update cur."""
+            if self._motor is not None:
+                dx = (tx - cur[0]) * self._CAL_HOP
+                dy = (ty - cur[1]) * self._CAL_HOP
+                if dx:
+                    self._motor.move("X", dx)
+                if dy:
+                    self._motor.move("Y", dy)
+            cur[0], cur[1] = tx, ty
+
+        try:
+            for (tx, ty) in self._CAL_RING:
+                goto(tx, ty)
+                _time.sleep(SETTLE)
+                frame = self._camera.grab()
+                if frame is not None:
+                    frames.append(frame)
+                self._statusbar.showMessage(
+                    f"Calibrating — touring slide… ({len(frames)} spots)"
+                )
+                QApplication.processEvents()
+                if _time.time() > deadline:
+                    break
+        except Exception as e:
+            self._statusbar.showMessage(f"Calibration move failed: {e}")
+        finally:
+            goto(0, 0)              # ALWAYS return to the starting spot
+            _time.sleep(SETTLE)
 
         if not frames:
             self._cal_btn.setEnabled(True)
@@ -960,7 +980,7 @@ class MainWindow(QMainWindow):
         self._cal_btn.setEnabled(True)
         self._statusbar.showMessage(
             f"Calibrated: sensitivity set to {sensitivity:.2f} "
-            f"(based on {len(frames)} frames)"
+            f"(toured {len(frames)} spots)"
         )
 
     # ── Go ────────────────────────────────────────────────────────────────────
