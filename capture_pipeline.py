@@ -11,21 +11,23 @@ so filenames match what the MATLAB analysis script expects when it does
 dir('*.jpg').
 
 Grid traversal pattern (calibrated raster with half-step stagger):
-    Every rung scans FORWARD in X (capture, then step one X-step), then the
-    stage rapidly returns in X while advancing one Y rung.  The returns are
-    deliberately asymmetric so that odd rungs are offset by half an X-step,
-    interleaving their samples with the even rungs for finer X coverage:
+    Every rung scans the SWEEP axis forward (capture, then step one sweep-step),
+    then the stage returns along the SWEEP axis and advances one RUNG step.  All
+    moves are SEQUENTIAL (one axis at a time — no concurrent diagonal).  The
+    returns are deliberately asymmetric so odd rungs are offset half a sweep-step,
+    interleaving their samples with the even rungs for finer coverage:
 
-        Rung 0:  capture at X-steps 0,1,…,9  (start offset 0.0)
-          ↩ X return −9.5 steps,  Y +1 rung
-        Rung 1:  capture at X-steps 0.5,1.5,…,9.5  (start offset 0.5)
-          ↩ X return −10.5 steps,  Y +1 rung
-        Rung 2:  capture at X-steps 0,1,…,9  (start offset 0.0)
+        Rung 0:  capture at sweep-steps 0,1,…,9   (start offset 0.0)
+          ↩ sweep return −9.5 steps,  rung +1
+        Rung 1:  capture at sweep-steps 0.5,1.5,…,9.5  (start offset 0.5)
+          ↩ sweep return −10.5 steps,  rung +1
+        Rung 2:  capture at sweep-steps 0,1,…,9   (start offset 0.0)
 
-    With the measured calibration (1 X-step = 0.53 cm = 2714 half-steps,
-    1 Y rung = 0.5 cm = 1463 half-steps) the half-step stagger is exact
-    because 2714 is even.  After the final capture the stage returns to the
-    leg origin so the next leg starts from a known position.
+    Axis roles (see SWEEP_AXIS / RUNG_AXIS below): the fast 10-per-rung SWEEP
+    axis is firmware Y (1.4 cm/rot → 0.53 cm = 1551 half-steps); the slow
+    3-rung RUNG axis is firmware X (0.8 cm/rot → 0.5 cm = 2560 half-steps).
+    On a clean finish the stage walks back to the leg origin; on STOP it halts
+    in place (the operator re-zeroes before the next run).
 
 Nudge strategy when a frame is bad:
     1. Find the largest dark blob (dust) in the frame using OpenCV.
@@ -95,72 +97,70 @@ class CapturePipeline:
 
     # ── Grid scan ─────────────────────────────────────────────────────────────
 
+    # ── Physical axis roles ────────────────────────────────────────────────
+    # The fast SWEEP axis takes 10 captures per rung; the slow RUNG axis indexes
+    # 3 times per leg.  These map the scan roles onto the firmware axis letters.
+    # If the stage axes are wired the other way, swap these two letters (and the
+    # X/Y spacing defaults in main.py).
+    SWEEP_AXIS = "Y"   # fast: 10 captures per rung  (firmware Y stepper)
+    RUNG_AXIS  = "X"   # slow: 3 rungs per leg       (firmware X stepper)
+
     @staticmethod
     def _rung_start(row):
-        """X start offset of a rung, in whole X-steps.  Odd rungs are
-        staggered half a step so their samples interleave with even rungs."""
+        """Sweep-axis start offset of a rung, in whole sweep-steps.  Odd rungs
+        are staggered half a step so their samples interleave with even rungs."""
         return 0.5 if (row % 2 == 1) else 0.0
 
     def _run(self):
         """
         Main capture loop — runs in a background thread.
-        Scans each rung forward in X (capture-then-step), rapidly returns in X
-        while advancing one Y rung between rungs, then returns to the leg
-        origin.  Calls on_progress after each image.
+        Each rung scans the SWEEP axis forward (capture-then-step); between rungs
+        the SWEEP axis returns and the RUNG axis advances one step.  All moves
+        are sequential (one axis at a time).  On normal completion the stage
+        returns to the leg origin; on STOP it halts in place.
         """
         try:
-            total  = self._rows * self._cols
-            cols   = self._cols
-            x_step = self._x_spacing            # half-steps per 0.53 cm X move
-            y_step = self._y_spacing            # half-steps per 0.5 cm Y rung
-            done   = 0
+            total = self._rows * self._cols
+            cols  = self._cols
+            # Spacing is indexed by firmware axis; pick out each role's step.
+            spacing    = {"X": self._x_spacing, "Y": self._y_spacing}
+            sweep_step = spacing[self.SWEEP_AXIS]   # half-steps per sweep step
+            rung_step  = spacing[self.RUNG_AXIS]    # half-steps per rung step
+            done = 0
 
-            # Track net deliberate stage travel so we can return to origin at
-            # the end (centroid nudges restore themselves, so they net zero and
-            # are not counted here).
-            abs_x = 0
-            abs_y = 0
+            # Net travel per firmware axis, so we can return to origin at the
+            # end.  (Centroid nudges restore themselves and are not counted.)
+            abs_pos = {"X": 0, "Y": 0}
 
-            def grid_move(axis, amount):
-                nonlocal abs_x, abs_y
+            def move(axis, amount):
                 amount = int(amount)
                 if amount == 0:
                     return
                 self._motor.move(axis, amount)
-                if axis == "X":
-                    abs_x += amount
-                else:
-                    abs_y += amount
+                abs_pos[axis] += amount
 
             for row in range(self._rows):
                 if self._stop_event.is_set():
                     break
 
-                # Reposition between rungs: rapid X return WHILE advancing one Y
-                # rung, performed concurrently for speed.  The X return distance
-                # = (next start) − (prev start + cols) in whole X-steps, e.g.
+                # Reposition between rungs (sequential): SWEEP axis returns, then
+                # RUNG axis advances one step.  SWEEP return distance = (next
+                # start) − (prev start + cols) in whole sweep-steps, e.g.
                 # row 0→1: 0.5 − 10 = −9.5 steps;  row 1→2: 0 − 10.5 = −10.5.
                 if row > 0:
-                    x_return = self._rung_start(row) - self._rung_start(row - 1) - cols
-                    x_amt = round(x_return * x_step)
-                    if hasattr(self._motor, "move_xy"):
-                        self._motor.move_xy(x_amt, y_step)
-                        abs_x += x_amt
-                        abs_y += y_step
-                    else:   # fall back to sequential moves if firmware lacks MOVE XY
-                        grid_move("X", x_amt)
-                        grid_move("Y", y_step)
+                    sweep_return = self._rung_start(row) - self._rung_start(row - 1) - cols
+                    move(self.SWEEP_AXIS, round(sweep_return * sweep_step))
+                    move(self.RUNG_AXIS, rung_step)
                     time.sleep(0.3)   # settle after the reposition
 
                 for col in range(cols):
                     if self._stop_event.is_set():
                         break
 
-                    # Capture FIRST (capture-then-step) at this X position.
+                    # Capture FIRST (capture-then-step) at this sweep position.
                     frame = self._best_frame()
                     if frame is not None:
-                        # Positional filename: every rung is left-to-right.
-                        img_num = row * cols + col + 1
+                        img_num = row * cols + col + 1   # positional filename
                         path = os.path.join(self._out, f"{img_num:03d}.jpg")
                         self._save(frame, path)
                         self._on_frame(frame)
@@ -168,21 +168,19 @@ class CapturePipeline:
                     done += 1
                     self._on_progress(done, total)
 
-                    # Step forward one X position after every capture EXCEPT the
-                    # very last one of the scan (no rung follows it).  For
-                    # non-final rungs this final step is the start of the return.
+                    # Step the SWEEP axis one position after every capture except
+                    # the very last of the scan.  For non-final rungs this final
+                    # step is the start of the return.
                     last_overall = (row == self._rows - 1) and (col == cols - 1)
                     if not last_overall:
-                        grid_move("X", x_step)
+                        move(self.SWEEP_AXIS, sweep_step)
                         time.sleep(0.1)
 
-            # Return the stage to the leg origin so the next leg starts clean
-            # (concurrently when the firmware supports it).
-            if hasattr(self._motor, "move_xy"):
-                self._motor.move_xy(-abs_x, -abs_y)
-            else:
-                grid_move("X", -abs_x)
-                grid_move("Y", -abs_y)
+            # On a clean finish, walk back to the leg origin (sequential).  On a
+            # STOP, leave the stage where it is — the operator re-zeroes anyway.
+            if not self._stop_event.is_set():
+                move(self.RUNG_AXIS,  -abs_pos[self.RUNG_AXIS])
+                move(self.SWEEP_AXIS, -abs_pos[self.SWEEP_AXIS])
 
             self._on_done()
 

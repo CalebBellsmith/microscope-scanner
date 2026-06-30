@@ -361,7 +361,7 @@ class MainWindow(QMainWindow):
         self._manual_chk = QCheckBox("Enable arrow-key joystick")
         self._manual_chk.setFocusPolicy(Qt.NoFocus)
         self._manual_chk.setToolTip(
-            "When checked: ← → move X stepper, ↑ ↓ move Y stepper"
+            "When checked: ← → jog the Y stepper, ↑ ↓ jog the X stepper"
         )
         manual_lay.addWidget(self._manual_chk)
 
@@ -377,9 +377,13 @@ class MainWindow(QMainWindow):
         manual_lay.addLayout(step_row)
 
         manual_lay.addWidget(QLabel(
-            "← → = X axis    ↑ ↓ = Y axis",
+            "← → = Y axis    ↑ ↓ = X axis",
         ))
         right.addWidget(manual_box)
+        # Jog keys must work regardless of which widget holds keyboard focus
+        # (a scroll area or button would otherwise swallow the arrow keys), so
+        # we filter key events application-wide — see eventFilter below.
+        QApplication.instance().installEventFilter(self)
 
         # ── Scan profile ──────────────────────────────────────────────────────
         self._profile_box = QGroupBox("Scan profile")
@@ -393,10 +397,12 @@ class MainWindow(QMainWindow):
 
         self._rows_spin = QSpinBox(); self._rows_spin.setRange(1, 50); self._rows_spin.setValue(3)
         self._cols_spin = QSpinBox(); self._cols_spin.setRange(1, 50); self._cols_spin.setValue(10)
-        # Calibrated defaults: X-step 0.53 cm = 2714 half-steps,
-        # Y rung 0.5 cm = 1463 half-steps (28BYJ-48, 4096 half-steps/rotation).
-        self._x_spin    = QSpinBox(); self._x_spin.setRange(1, 20000); self._x_spin.setValue(2714)
-        self._y_spin    = QSpinBox(); self._y_spin.setRange(1, 20000); self._y_spin.setValue(1463)
+        # Calibrated defaults (axes swapped: fast sweep on firmware Y, slow rung
+        # on firmware X; 28BYJ-48, 4096 half-steps/rotation):
+        #   firmware X = rung 0.5 cm on 0.8 cm/rot motor  = 2560 half-steps
+        #   firmware Y = sweep 0.53 cm on 1.4 cm/rot motor = 1551 half-steps
+        self._x_spin    = QSpinBox(); self._x_spin.setRange(1, 20000); self._x_spin.setValue(2560)
+        self._y_spin    = QSpinBox(); self._y_spin.setRange(1, 20000); self._y_spin.setValue(1551)
         self._rows_spin.valueChanged.connect(self._on_spinbox_changed)
         self._cols_spin.valueChanged.connect(self._on_spinbox_changed)
         self._total_label = QLabel()
@@ -625,21 +631,34 @@ class MainWindow(QMainWindow):
 
     # ── Manual joystick ──────────────────────────────────────────────────────
 
-    def keyPressEvent(self, event):
-        if not self._manual_chk.isChecked():
-            super().keyPressEvent(event)
-            return
+    def eventFilter(self, obj, event):
+        # Application-wide key filter so arrow keys jog the stage even when a
+        # child widget (scroll area, button) holds keyboard focus.  Only acts
+        # while the joystick is enabled, and never steals keys from a text or
+        # spin field the user might be editing.
+        from PyQt5.QtCore import QEvent
+        if (event.type() == QEvent.KeyPress
+                and self._manual_chk.isChecked()
+                and not isinstance(QApplication.focusWidget(), (QLineEdit, QSpinBox))):
+            if self._handle_manual_key(event.key()):
+                return True   # consume — don't let the focused widget also act
+        return super().eventFilter(obj, event)
+
+    def _handle_manual_key(self, key) -> bool:
+        """Jog the stage one step.  Arrow→axis mapping reflects the swapped
+        axes: ← → drive the Y stepper, ↑ ↓ drive the X stepper.  Returns True
+        if the key was a handled arrow key (so the caller can consume it)."""
+        if key not in (Qt.Key_Left, Qt.Key_Right, Qt.Key_Up, Qt.Key_Down):
+            return False
         if self._motor is None:
             self._statusbar.showMessage("Motor not connected — connect first.")
-            super().keyPressEvent(event)
-            return
+            return True
         steps = self._manual_step_spin.value()
-        key   = event.key()
-        if   key == Qt.Key_Left:  self._motor.move("X", -steps)
-        elif key == Qt.Key_Right: self._motor.move("X",  steps)
-        elif key == Qt.Key_Up:    self._motor.move("Y", -steps)
-        elif key == Qt.Key_Down:  self._motor.move("Y",  steps)
-        else: super().keyPressEvent(event)
+        if   key == Qt.Key_Left:  self._motor.move("Y", -steps)
+        elif key == Qt.Key_Right: self._motor.move("Y",  steps)
+        elif key == Qt.Key_Up:    self._motor.move("X", -steps)
+        elif key == Qt.Key_Down:  self._motor.move("X",  steps)
+        return True
 
     # ── Profile helpers ───────────────────────────────────────────────────────
 
