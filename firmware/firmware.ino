@@ -8,6 +8,7 @@
   Supported commands:
     MOVE X <steps>          — drive X stepper ± <steps> half-steps (fast axis)
     MOVE Y <steps>          — drive Y stepper ± <steps> half-steps (slow axis)
+    MOVE Z <steps>          — drive Z stepper ± <steps> half-steps (focus axis)
     MOVE XY <xsteps> <ysteps> — drive BOTH steppers concurrently (interleaved)
     HOME                    — acknowledge only; Python resets logical position
 
@@ -25,11 +26,14 @@
   Hardware wiring (IN1-IN4 on each ULN2003 driver board):
     X stepper: GPIO 19, 18, 5, 17
     Y stepper: GPIO 27, 26, 25, 33
+    Z stepper: GPIO 13, 14, 16, 4   (focus knob; motors powered from the 5V bank,
+                                     ESP32 on USB — share a COMMON GROUND)
 */
 
 // ── Stepper pin assignments ───────────────────────────────────────────────
 const int X_PINS[4] = {19, 18, 5, 17};
 const int Y_PINS[4] = {27, 26, 25, 33};
+const int Z_PINS[4] = {13, 14, 16, 4};   // focus stepper (autofocus) — DevKit-V1 safe GPIOs
 
 // Half-step sequence: 8 rows, each row drives one electrical step.
 const int STEP_SEQ[8][4] = {
@@ -48,9 +52,11 @@ const int STEP_SEQ[8][4] = {
 // below 900 (prior validated-safe rate was ~1200 µs).
 const int X_STEP_DELAY_US = 900;   // rung axis (short moves)
 const int Y_STEP_DELAY_US = 900;   // sweep axis — 900 is the safe floor (700 skips)
+const int Z_STEP_DELAY_US = 900;   // focus axis — small moves, same safe rate
 
 int xStepIndex = 0;   // current position in the 8-step table for X
 int yStepIndex = 0;   // current position in the 8-step table for Y
+int zStepIndex = 0;   // current position in the 8-step table for Z
 
 // Advance one stepper a single half-step in the given direction (no delay,
 // no de-energise — callers handle pacing and coil shutdown).
@@ -137,6 +143,13 @@ void handleCommand(String cmd) {
     return;
   }
 
+  if (cmd.startsWith("MOVE Z ")) {
+    int n = cmd.substring(7).toInt();
+    stepN(Z_PINS, zStepIndex, n, Z_STEP_DELAY_US);
+    Serial.println("OK");
+    return;
+  }
+
   Serial.print("ERR unknown command: ");
   Serial.println(cmd);
 }
@@ -148,6 +161,7 @@ void setup() {
   for (int p = 0; p < 4; p++) {
     pinMode(X_PINS[p], OUTPUT); digitalWrite(X_PINS[p], LOW);
     pinMode(Y_PINS[p], OUTPUT); digitalWrite(Y_PINS[p], LOW);
+    pinMode(Z_PINS[p], OUTPUT); digitalWrite(Z_PINS[p], LOW);
   }
 
   Serial.println("READY");

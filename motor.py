@@ -80,12 +80,12 @@ class MotorController:
     def move(self, axis: str, amount: int):
         """
         Send a MOVE command and block until the ESP32 replies OK.
-        axis   : "X" or "Y"
+        axis   : "X", "Y", or "Z" (Z = focus stepper)
         amount : steps to move (positive = forward, negative = reverse)
         Raises RuntimeError if the firmware replies with an error.
         """
         axis = axis.upper()
-        assert axis in ("X", "Y"), f"Unknown axis {axis}"
+        assert axis in ("X", "Y", "Z"), f"Unknown axis {axis}"
 
         resp = self._command(f"MOVE {axis} {amount}\n", expected_steps=amount)
         if resp != "OK":

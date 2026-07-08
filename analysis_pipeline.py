@@ -585,29 +585,56 @@ def write_new_format(set_dir: str, leg_results: dict) -> str:
         for col, val in enumerate(row_data, start=1):
             _val(ws_sum, 2, col, val)
 
-        # ANOVA below summary
+        # Each leg's Statistic/Value (descStats) block, laid out side by side on
+        # the Summary tab so all four are visible at a glance.  (ANOVA + pairwise
+        # now live on their own "ANOVA" tab instead of below the summary.)
+        block_cols = {"FR": 1, "FL": 4, "BR": 7, "BL": 10}   # A-B, D-E, G-H, J-K
+        block_top  = 4
+        for leg, c0 in block_cols.items():
+            areas = all_areas_by_leg.get(leg)
+            if not areas:
+                continue
+            _hdr(ws_sum, block_top,     c0,     leg,         FILL_STAT)
+            _hdr(ws_sum, block_top,     c0 + 1, "",          FILL_STAT)
+            _hdr(ws_sum, block_top + 1, c0,     "Statistic", FILL_STAT)
+            _hdr(ws_sum, block_top + 1, c0 + 1, "Value",     FILL_STAT)
+            rr = block_top + 2
+            for label, value in _desc_stats(areas):
+                _val(ws_sum, rr, c0,     label)
+                _val(ws_sum, rr, c0 + 1, value)
+                ws_sum.cell(row=rr, column=c0).fill     = FILL_STAT
+                ws_sum.cell(row=rr, column=c0 + 1).fill = FILL_STAT
+                rr += 1
+
+        # ── ANOVA tab (own sheet): ANOVA table + pairwise comparisons ───────────
         if len(all_areas_by_leg) >= 2:
             anova_rows, pair_rows = _anova_rows(all_areas_by_leg)
-            r = 4
-            _hdr(ws_sum, r, 1, "ANOVA", FILL_STAT)
+            ws_an = wb.create_sheet(title="ANOVA", index=1)
+            ws_an.column_dimensions["A"].width = 16
+            for col in "BCDEF":
+                ws_an.column_dimensions[col].width = 14
+            r = 1
+            _hdr(ws_an, r, 1, "ANOVA", FILL_STAT)
             r += 1
-            for ar in anova_rows:
+            for i, ar in enumerate(anova_rows):
                 for col, val in enumerate(ar, start=1):
-                    c = ws_sum.cell(row=r, column=col, value=val)
+                    c = ws_an.cell(row=r, column=col, value=val)
                     c.border = BOX
-                    if r == 5:
+                    if i == 0:                 # first row is the column header
                         c.font = HDR
                 r += 1
             r += 1
-            _hdr(ws_sum, r, 1, "Pairwise Comparisons", FILL_STAT)
+            _hdr(ws_an, r, 1, "Pairwise Comparisons", FILL_STAT)
             r += 1
-            for ph in ["Group 1", "Group 2", "Lower CI", "Difference", "Upper CI", "p-value"]:
-                c = ws_sum.cell(row=r, column=["Group 1","Group 2","Lower CI","Difference","Upper CI","p-value"].index(ph)+1, value=ph)
+            for col, ph in enumerate(
+                    ["Group 1", "Group 2", "Lower CI", "Difference", "Upper CI", "p-value"],
+                    start=1):
+                c = ws_an.cell(row=r, column=col, value=ph)
                 c.font = HDR; c.border = BOX
             r += 1
             for pr in pair_rows:
                 for col, val in enumerate(pr, start=1):
-                    ws_sum.cell(row=r, column=col, value=val).border = BOX
+                    ws_an.cell(row=r, column=col, value=val).border = BOX
                 r += 1
 
     path = os.path.join(set_dir, f"{set_name}_results.xlsx")

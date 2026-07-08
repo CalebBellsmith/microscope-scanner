@@ -392,29 +392,63 @@ class MainWindow(QMainWindow):
         self._btn_review_none = QRadioButton("None")
         self._btn_review_auto = QRadioButton("Auto-pause")
         self._btn_review_man  = QRadioButton("Manual")
+        self._btn_review_af   = QRadioButton("Autofocus")
         self._btn_review_none.setChecked(True)
-        for b in (self._btn_review_none, self._btn_review_auto, self._btn_review_man):
+        for b in (self._btn_review_none, self._btn_review_auto,
+                  self._btn_review_man, self._btn_review_af):
             b.setFocusPolicy(Qt.NoFocus)
             self._review_group.addButton(b)
             review_lay.addWidget(b)
 
-        # Blur-threshold control — only shown for the pausing modes (Manual /
-        # Auto-pause).  Wrapped in a container so the whole row can hide in None.
+        # Focus-threshold control — shown for every mode that judges focus
+        # (Auto-pause / Manual / Autofocus).  Wrapped so the row can hide in None.
         self._blur_container = QWidget()
         blur_row = QHBoxLayout(self._blur_container)
         blur_row.setContentsMargins(0, 0, 0, 0)
-        blur_row.addWidget(QLabel("Blur threshold:"))
+        blur_row.addWidget(QLabel("Focus threshold:"))
         self._blur_spin = _NoScrollSpinBox()
         self._blur_spin.setFocusPolicy(Qt.ClickFocus)
         self._blur_spin.setRange(0, 5000)
-        self._blur_spin.setValue(60)          # focus-score floor for in-focus scratches
+        self._blur_spin.setValue(80)          # focus-score floor for in-focus scratches
         self._blur_spin.setToolTip(
             "Frames whose horizontal scratches score below this focus value are "
-            "treated as out of focus.  Higher = stricter (pauses more)."
+            "treated as out of focus.  Validated on real frames: in-focus ≳100, "
+            "clearly out-of-focus <60.  Higher = stricter (acts more often)."
         )
         blur_row.addWidget(self._blur_spin)
         blur_row.addStretch()
         review_lay.addWidget(self._blur_container)
+
+        # Autofocus-only Z controls — shown only in Autofocus mode.
+        self._af_container = QWidget()
+        af_lay = QVBoxLayout(self._af_container)
+        af_lay.setContentsMargins(0, 0, 0, 0)
+        af_lay.setSpacing(2)
+        z_row = QHBoxLayout()
+        z_row.addWidget(QLabel("Z step ½:"))
+        self._z_step_spin = _NoScrollSpinBox()
+        self._z_step_spin.setFocusPolicy(Qt.ClickFocus)
+        self._z_step_spin.setRange(1, 5000)
+        self._z_step_spin.setValue(200)
+        self._z_step_spin.setToolTip("Half-steps the Z (focus) stepper moves per "
+                                     "probe during an autofocus search.")
+        z_row.addWidget(self._z_step_spin)
+        z_row.addSpacing(10)
+        z_row.addWidget(QLabel("Z range ½:"))
+        self._z_range_spin = _NoScrollSpinBox()
+        self._z_range_spin.setFocusPolicy(Qt.ClickFocus)
+        self._z_range_spin.setRange(1, 20000)
+        self._z_range_spin.setValue(2000)
+        self._z_range_spin.setToolTip("Max ± half-steps a search may travel — a "
+                                      "runaway safety bound on the focus stepper.")
+        z_row.addWidget(self._z_range_spin)
+        z_row.addStretch()
+        af_lay.addLayout(z_row)
+        self._z_invert_chk = QCheckBox("Invert Z direction (flip if it focuses the wrong way)")
+        self._z_invert_chk.setFocusPolicy(Qt.NoFocus)
+        self._z_invert_chk.setStyleSheet("font-size:10px;")
+        af_lay.addWidget(self._z_invert_chk)
+        review_lay.addWidget(self._af_container)
 
         # Contextual hint for the pausing modes (e.g. the Enter/Space keys).
         self._review_hint = QLabel("")
@@ -748,28 +782,38 @@ class MainWindow(QMainWindow):
         self._statusbar.showMessage(f"Capture classifier: {mode}")
 
     def _update_review_ui(self, *_):
-        """Show the blur control + a key hint only for the pausing modes."""
+        """Show the focus threshold / Z controls / hint per selected mode.
+        The defect-nudge runs in ALL modes; these controls only govern focus."""
         mode = self._review_mode()
         if mode == "manual":
             self._review_hint.setText(
                 "After each photo: Enter = good / keep · Space = bad → adjust "
-                "focus and retake."
+                "focus and retake.  (Defect-nudge still runs automatically.)"
             )
         elif mode == "auto":
             self._review_hint.setText(
                 "Sharp frames are kept automatically; blurry ones pause for "
                 "Enter = keep · Space = retake."
             )
+        elif mode == "autofocus":
+            self._review_hint.setText(
+                "Soft frames trigger a Z focus search and re-capture — no operator "
+                "needed.  Fires rarely; calibrate Z step/range on the rig first."
+            )
         else:
             self._review_hint.setText("")
-        self._blur_container.setVisible(mode in ("auto", "manual"))
+        # Focus threshold applies to every focus-judging mode; Z controls only AF.
+        self._blur_container.setVisible(mode in ("auto", "manual", "autofocus"))
+        self._af_container.setVisible(mode == "autofocus")
 
     def _review_mode(self) -> str:
-        """Return the selected review mode: 'none', 'auto', or 'manual'."""
+        """Return the review mode: 'none', 'auto', 'manual', or 'autofocus'."""
         if self._btn_review_man.isChecked():
             return "manual"
         if self._btn_review_auto.isChecked():
             return "auto"
+        if self._btn_review_af.isChecked():
+            return "autofocus"
         return "none"
 
     def _request_review(self, frame, reason: str) -> str:
@@ -1186,6 +1230,9 @@ class MainWindow(QMainWindow):
             blur_threshold=self._blur_spin.value(),
             good_dir=TRAINING_GOOD_DIR,
             bad_dir=TRAINING_BAD_DIR,
+            z_step=self._z_step_spin.value(),
+            z_range=self._z_range_spin.value(),
+            z_dir=(-1 if self._z_invert_chk.isChecked() else 1),
             on_progress=lambda d, t: self._sig.capture_progress.emit(d, t),
             on_frame=lambda f: self._sig.frame_ready.emit(f),
             on_done=lambda: self._sig.capture_done.emit(),

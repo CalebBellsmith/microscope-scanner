@@ -56,8 +56,9 @@ class CapturePipeline:
                  output_dir, set_name, leg,
                  rows, cols, x_spacing, y_spacing,
                  quality_threshold=0.5,
-                 review_mode="none", review_fn=None, blur_threshold=60.0,
+                 review_mode="none", review_fn=None, blur_threshold=80.0,
                  good_dir=None, bad_dir=None,
+                 z_step=200, z_range=2000, z_dir=1,
                  on_progress=None, on_frame=None, on_done=None, on_error=None):
         """
         camera            : camera object (ToupTekCamera / OpenCVCamera)
@@ -71,17 +72,25 @@ class CapturePipeline:
         quality_threshold : classifier confidence required to skip nudge
                             (0.1 = lenient / accept almost anything,
                              0.9 = strict / nudge unless very confident)
-        review_mode       : "none"   — fully automatic (classify + auto-nudge)
-                            "auto"   — auto-keep sharp+good frames, else ask the
-                                       operator (used for non-uniform focus)
-                            "manual" — ask the operator on every frame
+        review_mode       : how FOCUS is handled — the defect-nudge always runs
+                            in every mode (it's the core job).  On top of that:
+                            "none"     — no focus handling.
+                            "auto"     — auto-keep in-focus frames; pause for the
+                                         operator only when a frame is soft.
+                            "manual"   — pause for the operator on every frame.
+                            "autofocus"— when a frame is soft, drive the Z stepper
+                                         to refocus and re-capture (no operator).
         review_fn(frame, reason) -> "good"|"bad"
                             blocking callback into the GUI for auto/manual modes;
                             "good" keeps the frame, "bad" logs it and retakes.
-        blur_threshold    : Laplacian-variance floor below which a frame is
-                            considered out of focus (auto mode only).
+        blur_threshold    : focus-score floor below which a frame is considered
+                            out of focus (auto + autofocus modes).
         good_dir / bad_dir: if set, reviewed frames are copied here (kept→good,
                             rejected→bad) to grow the ML training dataset.
+        z_step / z_range  : autofocus half-steps per probe, and the max ± travel
+                            the search may span (safety bound against runaway).
+        z_dir             : +1 or −1 — which firmware Z direction is "into focus"
+                            (set at calibration; the search probes both ways).
         on_progress(done, total) : called after each image is captured
         on_frame(frame)          : called with each saved frame (for GUI display)
         on_done()                : called when all images have been captured
@@ -101,6 +110,10 @@ class CapturePipeline:
         self._blur_thresh = blur_threshold
         self._good_dir    = good_dir
         self._bad_dir     = bad_dir
+        self._z_step      = int(z_step)
+        self._z_range     = int(z_range)
+        self._z_dir       = 1 if int(z_dir) >= 0 else -1
+        self._z_disabled  = False   # set if the Z stepper doesn't respond (no HW)
         self._on_progress = on_progress or (lambda done, total: None)
         self._on_frame    = on_frame    or (lambda img: None)
         self._on_done     = on_done     or (lambda: None)
@@ -233,6 +246,11 @@ class CapturePipeline:
     # below this there's nothing to judge and the frame is treated as in focus.
     _FOCUS_MIN_PIXELS = 150
 
+    # Scale factor so the (dimensionless) focus score lands in a friendly range
+    # for an integer GUI threshold — in-focus fields read ~100+, clearly
+    # out-of-focus ones well below (see _focus_score).  Default threshold ~80.
+    _FOCUS_SCALE = 10.0
+
     @staticmethod
     def _horizontal_scratch_mask(gray):
         """
@@ -241,8 +259,9 @@ class CapturePipeline:
         a local background, a contrast threshold, then keep only connected dark
         regions that are clearly WIDER THAN TALL (a real horizontal scratch).
         Round dust/blobs (width ≈ height) and vertical features are rejected by
-        the aspect gate, so they can't drive the focus score.  Returns a uint8
-        0/255 mask, slightly dilated so the line edges show.
+        the aspect gate, so they can't drive the focus score.  Returns
+        (mask uint8 0/255, darkness float image) — darkness is reused by the
+        focus score for contrast normalisation (avoids a second morphology).
         """
         import cv2
         bg       = cv2.morphologyEx(
@@ -261,44 +280,62 @@ class CapturePipeline:
             if w < 30:           continue   # too short to be a scratch
             mask[labels == i] = 255
 
-        return cv2.dilate(mask, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)))
+        mask = cv2.dilate(mask, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)))
+        return mask, darkness.astype(np.float64)
 
     def _focus_score(self, frame) -> float:
         """
-        Focus quality of the HORIZONTAL SCRATCHES only.  We mask the frame to
-        straight horizontal lines (so defects/dust are excluded) and take the
-        Laplacian variance there — crisp scratch edges score high, blurry ones
-        low.  Returns +inf when no horizontal scratch is present (nothing to
-        judge, so auto-pause won't fire on blank or defect-only frames).
+        Focus quality of the HORIZONTAL SCRATCHES.  A defocused horizontal line
+        keeps its darkness but loses the STEEPNESS of its top/bottom edges, so
+        we measure the vertical-gradient energy along the scratches and divide
+        by the scratches' contrast² — i.e. edge steepness *relative to* how dark
+        the line is.  That normalisation is the key: it stops a dark-but-soft
+        scratch (e.g. a deep line in an otherwise out-of-focus field) from
+        reading as sharp, and makes the score dimensionless → robust to
+        exposure/lighting so a single global threshold holds across slides.
+
+        Higher = sharper.  Returns +inf when no horizontal scratch is present
+        (nothing to judge → treated as in focus; autofocus/auto-pause won't fire
+        on blank or defect-only fields, which we don't care about anyway).
+        Validated on real rig frames: in-focus ≳100, clearly out-of-focus <60.
         """
         import cv2
         gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
-        mask = self._horizontal_scratch_mask(gray)
-        if int((mask > 0).sum()) < self._FOCUS_MIN_PIXELS:
+        mask, darkness = self._horizontal_scratch_mask(gray)
+        sel = mask > 0
+        if int(sel.sum()) < self._FOCUS_MIN_PIXELS:
             return float("inf")
-        vals = cv2.Laplacian(gray, cv2.CV_64F)[mask > 0]
-        return float(vals.var()) if vals.size else float("inf")
+        gy = cv2.Sobel(gray.astype(np.float64), cv2.CV_64F, 0, 1, ksize=3)
+        edge_energy = float((gy[sel] ** 2).mean())      # steepness across the lines
+        contrast    = float(darkness[sel].mean()) + 1e-6
+        return self._FOCUS_SCALE * edge_energy / (contrast * contrast)
 
     def _acquire_keeper(self):
         """
-        Grab the frame to save for this position, honouring the review mode:
-          none   — classify + auto-nudge (the original automatic behaviour).
-          auto   — keep the frame if it's sharp AND the classifier likes it;
-                   otherwise hand it to the operator (blurry/flagged review).
-          manual — always hand the frame to the operator.
+        Grab the frame to save for this position.  The DEFECT-NUDGE always runs
+        first (in every mode — it's the core job), producing the best
+        defect-avoided frame; the review mode then layers FOCUS handling on top:
+          none      — nothing further.
+          auto      — if the frame is soft, hand it to the operator.
+          manual    — always hand the frame to the operator.
+          autofocus — if the frame is soft, drive Z to refocus and re-capture.
         """
-        if self._review_mode == "none":
-            return self._best_frame()
-
-        frame = self._wait_for_frame()
+        frame = self._best_frame()          # defect-nudge — ALWAYS
         if frame is None:
             return None
 
-        if self._review_mode == "auto":
-            # Pause only when the horizontal scratches are out of focus.  The
-            # focus score is measured ONLY along straight horizontal lines, so
-            # dust/blobs/defects don't trip auto-pause (they did when this was a
-            # whole-frame sharpness test — sharp dust read as "in focus").
+        mode = self._review_mode
+        if mode == "none":
+            return frame
+
+        if mode == "autofocus":
+            # Focus is objective: a frame is either sharp enough or not.  Only
+            # soft frames (rare) trigger a Z search, so this fires seldom.
+            if self._z_disabled or self._focus_score(frame) >= self._blur_thresh:
+                return frame            # in focus, or Z unavailable — keep as-is
+            return self._autofocus(frame)
+
+        if mode == "auto":
             if self._focus_score(frame) >= self._blur_thresh:
                 return frame
             return self._operator_review(frame, "blurry")
@@ -321,9 +358,10 @@ class CapturePipeline:
             if decision == "good":
                 self._save_training(frame, self._good_dir)
                 return frame
-            # bad → log it and retake at the same spot (focus was adjusted)
+            # bad → log it and retake at the same spot (focus was adjusted).
+            # Retake through _best_frame so the defect-nudge still runs.
             self._save_training(frame, self._bad_dir)
-            retake = self._wait_for_frame()
+            retake = self._best_frame()
             if retake is None:
                 return frame
             frame  = retake
@@ -341,6 +379,93 @@ class CapturePipeline:
             self._save(frame, os.path.join(dest_dir, f"{stamp}_{ms:03d}.jpg"))
         except Exception:
             pass   # never let dataset bookkeeping break a scan
+
+    def _autofocus(self, soft_frame):
+        """
+        Run the Z focus search, but degrade gracefully if the Z stepper doesn't
+        respond — e.g. the focus motor isn't wired yet, or the firmware predates
+        MOVE Z.  On the first such failure we disable Z for the rest of the run
+        and keep the (soft) frame we already have, so a missing focus axis can
+        never abort a whole scan.
+        """
+        try:
+            return self._autofocus_search(soft_frame)
+        except RuntimeError as e:
+            self._z_disabled = True
+            print(f"[capture] autofocus disabled — Z stepper not responding ({e}). "
+                  f"Keeping frames as captured for the rest of this run.")
+            return soft_frame
+
+    def _autofocus_search(self, soft_frame):
+        """
+        Drive the Z stepper to bring a soft field into focus, then re-capture.
+
+        We don't know a priori which way is "into focus" (and there's coupling
+        backlash), so we probe ONE step each way from the current height, take
+        the uphill direction, and hill-climb until the focus score stops rising
+        — i.e. we just passed the peak.  The search samples cheap RAW frames
+        (focus only); the final keeper at the best height is taken through
+        _best_frame so the defect-nudge still runs on the saved image.
+
+        Robustness notes:
+          • We keep the height with the best SCORE, and the saved image is taken
+            there — so residual backlash in the final Z position doesn't hurt the
+            image, it only sets the (nearby) start for the next field, which will
+            re-focus itself anyway.
+          • Travel is hard-bounded to ±z_range as a runaway safety stop.
+          • If neither direction improves, we return to the start and keep the
+            original (best available) frame.
+        """
+        step      = self._z_step
+        max_steps = max(1, self._z_range // max(step, 1))
+
+        cur_z = 0                                   # net Z applied during this search
+        s0    = self._focus_score(soft_frame)
+        best_s, best_z = s0, 0
+
+        def go_to(target_z):
+            nonlocal cur_z
+            d = target_z - cur_z
+            if d != 0:
+                self._motor.move("Z", d)
+                cur_z = target_z
+                time.sleep(self.SETTLE_S)           # let focus settle before sampling
+
+        def score_at(target_z):
+            go_to(target_z)
+            f = self._wait_for_frame()
+            return (float("-inf") if f is None else self._focus_score(f))
+
+        # Probe +dir; if that doesn't beat the start, probe −dir.
+        up = self._z_dir * step
+        s_up = score_at(up)
+        if s_up > best_s:
+            best_s, best_z, direction = s_up, up, self._z_dir
+        else:
+            dn = -self._z_dir * step
+            s_dn = score_at(dn)
+            if s_dn > best_s:
+                best_s, best_z, direction = s_dn, dn, -self._z_dir
+            else:
+                go_to(0)                            # neither way better — restore
+                return self._best_frame()
+
+        # Hill-climb in the winning direction until a step stops improving.
+        steps = 1
+        while steps < max_steps and not self._stop_event.is_set():
+            target = best_z + direction * step
+            if abs(target) > self._z_range:         # safety bound
+                break
+            s = score_at(target)
+            if s > best_s:
+                best_s, best_z = s, target
+                steps += 1
+            else:
+                break                               # passed the peak
+
+        # Settle at the best height and take the defect-nudged keeper there.
+        go_to(best_z)
+        return self._best_frame()
 
     def _best_frame(self):
         """
