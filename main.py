@@ -562,6 +562,21 @@ class MainWindow(QMainWindow):
         # is why their half-step counts differ.)
         profile_lay.addLayout(_row("Sweep step ½-steps (10/row):", self._y_spin))
         profile_lay.addLayout(_row("Rung step ½-steps (×2/leg):",  self._x_spin))
+
+        # How hard to jump the stage to push a detected defect out of frame.
+        self._nudge_spin = _NoScrollSpinBox()
+        self._nudge_spin.setFocusPolicy(Qt.ClickFocus)
+        self._nudge_spin.setRange(10, 800)
+        self._nudge_spin.setValue(150)
+        self._nudge_spin.setSuffix(" %")
+        self._nudge_spin.setToolTip(
+            "How far the stage jumps to push a detected defect out of frame, as a "
+            "percentage of one grid step scaled by how off-centre the defect is.  "
+            "Raise this if defects stay on screen after the nudge (they only moved "
+            "a little).  100% ≈ a firm nudge; the old default was 40%."
+        )
+        profile_lay.addLayout(_row("Defect jump:", self._nudge_spin))
+
         profile_lay.addWidget(self._total_label)
 
         # Detection sensitivity slider
@@ -1233,6 +1248,7 @@ class MainWindow(QMainWindow):
             z_step=self._z_step_spin.value(),
             z_range=self._z_range_spin.value(),
             z_dir=(-1 if self._z_invert_chk.isChecked() else 1),
+            nudge_scale=self._nudge_spin.value() / 100.0,
             on_progress=lambda d, t: self._sig.capture_progress.emit(d, t),
             on_frame=lambda f: self._sig.frame_ready.emit(f),
             on_done=lambda: self._sig.capture_done.emit(),

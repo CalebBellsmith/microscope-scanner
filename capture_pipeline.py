@@ -58,7 +58,7 @@ class CapturePipeline:
                  quality_threshold=0.5,
                  review_mode="none", review_fn=None, blur_threshold=80.0,
                  good_dir=None, bad_dir=None,
-                 z_step=200, z_range=2000, z_dir=1,
+                 z_step=200, z_range=2000, z_dir=1, nudge_scale=0.4,
                  on_progress=None, on_frame=None, on_done=None, on_error=None):
         """
         camera            : camera object (ToupTekCamera / OpenCVCamera)
@@ -114,6 +114,7 @@ class CapturePipeline:
         self._z_range     = int(z_range)
         self._z_dir       = 1 if int(z_dir) >= 0 else -1
         self._z_disabled  = False   # set if the Z stepper doesn't respond (no HW)
+        self._nudge_scale = float(nudge_scale)   # defect-avoidance jump strength
         self._on_progress = on_progress or (lambda done, total: None)
         self._on_frame    = on_frame    or (lambda img: None)
         self._on_done     = on_done     or (lambda: None)
@@ -490,7 +491,7 @@ class CapturePipeline:
 
         # Frame is bad — find the defect and nudge away from it
         nudge_x, nudge_y = _centroid_nudge(
-            frame, self._x_spacing, self._y_spacing
+            frame, self._x_spacing, self._y_spacing, self._nudge_scale
         )
 
         if nudge_x == 0 and nudge_y == 0:
@@ -557,7 +558,8 @@ class CapturePipeline:
 
 def _centroid_nudge(frame: np.ndarray,
                     x_spacing: int,
-                    y_spacing: int) -> tuple[int, int]:
+                    y_spacing: int,
+                    nudge_scale: float = 0.4) -> tuple[int, int]:
     """
     Find the largest dark blob (dust/debris) in the frame and return
     (steps_x, steps_y) that moves the stage AWAY from it.
@@ -569,6 +571,10 @@ def _centroid_nudge(frame: np.ndarray,
       4. Take the largest contour — that is the main defect.
       5. Compute its centroid relative to the frame centre.
       6. Scale the centroid offset to a fraction of the grid spacing.
+
+    nudge_scale is the "defect jump" strength from the GUI (fraction of one grid
+    step per unit of off-centre offset).  Raise it if defects only move a little
+    and stay on screen; the historical fixed value was 0.4.
 
     Stage direction notes:
       Moving the stage +X shifts the image field +X (stage carries the slide).
@@ -582,7 +588,7 @@ def _centroid_nudge(frame: np.ndarray,
 
     NUDGE_SIGN_X = -1   # −1: stage and image move in same direction
     NUDGE_SIGN_Y = -1   # flip to +1 if image pans opposite to stage
-    NUDGE_SCALE  = 0.4  # fraction of one grid spacing to nudge (tunable)
+    NUDGE_SCALE  = nudge_scale   # "defect jump" strength (GUI-tunable)
 
     # Convert to greyscale for blob detection
     gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
