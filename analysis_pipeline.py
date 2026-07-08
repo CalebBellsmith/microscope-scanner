@@ -423,11 +423,13 @@ def _summary_row(set_name: str, leg_means: dict, all_areas_flat: list) -> dict:
     )
 
 
-def _anova_rows(all_areas_by_leg: dict) -> tuple:
-    """Return (anova_table_rows, pairwise_rows) matching MATLAB ANOVA1 sheet."""
+def _anova_rows(all_areas_by_leg: dict, order=None) -> tuple:
+    """Return (anova_table_rows, pairwise_rows) matching MATLAB ANOVA1 sheet.
+    `order` sets the leg column order (group numbering); defaults to LEGS."""
     from scipy.stats import f_oneway
-    groups     = [all_areas_by_leg[lg] for lg in LEGS if lg in all_areas_by_leg]
-    leg_labels = [lg for lg in LEGS if lg in all_areas_by_leg]
+    order      = order or LEGS
+    groups     = [all_areas_by_leg[lg] for lg in order if lg in all_areas_by_leg]
+    leg_labels = [lg for lg in order if lg in all_areas_by_leg]
     if len(groups) < 2:
         return [], []
 
@@ -732,6 +734,238 @@ def write_legacy_format(set_dir: str, leg_results: dict) -> list[str]:
         paths.append(p3)
 
     return paths
+
+
+# ── Summarize: combine many sets into one C8-style workbook ──────────────────
+
+# Leg column order used by the C8 "Data set" template (top blocks + summary).
+_SUMMARY_LEG_ORDER = ["BL", "BR", "FL", "FR"]
+_IMG_EXTS = (".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp")
+
+
+def _read_set_areas(workbook_path: str) -> dict:
+    """
+    Read one set's per-leg image scratch areas from its results workbook.
+
+    Works for BOTH formats: the new '{set}_results.xlsx' and the legacy
+    '{set}_scratch_count.xlsx' both keep raw data on sheets named FR/FL/BR/BL
+    with the image name in column A and the scratch area in column B.  We take
+    only the rows whose column A is an image filename, so the trailing descStats
+    block (labelled 'mean', 'median', …) is skipped.
+
+    Returns {leg: [areas]} for whichever legs are present.
+    """
+    import openpyxl
+    wb = openpyxl.load_workbook(workbook_path, data_only=True, read_only=True)
+    out = {}
+    try:
+        for leg in LEGS:
+            if leg not in wb.sheetnames:
+                continue
+            areas = []
+            for name, area in wb[leg].iter_rows(min_row=2, max_col=2, values_only=True):
+                if (isinstance(name, str) and name.lower().endswith(_IMG_EXTS)
+                        and isinstance(area, (int, float))):
+                    areas.append(float(area))
+            if areas:
+                out[leg] = areas
+    finally:
+        wb.close()
+    return out
+
+
+def collect_sets(parent_dir: str) -> list:
+    """
+    Walk every subfolder under parent_dir and read each set's results workbook.
+    Prefers the new '*_results.xlsx'; falls back to legacy '*_scratch_count.xlsx'.
+    Returns a sorted list of (set_name, {leg: [areas]}).
+    """
+    sets = []
+    for root, _dirs, files in os.walk(parent_dir):
+        new    = sorted(f for f in files if f.endswith("_results.xlsx"))
+        legacy = sorted(f for f in files if f.endswith("_scratch_count.xlsx"))
+        if new:
+            path, name = os.path.join(root, new[0]), new[0][:-len("_results.xlsx")]
+        elif legacy:
+            path, name = os.path.join(root, legacy[0]), legacy[0][:-len("_scratch_count.xlsx")]
+        else:
+            continue
+        data = _read_set_areas(path)
+        if data:
+            sets.append((name, data))
+    sets.sort(key=lambda x: x[0])
+    return sets
+
+
+def write_summarize_format(parent_dir: str, sets: list, out_path: str = None) -> str:
+    """
+    Combine many sets into one workbook mirroring the C8 'Data set' layout:
+      • a horizontal block per set — raw per-image areas (BL/BR/FL/FR) → descStats
+        → ANOVA table → pairwise comparisons;
+      • two summary tables underneath — Film leg-means with per-set Average and
+        STDEV of Legs plus aggregate Average/STDEV/RANGE, then an identical
+        'Outliers Removed' copy where outlier cells are FLAGGED RED (never
+        deleted): a leg cell is flagged if its mean lies outside the pooled
+        leg-mean mean ± 1.96·stdev, and an Average cell if the set average lies
+        outside the set-average mean ± 1.96·stdev.
+    Returns the written path.
+    """
+    import datetime
+    import openpyxl
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+
+    HDR       = Font(bold=True)
+    FILL_HDR  = PatternFill("solid", start_color="D9E1F2")
+    FILL_STAT = PatternFill("solid", start_color="EBF1DE")
+    FILL_RED  = PatternFill("solid", start_color="FFC7CE")   # outlier flag
+    FONT_RED  = Font(color="9C0006", bold=True)
+    THIN = Side(style="thin")
+    BOX  = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
+    CTR  = Alignment(horizontal="center")
+
+    legs_order = _SUMMARY_LEG_ORDER
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "S1"
+
+    def cell(r, c, value, *, bold=False, fill=None, box=False, ctr=False, font=None):
+        x = ws.cell(row=r, column=c, value=value)
+        if bold:  x.font = HDR
+        if font:  x.font = font
+        if fill:  x.fill = fill
+        if box:   x.border = BOX
+        if ctr:   x.alignment = CTR
+        return x
+
+    # Metadata header (top-left, rows 1-3): fill the date; leave the rest blank.
+    cell(1, 1, "Date Completed", bold=True)
+    ws.cell(row=1, column=2, value=datetime.date.today().strftime("%d-%b-%Y"))
+    cell(2, 1, "Completed By", bold=True)
+    cell(3, 1, "Notes", bold=True)
+
+    # ── Top: one horizontal block per set (below the metadata header) ──────────
+    BLOCK_TOP  = 5                        # first block row (leaves rows 1-3 for meta)
+    N_IMG      = 30                       # expected images per leg (layout spacing)
+    SET_WIDTH  = len(legs_order) * 2      # 2 columns (name, area) per leg
+    SET_STRIDE = SET_WIDTH + 1            # one spacer column between sets
+    per_set = []                          # cache computed values for the summary
+
+    for i, (name, data) in enumerate(sets):
+        c0 = 1 + i * SET_STRIDE
+        cell(BLOCK_TOP, c0, name, bold=True)
+        for j, leg in enumerate(legs_order):
+            nc = c0 + j * 2               # image-name column for this leg
+            cell(BLOCK_TOP + 1, nc, leg, bold=True, box=True, ctr=True)
+            cell(BLOCK_TOP + 2, nc,     "image name",            bold=True, box=True)
+            cell(BLOCK_TOP + 2, nc + 1, "scratch area (pixels)", bold=True, box=True)
+            areas = data.get(leg, [])
+            r = BLOCK_TOP + 3
+            for k, a in enumerate(areas):
+                cell(r, nc,     f"{k + 1:03d}.jpg", box=True)
+                cell(r, nc + 1, a,                  box=True)
+                r += 1
+            if areas:                     # descStats block below the raw rows
+                for label, value in _desc_stats(areas):
+                    cell(r, nc,     label, fill=FILL_STAT, box=True)
+                    cell(r, nc + 1, value, fill=FILL_STAT, box=True)
+                    r += 1
+
+        # ANOVA + pairwise for this set (needs ≥2 legs)
+        present = {lg: data[lg] for lg in legs_order if lg in data}
+        if len(present) >= 2:
+            anova_rows, pair_rows = _anova_rows(present, order=legs_order)
+            ar = BLOCK_TOP + 3 + N_IMG + len(_desc_stats([0])) + 2   # below the stats
+            for gi, arow in enumerate(anova_rows):
+                for dc, val in enumerate(arow):
+                    cell(ar, c0 + dc, val, bold=(gi == 0), box=True)
+                ar += 1
+            ar += 1
+            for prow in pair_rows:
+                for dc, val in enumerate(prow):
+                    cell(ar, c0 + dc, val, box=True)
+                ar += 1
+
+        # Per-set summary numbers (display leg order; only present legs count)
+        leg_means = {lg: sum(data[lg]) / len(data[lg]) for lg in present}
+        avg = sum(leg_means.values()) / len(leg_means) if leg_means else 0.0
+        std_legs = float(np.std(list(leg_means.values()), ddof=1)) if len(leg_means) > 1 else 0.0
+        per_set.append((name, leg_means, avg, std_legs))
+
+    # ── Bottom: the two Film summary tables (below every top block) ─────────────
+    start_row = BLOCK_TOP + 3 + N_IMG + len(_desc_stats([0])) + 3 + 6 + 4
+    grand_row = _write_summary_table(
+        ws, start_row, "", per_set, legs_order,
+        cell, HDR, FILL_STAT, FILL_RED, FONT_RED, flag_outliers=False)
+
+    _write_summary_table(
+        ws, grand_row + 3, "Outliers Removed", per_set, legs_order,
+        cell, HDR, FILL_STAT, FILL_RED, FONT_RED, flag_outliers=True)
+
+    out_path = out_path or os.path.join(
+        parent_dir, f"{os.path.basename(os.path.abspath(parent_dir))}_summary.xlsx")
+    wb.save(out_path)
+    return out_path
+
+
+def _write_summary_table(ws, top, title, per_set, legs_order,
+                         cell, HDR, FILL_STAT, FILL_RED, FONT_RED, flag_outliers):
+    """Write one Film summary table starting at row `top`; return its last row."""
+    r = top
+    if title:
+        cell(r, 1, title, bold=True)
+        r += 1
+    headers = ["Film"] + legs_order + ["Average", "STDEV of Legs", "95% Confidence Interval"]
+    for c, h in enumerate(headers, start=1):
+        cell(r, c, h, bold=True, fill=FILL_STAT, box=True)
+    r += 1
+
+    # Outlier reference distributions (pooled across sets).
+    all_leg_means = [m for _n, lm, _a, _s in per_set for m in lm.values()]
+    set_avgs      = [a for _n, _lm, a, _s in per_set]
+    lm_mean = sum(all_leg_means) / len(all_leg_means) if all_leg_means else 0.0
+    lm_std  = float(np.std(all_leg_means, ddof=1)) if len(all_leg_means) > 1 else 0.0
+    av_mean = sum(set_avgs) / len(set_avgs) if set_avgs else 0.0
+    av_std  = float(np.std(set_avgs, ddof=1)) if len(set_avgs) > 1 else 0.0
+
+    def outlier(val, mu, sd):
+        return sd > 0 and abs(val - mu) > 1.96 * sd
+
+    for name, leg_means, avg, std_legs in per_set:
+        cell(r, 1, name, box=True)
+        for c, leg in enumerate(legs_order, start=2):
+            v = leg_means.get(leg)
+            x = cell(r, c, round(v, 1) if v is not None else "", box=True)
+            if flag_outliers and v is not None and outlier(v, lm_mean, lm_std):
+                x.fill = FILL_RED; x.font = FONT_RED
+        ax = cell(r, 2 + len(legs_order), round(avg, 1), box=True)
+        if flag_outliers and outlier(avg, av_mean, av_std):
+            ax.fill = FILL_RED; ax.font = FONT_RED
+        cell(r, 3 + len(legs_order), round(std_legs, 1), box=True)
+        r += 1
+
+    # Aggregate rows: per-leg Average / STDEV across sets, plus pooled stats.
+    avg_col = 2 + len(legs_order)
+    cell(r, 1, "Average", bold=True, box=True)
+    for c, leg in enumerate(legs_order, start=2):
+        col_vals = [lm[leg] for _n, lm, _a, _s in per_set if leg in lm]
+        cell(r, c, round(sum(col_vals) / len(col_vals), 1) if col_vals else "", box=True)
+    cell(r, avg_col, round(av_mean, 1), box=True)
+    cell(r, avg_col + 1, round(lm_std, 1), box=True)            # pooled STDEV of Legs
+    ci = 1.96 * lm_std / (len(all_leg_means) ** 0.5) if all_leg_means else 0.0
+    cell(r, avg_col + 2, round(ci, 1), box=True)               # 95% CI
+    r += 1
+
+    cell(r, 1, "STDEV", bold=True, box=True)
+    for c, leg in enumerate(legs_order, start=2):
+        col_vals = [lm[leg] for _n, lm, _a, _s in per_set if leg in lm]
+        sd = float(np.std(col_vals, ddof=1)) if len(col_vals) > 1 else 0.0
+        cell(r, c, round(sd, 1), box=True)
+    r += 1
+
+    cell(r, 1, "RANGE", bold=True, box=True)
+    rng = (max(all_leg_means) - min(all_leg_means)) if all_leg_means else 0.0
+    cell(r, 2, round(rng, 3), box=True)
+    return r
 
 
 # ── Pipeline class ────────────────────────────────────────────────────────────

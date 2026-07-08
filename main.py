@@ -66,6 +66,7 @@ from ml_inference import QualityClassifier
 from capture_pipeline import CapturePipeline
 from analysis_pipeline import (
     AnalysisPipeline, write_new_format, write_legacy_format,
+    collect_sets, write_summarize_format,
     LEGS, EXPECTED_IMAGES,
 )
 
@@ -87,6 +88,7 @@ _CUSTOM_IDX = len(PROFILES) - 1   # index of the "Custom" entry in the combo box
 MODE_CAPTURE_ONLY    = 0   # capture images but skip analysis
 MODE_ANALYZE_ONLY    = 1   # run analysis on an existing folder
 MODE_CAPTURE_ANALYZE = 2   # capture then analyze automatically
+MODE_SUMMARIZE       = 3   # combine many sets' results into one summary workbook
 
 # ML training dataset (manual / auto-pause reviews drop labelled frames here so
 # the good/bad model can be retrained on real operator decisions).
@@ -352,10 +354,12 @@ class MainWindow(QMainWindow):
         self._btn_cap_analyze = QRadioButton("Capture + Analyze simultaneously")
         self._btn_cap_only    = QRadioButton("Capture only  (analyze later)")
         self._btn_ana_only    = QRadioButton("Analyze only  (existing folder)")
+        self._btn_summarize   = QRadioButton("Summarize  (combine multiple sets)")
         self._btn_cap_analyze.setChecked(True)
         for btn, mid in [(self._btn_cap_analyze, MODE_CAPTURE_ANALYZE),
                          (self._btn_cap_only,    MODE_CAPTURE_ONLY),
-                         (self._btn_ana_only,    MODE_ANALYZE_ONLY)]:
+                         (self._btn_ana_only,    MODE_ANALYZE_ONLY),
+                         (self._btn_summarize,   MODE_SUMMARIZE)]:
             self._mode_group.addButton(btn, mid)
             mode_lay.addWidget(btn)
         self._mode_group.buttonToggled.connect(self._on_mode_changed)
@@ -958,6 +962,10 @@ class MainWindow(QMainWindow):
 
         if mode == MODE_ANALYZE_ONLY and self._set_dir:
             self._go_btn.setEnabled(True)
+        # Summarize needs no camera/ESP/set folder — it prompts for its own
+        # parent folder — so Go is always available in this mode.
+        if mode == MODE_SUMMARIZE:
+            self._go_btn.setEnabled(True)
 
     # ── Leg table helpers ─────────────────────────────────────────────────────
 
@@ -1099,7 +1107,8 @@ class MainWindow(QMainWindow):
 
     def _set_mode_enabled(self, on: bool):
         """Lock/unlock Mode radios + analysis-method selector during a run."""
-        for btn in (self._btn_cap_analyze, self._btn_cap_only, self._btn_ana_only):
+        for btn in (self._btn_cap_analyze, self._btn_cap_only,
+                    self._btn_ana_only, self._btn_summarize):
             btn.setEnabled(on)
         self._method_combo.setEnabled(on)
 
@@ -1202,6 +1211,12 @@ class MainWindow(QMainWindow):
     # ── Go ────────────────────────────────────────────────────────────────────
 
     def _on_go(self):
+        # Summarize combines existing sets from a parent folder — it needs no
+        # set folder, camera or ESP32, so handle it before the usual checks.
+        if self._mode_group.checkedId() == MODE_SUMMARIZE:
+            self._run_summarize()
+            return
+
         if not self._set_dir:
             self._prompt_set_folder()
             return
@@ -1467,6 +1482,53 @@ class MainWindow(QMainWindow):
         self._analyzing_legs.discard(leg_name)
         self._set_leg_status(leg_name, "—", 0)
         self._check_finish_eligibility()
+
+    # ── Summarize mode ────────────────────────────────────────────────────────
+
+    def _run_summarize(self):
+        """
+        Prompt for a parent folder, comb every sub-folder for a results workbook
+        (new '*_results.xlsx' or legacy '*_scratch_count.xlsx'), and write one
+        combined C8-style summary workbook (raw blocks + ANOVA per set, plus the
+        Film summary tables with red-flagged outliers).
+        """
+        parent = QFileDialog.getExistingDirectory(
+            self, "Select the parent folder containing all sets")
+        if not parent:
+            return
+
+        self._statusbar.showMessage("Summarizing — scanning sub-folders…")
+        QApplication.processEvents()
+        try:
+            sets = collect_sets(parent)
+        except Exception as e:
+            QMessageBox.critical(self, "Summarize failed", f"Could not read sets:\n{e}")
+            self._statusbar.showMessage("Summarize failed.")
+            return
+
+        if not sets:
+            QMessageBox.warning(
+                self, "No sets found",
+                "No results workbooks (*_results.xlsx or *_scratch_count.xlsx) "
+                "were found in any sub-folder of:\n\n" + parent)
+            self._statusbar.showMessage("Summarize: no sets found.")
+            return
+
+        try:
+            out_path = write_summarize_format(parent, sets)
+        except Exception as e:
+            QMessageBox.critical(self, "Summarize failed",
+                                 f"Could not write the summary workbook:\n{e}")
+            self._statusbar.showMessage("Summarize failed.")
+            return
+
+        names = ", ".join(n for n, _ in sets)
+        QMessageBox.information(
+            self, "Summary written",
+            f"Combined {len(sets)} set(s) into:\n\n{out_path}\n\nSets: {names}\n\n"
+            "Outlier cells (outside ±1.96σ) are flagged red in the "
+            "'Outliers Removed' table; nothing was deleted.")
+        self._statusbar.showMessage(f"Summary written: {out_path}")
 
     # ── Analyze-only mode ─────────────────────────────────────────────────────
 
