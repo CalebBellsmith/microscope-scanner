@@ -962,7 +962,10 @@ class MainWindow(QMainWindow):
         capture = mode in (MODE_CAPTURE_ONLY, MODE_CAPTURE_ANALYZE)
         analyze = mode in (MODE_ANALYZE_ONLY, MODE_CAPTURE_ANALYZE)
 
-        self._conn_box.setVisible(capture)
+        # Connection (Camera + ESP32 + Connect) stays available in every mode
+        # except Summarize — even in Analyze-only you may want to connect to jog
+        # the stage / use the manual joystick.  Summarize is pure file-crunching.
+        self._conn_box.setVisible(mode != MODE_SUMMARIZE)
         self._profile_box.setVisible(capture)
         self._cap_label.setVisible(capture)
         self._cap_bar.setVisible(capture)
