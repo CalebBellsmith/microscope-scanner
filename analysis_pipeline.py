@@ -742,6 +742,13 @@ def write_legacy_format(set_dir: str, leg_results: dict) -> list[str]:
 _SUMMARY_LEG_ORDER = ["BL", "BR", "FL", "FR"]
 _IMG_EXTS = (".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp")
 
+# Analysis-only mode ignores any file whose name isn't one of the expected
+# capture frames 000..030.  Keeps stray/renamed files (thumbnails, overlays,
+# hand-added images) from being processed and polluting the results.
+def _is_numbered_frame(fname: str) -> bool:
+    stem = os.path.splitext(fname)[0]
+    return stem.isdigit() and 0 <= int(stem) <= EXPECTED_IMAGES
+
 
 def _read_set_areas(workbook_path: str) -> dict:
     """
@@ -1025,6 +1032,10 @@ class AnalysisPipeline:
                         if (f.endswith(".jpg") or f.endswith(".png"))
                         and not f.endswith("_overlay.png")
                         and f not in processed
+                        # Analysis-only mode: process ONLY the numbered capture
+                        # frames 000..030, nothing else.  (Live/"both" capture
+                        # writes its own frames, so no need to filter there.)
+                        and (self._live_capture or _is_numbered_frame(f))
                     )
                     if images:
                         idle_ticks = 0
