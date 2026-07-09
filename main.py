@@ -873,6 +873,7 @@ class MainWindow(QMainWindow):
         # while the joystick is enabled, and never steals keys from a text or
         # spin field the user might be editing.
         from PyQt5.QtCore import QEvent
+        from PyQt5.QtWidgets import QAbstractSpinBox
         # Operator review (manual / auto-pause): Enter = good, Space = bad/retake.
         # Takes priority over the joystick while a frame is awaiting review.
         if self._review_active and event.type() == QEvent.KeyPress:
@@ -883,10 +884,16 @@ class MainWindow(QMainWindow):
             if key == Qt.Key_Space:
                 self._resolve_review("bad")
                 return True
-        if (event.type() == QEvent.KeyPress
-                and self._manual_chk.isChecked()
-                and not isinstance(QApplication.focusWidget(), (QLineEdit, QSpinBox))):
-            if self._handle_manual_key(event.key()):
+        if event.type() == QEvent.KeyPress and self._manual_chk.isChecked():
+            # Only stand down for a *standalone* text field (the port boxes),
+            # where the user is typing.  A focused QSpinBox reports its internal
+            # QLineEdit as the focus widget, so a bare isinstance(QLineEdit)
+            # check would wrongly swallow every jog key whenever a number box
+            # had focus — which killed the joystick as more spinboxes were added.
+            fw = QApplication.focusWidget()
+            typing_text = (isinstance(fw, QLineEdit)
+                           and not isinstance(fw.parent(), QAbstractSpinBox))
+            if not typing_text and self._handle_manual_key(event.key()):
                 return True   # consume — don't let the focused widget also act
         return super().eventFilter(obj, event)
 
