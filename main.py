@@ -508,7 +508,8 @@ class MainWindow(QMainWindow):
         self._manual_chk = QCheckBox("Enable arrow-key joystick")
         self._manual_chk.setFocusPolicy(Qt.NoFocus)
         self._manual_chk.setToolTip(
-            "When checked: ← → jog the Sweep axis (10/row), ↑ ↓ jog the Rung axis"
+            "When checked: ← → jog the Sweep axis, ↑ ↓ jog the Rung axis, "
+            "W / S jog the Z focus axis (by the Z-step amount)"
         )
         manual_lay.addWidget(self._manual_chk)
 
@@ -524,7 +525,7 @@ class MainWindow(QMainWindow):
         manual_lay.addLayout(step_row)
 
         manual_lay.addWidget(QLabel(
-            "← → = Sweep    ↑ ↓ = Rung",
+            "← → = Sweep    ↑ ↓ = Rung    W / S = Focus (Z)",
         ))
         right.addWidget(manual_box)
         # Jog keys must work regardless of which widget holds keyboard focus
@@ -891,12 +892,20 @@ class MainWindow(QMainWindow):
 
     def _handle_manual_key(self, key) -> bool:
         """Jog the stage one step.  Arrow→axis mapping reflects the swapped
-        axes: ← → drive the Y stepper, ↑ ↓ drive the X stepper.  Returns True
-        if the key was a handled arrow key (so the caller can consume it)."""
-        if key not in (Qt.Key_Left, Qt.Key_Right, Qt.Key_Up, Qt.Key_Down):
+        axes: ← → drive the Y stepper, ↑ ↓ drive the X stepper.  W / S drive
+        the Z (focus) stepper by the Z-step amount.  Returns True if the key
+        was a handled jog key (so the caller can consume it)."""
+        z_keys = (Qt.Key_W, Qt.Key_S)
+        if key not in (Qt.Key_Left, Qt.Key_Right, Qt.Key_Up, Qt.Key_Down, *z_keys):
             return False
         if self._motor is None:
             self._statusbar.showMessage("Motor not connected — connect first.")
+            return True
+        if key in z_keys:
+            # Focus axis uses its own step size (a Z half-step is a much finer
+            # physical move than a stage jog).  W = up/in, S = down/out.
+            zsteps = self._z_step_spin.value()
+            self._motor.move("Z", zsteps if key == Qt.Key_W else -zsteps)
             return True
         steps = self._manual_step_spin.value()
         if   key == Qt.Key_Left:  self._motor.move("Y", -steps)
