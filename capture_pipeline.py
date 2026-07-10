@@ -56,7 +56,7 @@ class CapturePipeline:
                  output_dir, set_name, leg,
                  rows, cols, x_spacing, y_spacing,
                  quality_threshold=0.5,
-                 review_mode="none", review_fn=None, blur_threshold=80.0,
+                 review_mode="none", review_fn=None, blur_threshold=2500.0,
                  good_dir=None, bad_dir=None,
                  z_step=200, z_range=2000, z_dir=1, nudge_scale=0.4,
                  on_progress=None, on_frame=None, on_done=None, on_error=None):
@@ -243,14 +243,26 @@ class CapturePipeline:
 
     # ── Review-aware capture (focus / operator gate) ──────────────────────────
 
-    # Minimum horizontal-scratch pixels before a focus score is trustworthy;
-    # below this there's nothing to judge and the frame is treated as in focus.
-    _FOCUS_MIN_PIXELS = 150
+    # Minimum horizontal-scratch pixels (and mask contrast) before the scratch
+    # mask is trustworthy focus evidence.  Below these, the mask is either
+    # absent or JPEG-grain phantoms — the metric then falls back to judging
+    # the DUST SPECS instead (present on every frame, same slide plane, and
+    # they visibly fuzz exactly when the frame goes soft).  Calibrated on the
+    # 20-set / 2,400-frame archive of old-system captures.
+    _FOCUS_MIN_PIXELS   = 1500
+    _FOCUS_MIN_CONTRAST = 28.0
+    _FOCUS_MIN_SPOTS    = 400
 
-    # Scale factor so the (dimensionless) focus score lands in a friendly range
-    # for an integer GUI threshold — in-focus fields read ~100+, clearly
-    # out-of-focus ones well below (see _focus_score).  Default threshold ~80.
+    # Scale factors.  The E/c normalisation is empirical: across visually
+    # sharp archive frames the scratch-edge energy E scales ~linearly with
+    # scratch darkness c (verified from contrast 33 → 83), so E/c is what
+    # stays flat for sharp frames — the old E/c² over-punished dark scratches.
+    # _SPEC_SCALE aligns the spec-fallback range with the scratch-tier range
+    # so ONE threshold serves both.  In-focus frames read ≈4000-8000, soft
+    # ones ≲2100 — default GUI threshold 2500 (flags ~1.5% of the archive,
+    # all visually degraded/soft).
     _FOCUS_SCALE = 10.0
+    _SPEC_SCALE  = 0.76
 
     @staticmethod
     def _horizontal_scratch_mask(gray):
@@ -286,30 +298,54 @@ class CapturePipeline:
 
     def _focus_score(self, frame) -> float:
         """
-        Focus quality of the HORIZONTAL SCRATCHES.  A defocused horizontal line
-        keeps its darkness but loses the STEEPNESS of its top/bottom edges, so
-        we measure the vertical-gradient energy along the scratches and divide
-        by the scratches' contrast² — i.e. edge steepness *relative to* how dark
-        the line is.  That normalisation is the key: it stops a dark-but-soft
-        scratch (e.g. a deep line in an otherwise out-of-focus field) from
-        reading as sharp, and makes the score dimensionless → robust to
-        exposure/lighting so a single global threshold holds across slides.
+        Two-tier focus score, higher = sharper.
 
-        Higher = sharper.  Returns +inf when no horizontal scratch is present
-        (nothing to judge → treated as in focus; autofocus/auto-pause won't fire
-        on blank or defect-only fields, which we don't care about anyway).
-        Validated on real rig frames: in-focus ≳100, clearly out-of-focus <60.
+        Tier 1 — scratches: when the frame has a substantial, genuinely dark
+        horizontal-scratch mask, measure the vertical-gradient energy along
+        the scratches over their darkness (E/c).  A defocused line keeps its
+        darkness but loses edge steepness, so E/c drops hard; on sharp frames
+        E grows ~linearly with c, so the score stays flat regardless of how
+        deep the scratches are.
+
+        Tier 2 — dust specs: when scratch evidence is weak (few mask pixels
+        or low contrast → phantom JPEG-grain squiggles), judge the dust specs
+        instead: they exist on every frame, sit on the same slide plane, and
+        fuzz out exactly when the frame goes soft.  Same E/c form on the spec
+        pixels, scaled to the scratch tier's range.
+
+        Returns +inf only when there are neither scratches nor specs to judge
+        (blank field → treated as in focus).
+
+        Calibrated on the 2,400-frame old-system archive: in-focus frames
+        read ≈4000-8000 in BOTH tiers, soft/degraded ones ≲2100.  Default
+        threshold 2500.
         """
         import cv2
         gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
         mask, darkness = self._horizontal_scratch_mask(gray)
         sel = mask > 0
-        if int(sel.sum()) < self._FOCUS_MIN_PIXELS:
+        if int(sel.sum()) >= self._FOCUS_MIN_PIXELS:
+            contrast = float(darkness[sel].mean()) + 1e-6
+            if contrast >= self._FOCUS_MIN_CONTRAST:
+                gy = cv2.Sobel(gray.astype(np.float64), cv2.CV_64F, 0, 1, ksize=3)
+                edge_energy = float((gy[sel] ** 2).mean())
+                return self._FOCUS_SCALE * edge_energy / contrast
+
+        # Spec fallback — small dark spots against a smooth local background.
+        bg = cv2.morphologyEx(
+            gray, cv2.MORPH_CLOSE,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (25, 25)))
+        dk = cv2.subtract(bg, gray).astype(np.float64)
+        thr = max(8.0, dk.mean() + 2.0 * dk.std())
+        spots = dk > thr
+        if int(spots.sum()) < self._FOCUS_MIN_SPOTS:
             return float("inf")
-        gy = cv2.Sobel(gray.astype(np.float64), cv2.CV_64F, 0, 1, ksize=3)
-        edge_energy = float((gy[sel] ** 2).mean())      # steepness across the lines
-        contrast    = float(darkness[sel].mean()) + 1e-6
-        return self._FOCUS_SCALE * edge_energy / (contrast * contrast)
+        g64 = gray.astype(np.float64)
+        gx = cv2.Sobel(g64, cv2.CV_64F, 1, 0, ksize=3)
+        gy = cv2.Sobel(g64, cv2.CV_64F, 0, 1, ksize=3)
+        edge_energy = float(((gx ** 2 + gy ** 2)[spots]).mean())
+        contrast = float(dk[spots].mean()) + 1e-6
+        return self._SPEC_SCALE * self._FOCUS_SCALE * edge_energy / contrast
 
     def _acquire_keeper(self):
         """

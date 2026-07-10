@@ -412,12 +412,12 @@ class MainWindow(QMainWindow):
         blur_row.addWidget(QLabel("Focus threshold:"))
         self._blur_spin = _NoScrollSpinBox()
         self._blur_spin.setFocusPolicy(Qt.ClickFocus)
-        self._blur_spin.setRange(0, 5000)
-        self._blur_spin.setValue(80)          # focus-score floor for in-focus scratches
+        self._blur_spin.setRange(0, 20000)
+        self._blur_spin.setValue(2500)        # focus-score floor for in-focus frames
         self._blur_spin.setToolTip(
-            "Frames whose horizontal scratches score below this focus value are "
-            "treated as out of focus.  Validated on real frames: in-focus ≳100, "
-            "clearly out-of-focus <60.  Higher = stricter (acts more often)."
+            "Frames scoring below this focus value are treated as out of focus.  "
+            "Calibrated on the 2,400-frame archive: in-focus ≈4000-8000, "
+            "soft/degraded ≲2100.  Higher = stricter (acts more often)."
         )
         blur_row.addWidget(self._blur_spin)
         blur_row.addStretch()
