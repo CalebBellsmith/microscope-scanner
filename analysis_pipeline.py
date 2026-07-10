@@ -243,22 +243,29 @@ def detect_scratches(image_path: str, mode: str = "legacy") -> dict:
 # The Python port cannot be bit-identical to MATLAB (findpeaks interpolation,
 # JPEG decoder, rounding conventions), so after the pipeline-level fixes a small
 # global calibration maps the port's per-image measurements onto the original
-# MATLAB numbers.  Fitted ONCE on the 20-set / 2,400-image archive of old-system
-# results (leg-weighted least squares + gentle minimax reweighting):
-#   - every one of the 80 leg means lands within 4% of the MATLAB mean
-#     (min 96.2%, mean 98.6% agreement)
-#   - validated on held-out sets (5 random 10/10 splits) to confirm the mapping
-#     generalizes rather than memorizes.
+# MATLAB numbers.  Fitted on the full 30-set / 3,600-image archive of
+# old-system results — 20 glass-slide sets plus 10 PET-film sets (textured
+# substrate, diagonals, smears) — via leg-weighted least squares with gentle
+# minimax reweighting:
+#   - glass:  80/80 leg means within 4% of MATLAB (min 96.1%, mean 98.6%)
+#   - PET:    38/40 within 4% (min 95.6%, mean 98.0%) — the two stragglers
+#     (CY266E-109425 Set 1) carry opposite-sign port-vs-MATLAB disagreement
+#     within one set; even a PET-only fit cannot beat this (verified), which
+#     is why there is ONE unified calibration and no per-substrate mode.
+#   - generalization proof: the previous 20-set-only fit, applied FROZEN to
+#     the never-seen PET sets, already scored 38/40 legs >= 96% (min 95.4%) —
+#     the mapping is algorithm-to-algorithm, not set-specific.  Held-out
+#     split checks (5 random 15/15) confirm.
 # Features are simple per-image aggregates of the accepted scratch components.
 _LEGACY_CAL_COEFFS = (
-    0.424348,     # area in scratches >= 100 px long
-    0.532681,     # area in scratches >= 400 px^2
-    0.326735,     # area in scratches  < 400 px^2
-    0.435068,     # area in scratches  < 100 px long
-    198.08206,    # count of scratches >= 100 px long
-    -17.22614,    # min(count, 80)
-    -108.592611,  # max(count - 80, 0)      — swarm regime
-    -0.446778,    # small-scratch (<200 px^2) area when count > 80 — swarm regime
+    0.446196,     # area in scratches >= 100 px long
+    0.520699,     # area in scratches >= 400 px^2
+    0.348288,     # area in scratches  < 400 px^2
+    0.422791,     # area in scratches  < 100 px long
+    180.258163,   # count of scratches >= 100 px long
+    -18.622173,   # min(count, 80)
+    -118.203751,  # max(count - 80, 0)      — swarm regime
+    -0.402078,    # small-scratch (<200 px^2) area when count > 80 — swarm regime
 )
 
 
@@ -414,8 +421,14 @@ def _detect_accurate(rgb: np.ndarray):
         aspect = w / max(h, 1)
         if aspect < 2.6:                 # dots & merged dot-pairs are ~1:1
             continue
-        if h > 12 and aspect < 4.0:      # thick things must be very elongated
-            continue
+        if h > 12 and aspect < 4.0:
+            # Thick and squat — usually a smudge/halo blob.  EXCEPTION: dense
+            # abrasion smears ("comet" gouges, PET sets) are thick too, but
+            # unlike dust/smudges they contain long horizontal streak runs.
+            # Accept when some row of the component carries a wide seed run.
+            seed_in = horiz_seed[y:y + h, x:x + w].astype(bool) & comp
+            if int(seed_in.sum(axis=1).max()) < 40:
+                continue
         area += int(a)
         count += 1
         objs.append({"scratch_num": count, "width_px": int(h),
