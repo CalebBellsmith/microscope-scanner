@@ -41,6 +41,7 @@ from PyQt5.QtWidgets import (
     QRadioButton, QButtonGroup, QInputDialog, QTableWidget,
     QTableWidgetItem, QHeaderView, QSizePolicy, QFrame,
     QScrollArea, QCheckBox, QSlider, QDialog,
+    QToolButton, QTextBrowser,
 )
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject
 from PyQt5.QtGui import QImage, QPixmap, QColor, QFont
@@ -67,8 +68,20 @@ from capture_pipeline import CapturePipeline
 from analysis_pipeline import (
     AnalysisPipeline, write_new_format, write_legacy_format,
     collect_sets, write_summarize_format,
+    _is_numbered_frame,
     LEGS, EXPECTED_IMAGES,
 )
+
+
+def _count_numbered_frames(leg_dir: str) -> int:
+    """Count only the numbered capture frames (000-030) in a leg folder — the
+    exact set the analysis pipeline will process.  Ignores the old system's
+    Overlay_*/Scratch_* exports and any other stray files, so the progress bar
+    total matches the work actually done."""
+    try:
+        return sum(1 for f in os.listdir(leg_dir) if _is_numbered_frame(f))
+    except OSError:
+        return 0
 
 # Default root for the file-chooser dialog — user can navigate away from here
 DEFAULT_BASE = os.path.join(os.path.expanduser("~"), "Downloads", "alchemy", "abrasion")
@@ -714,9 +727,101 @@ class MainWindow(QMainWindow):
         )
         self._finish_btn.clicked.connect(self._on_finish)
         right.addWidget(self._finish_btn)
+
+        # ── Info (collapsible) — what each mode & setting does ─────────────────
+        self._build_info_panel(right)
+
         right.addStretch()
 
         self._on_mode_changed()
+
+    # ── Info panel ─────────────────────────────────────────────────────────────
+
+    # Plain-language reference for every mode and setting.  Rendered as HTML in
+    # a collapsible panel pinned to the bottom of the control column.
+    _INFO_HTML = """
+    <h3>Modes (top of panel)</h3>
+    <p><b>Photograph only</b> — drive the stage in a grid and save a photo at
+    each stop.  No analysis.  Use when you just want to capture a set.</p>
+    <p><b>Analyze only</b> — pick a folder that already holds the leg sub-folders
+    (FR / FL / BR / BL), each with the 30 numbered frames (000-030), and score
+    them.  Only files named 000-030 are processed; Overlay/Scratch exports and
+    other files are ignored.  Use to re-run analysis on existing photos.</p>
+    <p><b>Photograph &amp; Analyze</b> — capture and score at the same time, one
+    leg at a time.  The normal end-to-end run.</p>
+    <p><b>Summarize</b> — point at a parent folder of many finished sets; combines
+    every set's results into one C8-style workbook (outliers flagged red, never
+    deleted).  No camera or stage needed.</p>
+
+    <h3>Analysis method</h3>
+    <p><b>Legacy</b> — reproduces the original MATLAB numbers (calibrated to
+    within ~4% of them across 30 archived sets).  Use when you need continuity
+    with historical data.</p>
+    <p><b>Accurate</b> — defect-aware detector: measures genuine horizontal
+    abrasion scratches (including dense "comet" smears) and rejects dust dots,
+    dot-pairs, smudges and diagonal handling marks.  Use for the truest scratch
+    area on a fresh sample.</p>
+
+    <h3>Review during capture (focus handling)</h3>
+    <p>All four modes always run the <b>defect nudge</b> (a small stage move that
+    pushes a defect off-frame before the keeper shot).  They differ only in how
+    focus is handled:</p>
+    <p><b>None</b> — keep every frame as shot.<br>
+    <b>Auto-pause</b> — pause and ask you only when a frame reads soft.<br>
+    <b>Manual</b> — pause on every frame so you can adjust focus and retake.<br>
+    <b>Autofocus</b> — a soft frame triggers an automatic Z hill-climb search for
+    the sharpest focus (needs the Z stepper wired).</p>
+    <p><b>Focus threshold</b> — frames scoring below this are treated as out of
+    focus.  Calibrated range: in-focus ≈4000-8000, soft ≲2100; default 2500.
+    Higher = stricter (acts more often).</p>
+    <p><b>Z-step / Z-range / Invert Z</b> — how far each autofocus probe moves,
+    how far the search may wander before giving up, and which direction counts as
+    "in".  Z-step also sets how far <b>W / S</b> jog the focus in manual joystick.</p>
+
+    <h3>Detection tuning</h3>
+    <p><b>Sensitivity / Auto-calibrate</b> — the scratch-vs-background threshold.
+    Auto-calibrate tours a few nearby spots with the stage and picks a value
+    automatically.</p>
+    <p><b>Defect jump</b> — how hard the defect nudge moves the stage.  Raise it
+    if defects are still on screen after the nudge (they only moved a little).
+    100% ≈ a firm nudge.</p>
+
+    <h3>Connection &amp; manual control</h3>
+    <p><b>Connection</b> — camera and ESP32 ports (auto usually works); hidden
+    only in Summarize.  <b>Manual joystick</b> — arrow keys jog the stage
+    (← → sweep, ↑ ↓ rung), <b>W / S</b> jog the Z focus axis.</p>
+    """
+
+    def _build_info_panel(self, parent_layout):
+        """Small collapsible 'Info' panel at the bottom explaining every
+        mode/setting.  Collapsed by default so it stays out of the way."""
+        self._info_btn = QToolButton()
+        self._info_btn.setText("ℹ  Info — what each mode & setting does")
+        self._info_btn.setCheckable(True)
+        self._info_btn.setChecked(False)
+        self._info_btn.setFocusPolicy(Qt.NoFocus)
+        self._info_btn.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self._info_btn.setArrowType(Qt.RightArrow)
+        self._info_btn.setStyleSheet(
+            "QToolButton { border:none; color:#8ab4f8; font-size:11px; padding:2px; }")
+        self._info_btn.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+
+        self._info_body = QTextBrowser()
+        self._info_body.setHtml(self._INFO_HTML)
+        self._info_body.setOpenExternalLinks(False)
+        self._info_body.setMinimumHeight(240)
+        self._info_body.setStyleSheet(
+            "QTextBrowser { background:#1a1a1a; color:#ccc; border:1px solid #333;"
+            " font-size:11px; }")
+        self._info_body.setVisible(False)
+
+        def _toggle(checked):
+            self._info_body.setVisible(checked)
+            self._info_btn.setArrowType(Qt.DownArrow if checked else Qt.RightArrow)
+
+        self._info_btn.toggled.connect(_toggle)
+        parent_layout.addWidget(self._info_btn)
+        parent_layout.addWidget(self._info_body)
 
     # ── Set folder ────────────────────────────────────────────────────────────
 
@@ -745,9 +850,7 @@ class MainWindow(QMainWindow):
         for entry in sorted(os.listdir(self._set_dir)):
             full = os.path.join(self._set_dir, entry)
             if os.path.isdir(full):
-                jpegs = [f for f in os.listdir(full)
-                         if f.endswith(".jpg") and "overlay" not in f]
-                self._upsert_leg_row(entry, len(jpegs), "—")
+                self._upsert_leg_row(entry, _count_numbered_frames(full), "—")
 
     # ── Camera mode ───────────────────────────────────────────────────────────
 
@@ -1559,12 +1662,12 @@ class MainWindow(QMainWindow):
                                 "No sub-folders found in the set folder.")
             return
 
-        # Validate image counts
+        # Validate image counts (numbered frames only — the pipeline ignores
+        # any Overlay_*/Scratch_* exports or other non-000-030 files).
         bad_legs = []
         for lg in found:
             lg_dir = os.path.join(self._set_dir, lg)
-            n = len([f for f in os.listdir(lg_dir)
-                     if f.endswith(".jpg") and "overlay" not in f])
+            n = _count_numbered_frames(lg_dir)
             if n != EXPECTED_IMAGES:
                 bad_legs.append(f"{lg}: {n} images (expected {EXPECTED_IMAGES})")
 
@@ -1576,11 +1679,8 @@ class MainWindow(QMainWindow):
                                    QMessageBox.Yes | QMessageBox.No) == QMessageBox.No:
                 return
 
-        total = sum(
-            len([f for f in os.listdir(os.path.join(self._set_dir, lg))
-                 if f.endswith(".jpg") and "overlay" not in f])
-            for lg in found
-        )
+        total = sum(_count_numbered_frames(os.path.join(self._set_dir, lg))
+                    for lg in found)
         self._ana_bar.setMaximum(max(total, 1)); self._ana_bar.setValue(0)
         self._go_btn.setEnabled(False)
         self._stop_btn.setEnabled(True)
@@ -1595,8 +1695,7 @@ class MainWindow(QMainWindow):
         self._analysis_queue = []
         for lg in found:
             lg_dir = os.path.join(self._set_dir, lg)
-            n = len([f for f in os.listdir(lg_dir)
-                     if f.endswith(".jpg") and "overlay" not in f])
+            n = _count_numbered_frames(lg_dir)
             self._upsert_leg_row(lg, n, "Queued")
             self._analysis_queue.append((lg, lg_dir, n))
 
