@@ -222,8 +222,12 @@ def _rule_predict(rgb_array: np.ndarray, sensitivity: float = 0.5) -> tuple[str,
     # merged into 2-D clusters — are made of long runs (coverage ≈ 1); a curved
     # fibre only touches runs where its tangent goes horizontal (coverage ≲ 0.3).
     # Judging coverage instead of erasing runs keeps the fibre in one piece.
+    # The small horizontal close first fuses STIPPLED scratches (dashed chains
+    # of dots, e.g. wiper marks) into runs, so they read as scratches too.
+    run_src = cv2.morphologyEx(dark_mask, cv2.MORPH_CLOSE,
+                               cv2.getStructuringElement(cv2.MORPH_RECT, (9, 1)))
     run_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (_SCRATCH_RUN, 1))
-    scratch_runs = cv2.morphologyEx(dark_mask, cv2.MORPH_OPEN, run_kernel)
+    scratch_runs = cv2.morphologyEx(run_src, cv2.MORPH_OPEN, run_kernel)
     n, labels, stats, _ = cv2.connectedComponentsWithStats(
         (dark_mask > 0).astype(np.uint8), connectivity=8)
     for i in range(1, n):
