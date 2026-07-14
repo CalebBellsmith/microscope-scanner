@@ -15,6 +15,8 @@ The system has four independent algorithmic subsystems:
 | **Focus** | `capture_pipeline.py` (`_focus_score`, `_autofocus_search`) | Decide if a frame is sharp, and drive Z to make it sharp |
 | **Defect / spec classifier** | `ml_inference.py` (`_rule_predict`) | Decide if a frame has avoidable debris worth nudging away from |
 
+Per-image runtimes for all four are in [§6 Performance](#6-performance--how-fast-each-algorithm-runs).
+
 A recurring idea ties them together, so it is worth stating once up front.
 
 ### The one trick used everywhere: *darkness below a local background*
@@ -516,6 +518,75 @@ Two moves, in order (`_on_auto_calibrate`, `_autofocus_here`):
 
 The focus threshold stays put at 3000. The status bar reports both outcomes, e.g.
 `sensitivity 0.61, focused (score 6420)`.
+
+---
+
+## 6. Performance — how fast each algorithm runs
+
+All four algorithms process a single **822 × 1024** frame. The numbers below are
+median wall-clock times (steady-state, after warm-up) measured on an **Apple M1**
+(Python 3.13, OpenCV 4.12, NumPy 2.2), across four representative frames — clean
+glass, dense-swarm glass, textured PET, and a failing PET leg — to show how
+runtime varies with frame content.
+
+| Algorithm | Median / frame | Range across frames | ≈ frames/sec | Cost scaling |
+|---|---:|---:|---:|---|
+| **Focus detect** (`_focus_score`) | **≈ 32 ms** | 28–36 ms | ~31 | O(pixels) |
+| **Spec detect** (`_rule_predict`) | **≈ 50 ms** | 48–52 ms | ~20 | O(pixels) |
+| **Accurate analysis** (`_detect_accurate`) | **≈ 57 ms** | 41–65 ms | ~18 | O(pixels) + O(components) |
+| **Legacy analysis** (`_detect_legacy`) | **≈ 274 ms** | 225–362 ms | ~4 | O(columns × peaks) |
+
+Per-frame detail (median ms):
+
+| Frame | Focus | Spec | Accurate | Legacy |
+|---|---:|---:|---:|---:|
+| glass clean | 36 | 50 | 41 | 362 |
+| glass swarm | 31 | 49 | 62 | 225 |
+| PET textured | 28 | 52 | 59 | 262 |
+| PET failing | 33 | 48 | 65 | 247 |
+
+### What these numbers mean in practice
+
+- **The capture-time algorithms are effectively free.** During a scan, each saved
+  frame runs focus detect (~32 ms) and spec detect (~50 ms) — together ~80 ms,
+  which is small next to the stage settle time (0.5 s) and camera exposure. An
+  autofocus *search* costs one `_focus_score` per probe (~32 ms each), so even a
+  10-probe hill-climb adds only ~0.3 s, and it only fires on the rare soft frame.
+  Neither is a bottleneck; the scan is dominated by mechanical motion, not
+  computation.
+
+- **Accurate mode is fast enough for interactive analysis.** ~57 ms/frame means a
+  full 30-frame leg analyses in under 2 seconds, and the whole 3,600-frame
+  archive in ~3.5 minutes single-threaded (well under a minute across 6 cores).
+
+- **Legacy mode is the outlier, by design.** At ~274 ms it is ~5× slower than
+  accurate mode. The cost is almost entirely the **per-column peak detection**:
+  it calls `scipy.signal.find_peaks` **1,024 times per image** (once per column),
+  a sequential Python loop. That is inherent to faithfully reproducing the MATLAB
+  `findpeaks` loop — the whole point of legacy mode is bit-level fidelity to the
+  original, not speed, so the loop was kept literal rather than vectorised. It is
+  still only a quarter-second per frame, so a 30-frame leg finishes in ~8 s — fine
+  for its occasional "reconcile against historical numbers" use.
+
+### Why the content-dependence differs by algorithm
+
+- **Focus and spec detect are content-flat** (~±10%): they run a fixed set of
+  whole-image operations (morphology, Sobel/FFT, one components pass) whose cost
+  depends on pixel count, not on how many scratches are present.
+- **Accurate mode rises with clutter** (41 ms clean → 65 ms failing-PET): its
+  later stages iterate over *connected components*, and dirty/heavily-scratched
+  frames have far more of them. Still bounded and modest.
+- **Legacy mode is *fastest* on the busiest frames** (362 ms clean → 225 ms
+  swarm), which is counterintuitive until you see why: `find_peaks` returns early
+  on columns with strong clear peaks, whereas on a near-blank clean column it
+  works harder scanning for prominence that isn't there. The cost tracks the
+  peak-finding loop, not the eventual scratch count.
+
+> Absolute times scale with CPU and image resolution; treat them as *relative*
+> guidance. The ratios (legacy ≈ 5× accurate; focus/spec cheap) hold regardless
+> of machine. To re-measure on the target hardware, time each entry point
+> (`_detect_legacy`, `_detect_accurate`, `_rule_predict`, `_focus_score`) on a
+> handful of real frames after one warm-up call.
 
 ---
 
