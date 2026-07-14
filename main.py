@@ -773,10 +773,12 @@ class MainWindow(QMainWindow):
     <b>Autofocus</b> — a soft frame triggers an automatic Z hill-climb search for
     the sharpest focus (needs the Z stepper wired).  The search finds the "into
     focus" direction by itself: it probes one step, checks whether the score
-    improved, and remembers the winning direction for the next field.  If the
-    peak is still soft it retries once with wider probes over the full roller
-    range; a field that stays soft is saved as <code>NNN_soft.jpg</code> —
-    kept for the record but never analysed.</p>
+    improved, and remembers the winning direction for the next field.  When both
+    directions make the image WORSE, the field is at its verified focus peak and
+    is accepted as focused — even if its absolute score is low (grainy substrates
+    score lower).  A low score triggers one wider retry over the full roller
+    range to double-check; only a field with no verifiable peak is saved as
+    <code>NNN_soft.jpg</code> — kept for the record but never analysed.</p>
     <p><b>Focus threshold</b> — frames scoring below this are treated as out of
     focus.  Focus is objective (a frame is sharp or it isn't, whatever the
     slide), so this stays a fixed dial: in-focus ≈4000-8000, soft ≲2100;

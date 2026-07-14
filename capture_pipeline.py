@@ -475,13 +475,17 @@ class CapturePipeline:
           • The winning probe direction is remembered (self._z_dir) so the next
             field's search tries the likely direction first — one probe saved
             per field once the rig's Z sense is known.
-          • If the peak found is still below the blur threshold, the search
-            ESCALATES once: wider probes (×3 step) over the full ±ESCALATE_RANGE.
-            The Z axis is a continuous roller with no hard limit, so the range
-            bound is only a runaway guard.
-          • A field still soft after escalation is kept (best we have) but
-            flagged via self._last_soft, which tags the saved filename so
-            analysis skips it.
+          • If the best score is below the blur threshold, the search ESCALATES
+            once: wider probes (×3 step) over the full ±ESCALATE_RANGE.  The Z
+            axis is a continuous roller with no hard limit, so the range bound
+            is only a runaway guard.
+          • FOCUS IS THE PEAK, NOT THE NUMBER: when both directions make the
+            image worse, the field is at its sharpest physically possible —
+            it is accepted as focused even if its absolute score is low
+            (grainy substrates score lower across the board).  Only a field
+            below threshold WITHOUT a verified peak (search cut short by the
+            bound / stop / dropped frames) is flagged via self._last_soft,
+            which tags the saved filename so analysis skips it.
         """
         cur_z = 0                                   # net Z applied during this search
         s0    = self._focus_score(soft_frame)
@@ -503,7 +507,11 @@ class CapturePipeline:
         def climb(step, bound, best_s, best_z):
             """Probe one step each way from best_z (learned direction first),
             then hill-climb the uphill way until a step stops improving.
-            Remembers the winning direction for the next search."""
+            Remembers the winning direction for the next search.
+            Returns (best_s, best_z, at_peak): at_peak is True when the search
+            ENDED because the score fell on both sides of best_z — a verified
+            focus peak — and False when it was cut short (range bound, stop,
+            dropped frames), i.e. a better height might exist unseen."""
             up = best_z + self._z_dir * step
             s_up = score_at(up)
             if s_up > best_s:
@@ -514,28 +522,41 @@ class CapturePipeline:
                 if s_dn > best_s:
                     best_s, best_z, direction = s_dn, dn, -self._z_dir
                 else:
-                    return best_s, best_z          # neither way improves
+                    # neither way improves — both neighbours are worse, so the
+                    # start height IS the peak
+                    return best_s, best_z, True
             self._z_dir = direction                # learned: probe here first next time
             while not self._stop_event.is_set():
                 target = best_z + direction * step
                 if abs(target) > bound:            # runaway guard
-                    break
+                    return best_s, best_z, False   # peak may lie beyond the bound
                 s = score_at(target)
                 if s > best_s:
                     best_s, best_z = s, target
                 else:
-                    break                          # passed the peak
-            return best_s, best_z
+                    # the score fell: we climbed up one side and came down the
+                    # other — best_z is a verified peak
+                    return best_s, best_z, True
+            return best_s, best_z, False           # stopped mid-search
 
-        best_s, best_z = climb(self._z_step, self._z_range, best_s, best_z)
+        best_s, best_z, at_peak = climb(self._z_step, self._z_range,
+                                        best_s, best_z)
 
-        # Still soft?  Escalate once: wider probes, full roller range.  Catches
-        # fields whose focus peak lies beyond the normal search's reach.
+        # Score below threshold?  Escalate once: wider probes, full roller
+        # range.  This both reaches far-away peaks AND double-checks a low
+        # "peak" from the first pass — if ±3×step can't beat it either, the
+        # peak is real, not single-step score noise.
         if best_s < self._blur_thresh and not self._stop_event.is_set():
-            best_s, best_z = climb(self._z_step * self.ESCALATE_MULT,
-                                   self.ESCALATE_RANGE, best_s, best_z)
+            best_s, best_z, at_peak = climb(self._z_step * self.ESCALATE_MULT,
+                                            self.ESCALATE_RANGE, best_s, best_z)
 
-        self._last_soft = best_s < self._blur_thresh
+        # FOCUS IS THE PEAK, NOT THE NUMBER: a field at a verified peak is as
+        # sharp as it can physically be — grainy/low-contrast substrates just
+        # score lower overall, and excluding their sharp frames would starve
+        # the analysis.  The threshold decides when to SEARCH; only a field
+        # that is below threshold AND has no verified peak (search cut short)
+        # is tagged _soft and excluded.
+        self._last_soft = (best_s < self._blur_thresh) and not at_peak
         # Settle at the best height and take the defect-nudged keeper there.
         # (best_z is 0 when nothing improved — that restores the start height.)
         go_to(best_z)
