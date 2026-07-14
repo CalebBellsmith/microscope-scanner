@@ -315,14 +315,44 @@ Guards keep this from ever cutting a real scratch:
 Comet-smear heads escape naturally: they sit at the *end* of their scratch (no
 line continuing on both sides) or are part of a thick body (median > 15).
 
-### 2.5 Stage 5 — recount
+
+### 2.5 Stage 4c — halo trim: count the line, not its blur skirt
+
+Operator review flagged measured areas as a hair generous, and 5× zoom
+confirmed it: a **dark** line carries a wide optical/JPEG blur skirt, and the
+absolute weak threshold wades into it — on soft-optics PET frames the counted
+mask ran well beyond the visible line body (total counted area was ~3× the
+strict half-max (FWHM) line width).
+
+The fix is **relative, per scratch, per column**: drop pixels fainter than a
+**quarter of that column's own peak darkness**. Why quarter-max: half-max
+(FWHM) is the strict metrology definition but visibly clips real line body on
+these images; the full skirt extends to ~5% of peak; quarter-max sits at the
+visible edge — verified at 5× zoom on glass swarm, faint PET lines, dirty
+PET, and a deep-black glass line.
+
+Three properties make the trim safe:
+- **Faint lines are untouched** — their peak is near the threshold already, so
+  the quarter-max floor sits below it. The faint-extent recovery (hysteresis,
+  faint routes) cannot be undone by the trim.
+- **No scratch loses length** — every column keeps its peak pixel, so the
+  end-to-end extent is preserved; only thickness is tightened.
+- **Severed halo pads are dropped by evidence** — trimming can separate a pad
+  of halo that connected two structures; a final gate keeps a component only
+  if it carries its own detection evidence (core or faint-route pixels) or is
+  shaped like a line. Pads have neither and vanish.
+
+Corpus impact: −15% mean leg area (−6 to −23%), counts stable — a pure
+thickness correction, not a sensitivity change.
+
+### 2.6 Stage 5 — recount
 
 Union all accepted pixels and re-label with 8-connectivity, so touching pieces
 merge into single scratches. Components below 30 px (crumbs left by the shave)
 are dropped — every upstream gate already required ≥ 30 px, so nothing real is
 lost. Each surviving component is one scratch; its pixel count is its area.
 
-### 2.6 How it was validated
+### 2.7 How it was validated
 
 A fixed panel of 12 deliberately hard "sentinel" frames (dense swarm, noise-only,
 sparse-faint, heavy-dust, stippled wiper, textured PET, diagonals+smears, comet
@@ -548,7 +578,7 @@ runtime varies with frame content.
 |---|---:|---:|---:|---|
 | **Focus detect** (`_focus_score`) | **≈ 32 ms** | 28–36 ms | ~31 | O(pixels) |
 | **Spec detect** (`_rule_predict`) | **≈ 50 ms** | 48–52 ms | ~20 | O(pixels) |
-| **Accurate analysis** (`_detect_accurate`) | **≈ 63 ms** | 47–71 ms | ~16 | O(pixels) + O(components) |
+| **Accurate analysis** (`_detect_accurate`) | **≈ 70 ms** | 52–76 ms | ~14 | O(pixels) + O(components) |
 | **Legacy analysis** (`_detect_legacy`) | **≈ 274 ms** | 225–362 ms | ~4 | O(columns × peaks) |
 
 Per-frame detail (median ms):
@@ -560,7 +590,7 @@ Per-frame detail (median ms):
 | PET textured | 28 | 52 | 65 | 262 |
 | PET failing | 33 | 48 | 71 | 247 |
 
-(Accurate-mode times include the v6.1 ultra-faint third scan, ≈ +6 ms.)
+(Accurate-mode times include the v6.1 ultra-faint scan and the v6.2 halo trim, ≈ +13 ms together.)
 
 ### What these numbers mean in practice
 
@@ -572,7 +602,7 @@ Per-frame detail (median ms):
   Neither is a bottleneck; the scan is dominated by mechanical motion, not
   computation.
 
-- **Accurate mode is fast enough for interactive analysis.** ~63 ms/frame means a
+- **Accurate mode is fast enough for interactive analysis.** ~70 ms/frame means a
   full 30-frame leg analyses in under 2 seconds, and the whole 3,600-frame
   archive in ~4 minutes single-threaded (well under a minute across 6 cores).
 
