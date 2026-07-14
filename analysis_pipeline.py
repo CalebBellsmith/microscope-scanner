@@ -495,12 +495,13 @@ def _detect_accurate(rgb: np.ndarray):
     # The second, longer filter (51 px) doubles the SNR boost for long lines,
     # reaching streaks too faint for the 25 px filter; only the long-thin
     # route applies at that scale.
-    med_gate  = max(22.0, d_mean + 1.5 * d_std)
-    thin_gate = max(25.0, d_mean + 1.0 * d_std)
+    med_gate   = max(22.0, d_mean + 1.5 * d_std)
+    thin_gate  = max(25.0, d_mean + 1.0 * d_std)
+    ultra_gate = max(15.0, d_mean + 0.6 * d_std)
 
-    def _faint_scan(filt_len, min_w, standard_route):
+    def _faint_scan(filt_len, min_w, standard_route, thr_k=1.0, ultra_only=False):
         sm = cv2.blur(darkness.astype(np.float32), (filt_len, 1))
-        thr_f = max(2.5, float(sm.mean()) + 1.0 * float(sm.std()))
+        thr_f = max(2.5, float(sm.mean()) + thr_k * float(sm.std()))
         faint = (sm > thr_f).astype(np.uint8)
         faint = cv2.morphologyEx(faint, cv2.MORPH_CLOSE,
                                  cv2.getStructuringElement(cv2.MORPH_RECT, (11, 1)))
@@ -514,7 +515,10 @@ def _detect_accurate(rgb: np.ndarray):
             d = darkness[y:y + h, x:x + w].astype(np.float32).copy()
             d[~compb] = 0
             med = float(np.median(d.max(axis=0)))
-            if standard_route and w >= 45 and med >= med_gate:
+            if ultra_only:
+                if w >= 150 and h <= 8 and w / max(h, 1) >= 18.0 and med >= ultra_gate:
+                    add |= labf == k
+            elif standard_route and w >= 45 and med >= med_gate:
                 add |= labf == k
             elif w >= 120 and w / max(h, 1) >= 12.0 and med >= thin_gate:
                 add |= labf == k
@@ -522,6 +526,17 @@ def _detect_accurate(rgb: np.ndarray):
 
     union |= _faint_scan(25, 45, standard_route=True)
     union |= _faint_scan(51, 120, standard_route=False)
+    # ULTRA-FAINT route: a lower pixel threshold (mean + 0.6σ) with the 51 px
+    # filter, accepting ONLY very long, very thin, very straight runs
+    # (>= 150 px, <= 8 px, aspect >= 18) at a softer darkness gate.  Measured
+    # against control-sample PET texture: the longest chance texture ridge is
+    # ~127 px, so the 150 px floor keeps a real margin while recovering the
+    # faintest full-length scratches on badly abraded frames.  Anything
+    # shorter at this faintness is statistically indistinguishable from the
+    # substrate's own texture and is deliberately NOT counted — a false
+    # scratch on a control sample corrupts the control-vs-treatment
+    # comparison this instrument exists to make.
+    union |= _faint_scan(51, 150, standard_route=False, thr_k=0.6, ultra_only=True)
 
     # 4b. Dot-bulge shave: a dust spec dark enough to FUSE with a thin scratch
     # in the strong mask can't be excised as a component — it shows up as a
