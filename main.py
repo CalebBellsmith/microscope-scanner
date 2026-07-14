@@ -778,9 +778,9 @@ class MainWindow(QMainWindow):
     range; a field that stays soft is saved as <code>NNN_soft.jpg</code> —
     kept for the record but never analysed.</p>
     <p><b>Focus threshold</b> — frames scoring below this are treated as out of
-    focus.  Calibrated range: in-focus ≈4000-8000, soft ≲2100; default 3000.
-    Higher = stricter (acts more often).  Auto-calibrate can set this for the
-    slide (see below).</p>
+    focus.  Focus is objective (a frame is sharp or it isn't, whatever the
+    slide), so this stays a fixed dial: in-focus ≈4000-8000, soft ≲2100;
+    default 3000.  Higher = stricter (acts more often).</p>
     <p><b>Z-step / Z-range</b> — how far each autofocus probe moves (default 300),
     and a runaway guard on total travel (default 10000 — the Z axis is a
     continuous roller, so this is a sanity bound, not a physical limit).
@@ -788,10 +788,10 @@ class MainWindow(QMainWindow):
 
     <h3>Detection tuning</h3>
     <p><b>Sensitivity / Auto-calibrate</b> — the scratch-vs-background threshold.
-    Auto-calibrate tours a few nearby spots with the stage and picks a value
-    automatically; the same tour also measures the spots' focus scores and sets
-    a slide-specific <b>Focus threshold</b> (focus the slide first — the tour is
-    used as the sharp reference).</p>
+    Defect dirtiness IS slide-dependent (clean glass vs grainy PET), so
+    Auto-calibrate first drives Z to bring the frame into focus, then tours a
+    few nearby spots with the stage and picks the strictest sensitivity at
+    which this slide still reads clean.</p>
     <p><b>Defect jump</b> — how hard the defect nudge moves the stage.  Raise it
     if defects are still on screen after the nudge (they only moved a little).
     100% ≈ a firm nudge.</p>
@@ -1258,6 +1258,67 @@ class MainWindow(QMainWindow):
 
     # ── Auto-calibrate ────────────────────────────────────────────────────────
 
+    def _autofocus_here(self):
+        """
+        Bring the live frame into focus at the current stage position: probe
+        one Z step each way, hill-climb the direction that improves the focus
+        score, stop at the peak (same search the capture pipeline uses).  The
+        stage is LEFT at the focused height.  Returns the best score, or None
+        when there's no motor / the Z stepper doesn't respond (the calibrate
+        tour then just proceeds with the frame as-is).
+        """
+        if self._motor is None or self._camera is None:
+            return None
+        import time as _time
+        SETTLE = 0.3
+        step   = self._z_step_spin.value()
+        bound  = self._z_range_spin.value()
+        cur    = [0]                       # net Z applied so far
+
+        def go_to(z):
+            if z != cur[0]:
+                self._motor.move("Z", z - cur[0])
+                cur[0] = z
+                _time.sleep(SETTLE)
+
+        def score_at(z):
+            go_to(z)
+            f = self._camera.grab()
+            self._statusbar.showMessage(f"Calibrating — focusing… (Z {z:+d})")
+            QApplication.processEvents()
+            return float("-inf") if f is None else focus_score(f)
+
+        try:
+            best_s, best_z = score_at(0), 0
+            direction = None
+            up = score_at(step)
+            if up > best_s:
+                best_s, best_z, direction = up, step, 1
+            else:
+                dn = score_at(-step)
+                if dn > best_s:
+                    best_s, best_z, direction = dn, -step, -1
+            if direction is not None:
+                while True:
+                    target = best_z + direction * step
+                    if abs(target) > bound:
+                        break
+                    s = score_at(target)
+                    if s > best_s:
+                        best_s, best_z = s, target
+                    else:
+                        break              # passed the peak
+            go_to(best_z)                  # settle at the sharpest height
+            return best_s
+        except Exception as e:
+            try:
+                go_to(0)                   # Z failed mid-search — walk back
+            except Exception:
+                pass
+            self._statusbar.showMessage(f"Calibrate: Z focus skipped ({e})")
+            QApplication.processEvents()
+            return None
+
     # Auto-calibrate stage tour: hop size (half-steps/axis) and the ring of
     # offsets visited around the start.  Centre first, then a box of 8
     # neighbours — each is a spatially distinct field of the slide.  Small
@@ -1284,6 +1345,15 @@ class MainWindow(QMainWindow):
 
         self._cal_btn.setEnabled(False)
         QApplication.processEvents()
+
+        # Bring the frame into focus FIRST.  Focus is objective — a frame is
+        # either sharp or it isn't, regardless of the slide — so calibration
+        # doesn't touch the focus threshold; it just drives Z to the focus
+        # peak so the sensitivity tour below judges sharp frames.
+        self._cal_focus_msg = ""
+        best = self._autofocus_here()
+        if best is not None:
+            self._cal_focus_msg = f", focused (score {best:.0f})"
 
         import time as _time
         SETTLE   = 0.15                              # brief settle before each grab
@@ -1333,25 +1403,10 @@ class MainWindow(QMainWindow):
         slider_val = max(1, min(9, round(1 + 8 * (suggested ** (1 / 1.8)))))
         self._thresh_slider.setValue(slider_val)
 
-        # Focus threshold from the same tour: sharp frames score ≈4000–8000 and
-        # soft ones ≲2100, so HALF the sharp median lands in the gap between the
-        # bands — a slide-specific floor.  The operator focuses before touring,
-        # so the tour is the slide's sharp reference; clamped near the bench
-        # default (3000) so one odd tour can't set something wild.  Blank fields
-        # score +inf and are skipped; if every spot was blank, leave the dial.
-        focus_msg = ""
-        finite = sorted(s for s in (focus_score(f) for f in frames)
-                        if s != float("inf"))
-        if finite:
-            med = finite[len(finite) // 2]
-            blur_val = max(2000, min(5000, int(round(0.5 * med / 100.0) * 100)))
-            self._blur_spin.setValue(blur_val)
-            focus_msg = f", focus threshold {blur_val}"
-
         sensitivity = ((slider_val - 1) / 8.0) ** 1.8
         self._cal_btn.setEnabled(True)
         self._statusbar.showMessage(
-            f"Calibrated: sensitivity {sensitivity:.2f}{focus_msg} "
+            f"Calibrated: sensitivity {sensitivity:.2f}{self._cal_focus_msg} "
             f"(toured {len(frames)} spots)"
         )
 
