@@ -64,7 +64,7 @@ class _NoScrollSlider(QSlider):
 from camera import open_camera
 from motor import MotorController
 from ml_inference import QualityClassifier
-from capture_pipeline import CapturePipeline
+from capture_pipeline import CapturePipeline, focus_score
 from analysis_pipeline import (
     AnalysisPipeline, write_new_format, write_legacy_format,
     collect_sets, write_summarize_format,
@@ -426,7 +426,7 @@ class MainWindow(QMainWindow):
         self._blur_spin = _NoScrollSpinBox()
         self._blur_spin.setFocusPolicy(Qt.ClickFocus)
         self._blur_spin.setRange(0, 20000)
-        self._blur_spin.setValue(2500)        # focus-score floor for in-focus frames
+        self._blur_spin.setValue(3000)        # focus-score floor for in-focus frames
         self._blur_spin.setToolTip(
             "Frames scoring below this focus value are treated as out of focus.  "
             "Calibrated on the 2,400-frame archive: in-focus ≈4000-8000, "
@@ -446,7 +446,7 @@ class MainWindow(QMainWindow):
         self._z_step_spin = _NoScrollSpinBox()
         self._z_step_spin.setFocusPolicy(Qt.ClickFocus)
         self._z_step_spin.setRange(1, 5000)
-        self._z_step_spin.setValue(200)
+        self._z_step_spin.setValue(300)
         self._z_step_spin.setToolTip("Half-steps the Z (focus) stepper moves per "
                                      "probe during an autofocus search.")
         z_row.addWidget(self._z_step_spin)
@@ -455,16 +455,16 @@ class MainWindow(QMainWindow):
         self._z_range_spin = _NoScrollSpinBox()
         self._z_range_spin.setFocusPolicy(Qt.ClickFocus)
         self._z_range_spin.setRange(1, 20000)
-        self._z_range_spin.setValue(2000)
-        self._z_range_spin.setToolTip("Max ± half-steps a search may travel — a "
-                                      "runaway safety bound on the focus stepper.")
+        self._z_range_spin.setValue(10000)
+        self._z_range_spin.setToolTip("Max ± half-steps a search may travel.  The Z "
+                                      "axis is a continuous roller with no hard "
+                                      "limit, so this is only a runaway guard — "
+                                      "the search stops itself at the focus peak.")
         z_row.addWidget(self._z_range_spin)
         z_row.addStretch()
         af_lay.addLayout(z_row)
-        self._z_invert_chk = QCheckBox("Invert Z direction (flip if it focuses the wrong way)")
-        self._z_invert_chk.setFocusPolicy(Qt.NoFocus)
-        self._z_invert_chk.setStyleSheet("font-size:10px;")
-        af_lay.addWidget(self._z_invert_chk)
+        # No Z-direction control: the search probes one step, checks whether the
+        # focus score improved, and learns which way is "into focus" by itself.
         review_lay.addWidget(self._af_container)
 
         # Contextual hint for the pausing modes (e.g. the Enter/Space keys).
@@ -758,8 +758,9 @@ class MainWindow(QMainWindow):
     within ~4% of them across 30 archived sets).  Use when you need continuity
     with historical data.</p>
     <p><b>Accurate</b> — defect-aware detector: measures genuine horizontal
-    abrasion scratches (including dense "comet" smears) and rejects dust dots,
-    dot-pairs, smudges and diagonal handling marks.  Use for the truest scratch
+    abrasion scratches (including dense "comet" smears) end-to-end — faint tails
+    and whole faint lines included — and rejects dust dots, dot-pairs, smudges,
+    substrate texture and diagonal handling marks.  Use for the truest scratch
     area on a fresh sample.</p>
 
     <h3>Review during capture (focus handling)</h3>
@@ -770,18 +771,27 @@ class MainWindow(QMainWindow):
     <b>Auto-pause</b> — pause and ask you only when a frame reads soft.<br>
     <b>Manual</b> — pause on every frame so you can adjust focus and retake.<br>
     <b>Autofocus</b> — a soft frame triggers an automatic Z hill-climb search for
-    the sharpest focus (needs the Z stepper wired).</p>
+    the sharpest focus (needs the Z stepper wired).  The search finds the "into
+    focus" direction by itself: it probes one step, checks whether the score
+    improved, and remembers the winning direction for the next field.  If the
+    peak is still soft it retries once with wider probes over the full roller
+    range; a field that stays soft is saved as <code>NNN_soft.jpg</code> —
+    kept for the record but never analysed.</p>
     <p><b>Focus threshold</b> — frames scoring below this are treated as out of
-    focus.  Calibrated range: in-focus ≈4000-8000, soft ≲2100; default 2500.
-    Higher = stricter (acts more often).</p>
-    <p><b>Z-step / Z-range / Invert Z</b> — how far each autofocus probe moves,
-    how far the search may wander before giving up, and which direction counts as
-    "in".  Z-step also sets how far <b>W / S</b> jog the focus in manual joystick.</p>
+    focus.  Calibrated range: in-focus ≈4000-8000, soft ≲2100; default 3000.
+    Higher = stricter (acts more often).  Auto-calibrate can set this for the
+    slide (see below).</p>
+    <p><b>Z-step / Z-range</b> — how far each autofocus probe moves (default 300),
+    and a runaway guard on total travel (default 10000 — the Z axis is a
+    continuous roller, so this is a sanity bound, not a physical limit).
+    Z-step also sets how far <b>W / S</b> jog the focus in manual joystick.</p>
 
     <h3>Detection tuning</h3>
     <p><b>Sensitivity / Auto-calibrate</b> — the scratch-vs-background threshold.
     Auto-calibrate tours a few nearby spots with the stage and picks a value
-    automatically.</p>
+    automatically; the same tour also measures the spots' focus scores and sets
+    a slide-specific <b>Focus threshold</b> (focus the slide first — the tour is
+    used as the sharp reference).</p>
     <p><b>Defect jump</b> — how hard the defect nudge moves the stage.  Raise it
     if defects are still on screen after the nudge (they only moved a little).
     100% ≈ a firm nudge.</p>
@@ -1323,10 +1333,25 @@ class MainWindow(QMainWindow):
         slider_val = max(1, min(9, round(1 + 8 * (suggested ** (1 / 1.8)))))
         self._thresh_slider.setValue(slider_val)
 
+        # Focus threshold from the same tour: sharp frames score ≈4000–8000 and
+        # soft ones ≲2100, so HALF the sharp median lands in the gap between the
+        # bands — a slide-specific floor.  The operator focuses before touring,
+        # so the tour is the slide's sharp reference; clamped near the bench
+        # default (3000) so one odd tour can't set something wild.  Blank fields
+        # score +inf and are skipped; if every spot was blank, leave the dial.
+        focus_msg = ""
+        finite = sorted(s for s in (focus_score(f) for f in frames)
+                        if s != float("inf"))
+        if finite:
+            med = finite[len(finite) // 2]
+            blur_val = max(2000, min(5000, int(round(0.5 * med / 100.0) * 100)))
+            self._blur_spin.setValue(blur_val)
+            focus_msg = f", focus threshold {blur_val}"
+
         sensitivity = ((slider_val - 1) / 8.0) ** 1.8
         self._cal_btn.setEnabled(True)
         self._statusbar.showMessage(
-            f"Calibrated: sensitivity set to {sensitivity:.2f} "
+            f"Calibrated: sensitivity {sensitivity:.2f}{focus_msg} "
             f"(toured {len(frames)} spots)"
         )
 
@@ -1384,7 +1409,6 @@ class MainWindow(QMainWindow):
             bad_dir=TRAINING_BAD_DIR,
             z_step=self._z_step_spin.value(),
             z_range=self._z_range_spin.value(),
-            z_dir=(-1 if self._z_invert_chk.isChecked() else 1),
             nudge_scale=self._nudge_spin.value() / 100.0,
             on_progress=lambda d, t: self._sig.capture_progress.emit(d, t),
             on_frame=lambda f: self._sig.frame_ready.emit(f),

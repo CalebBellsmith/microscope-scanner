@@ -54,21 +54,30 @@ _WORKER    = os.path.join(_HERE, "inference_worker.py")
 # detected (it has low aspect) instead of being mistaken for a scratch.
 _ASPECT_LINE_MIN = 8.0
 
-# Morphological opening kernel (px).  A second detection pass opens the dark
-# mask with this kernel to ERASE thin horizontal scratches while preserving
-# compact blobs.  This isolates a defect that sits ON a scratch line — which
-# would otherwise fuse with the line into one high-aspect contour and be
-# discarded as a "line", swallowing the blob.  7 px removes scratches up to a
-# few px thick while keeping blobs ≳ 20 px across.
-_BLOB_OPEN_KERNEL = 7
+# Scratch-erasure before blob hunting: a horizontal opening of this run length
+# finds scratch RUNS pixel-by-pixel, which are then subtracted from the dark
+# mask (after a small dilation so scratch edges go too).  This replaces the old
+# whole-contour aspect test for merged structures: on dense scratch fields the
+# individual lines fuse into one 2-D cluster whose bounding-box aspect is < 8,
+# which the old test mistook for a giant blob (→ every heavy-abrasion frame
+# read "bad" and the nudge fired uselessly on unavoidable structure).  Erasing
+# the runs first leaves only genuinely compact objects for the blob scan, and
+# still isolates a blob that sits ON a scratch line.
+_SCRATCH_RUN     = 15   # px — min horizontal run treated as scratch structure
+_SPECKLE_OPEN    = 5    # px — ellipse opening that drops leftover grain/speckle
 
 # FFT residual check: after zeroing near-zero horizontal frequencies, the
 # fraction of the remaining std vs the original std.
 # Near 0  → frame is dominated by horizontal content (lines, scratches) → good
 # Near 1  → frame has significant non-horizontal energy (blobs, watermarks) → bad
+# LOCALISATION: uniform substrate texture (PET film) also leaves a large global
+# residual, but a nudge can't move away from texture that covers the whole
+# frame — so the residual must additionally be spatially CONCENTRATED
+# (peak block std ≥ _FFT_LOC_MIN × median block std) before it means "defect".
 _FFT_H_BAND_FRAC  = 0.05    # fraction of the kx frequency range treated as "horizontal"
 _FFT_RESIDUAL_BAD = 0.45    # residual/original ratio above which is flagged as bad
-_FFT_RESIDUAL_CERTAIN = 0.72  # standalone bad flag without needing blob confirmation
+_FFT_LOC_BLOCKS   = 8       # residual is judged on an 8×8 grid of blocks
+_FFT_LOC_MIN      = 3.0     # peak/median block-std ratio: texture ≈1-2, defect ≳3
 
 # Darkening gate (sensitivity-scaled at call time): a contour is only a defect
 # if its interior is meaningfully darker than the background mean.
@@ -79,10 +88,11 @@ _FFT_RESIDUAL_CERTAIN = 0.72  # standalone bad flag without needing blob confirm
 # above the grey-halo band so halos are never flagged.
 
 
-def _fft_residual_ratio(gray: np.ndarray) -> float:
+def _fft_residual_ratio(gray: np.ndarray):
     """
     2D real-FFT analysis: strip horizontal frequency content (low kx), return
-    residual_std / original_std.
+    (residual_std / original_std, residual image) — the residual image feeds
+    the localisation check.
 
     Horizontal scratches (regardless of thickness) concentrate their energy at
     kx ≈ 0.  After zeroing that band the residual is near zero.  Dust blobs and
@@ -94,7 +104,7 @@ def _fft_residual_ratio(gray: np.ndarray) -> float:
     """
     std = float(gray.std())
     if std < 1.0:
-        return 0.0     # nearly uniform image — no structure to analyse
+        return 0.0, np.zeros_like(gray, np.float32)  # nearly uniform image
 
     gray_f = gray.astype(np.float32)
     F      = np.fft.rfft2(gray_f)          # shape (H, W//2+1)
@@ -106,7 +116,27 @@ def _fft_residual_ratio(gray: np.ndarray) -> float:
     F_residual[:, :band] = 0
 
     residual = np.fft.irfft2(F_residual, s=gray.shape)
-    return float(residual.std() / (std + 1e-6))
+    return float(residual.std() / (std + 1e-6)), residual
+
+
+def _residual_localisation(residual: np.ndarray) -> float:
+    """
+    How spatially concentrated the non-horizontal residual is: the frame is
+    split into an _FFT_LOC_BLOCKS² grid and each block's std measured.
+    Returns peak/median block std — ≈1-2 for uniform substrate texture
+    (energy everywhere), ≳3 when one region holds the defect.
+    """
+    H, W = residual.shape
+    bh, bw = H // _FFT_LOC_BLOCKS, W // _FFT_LOC_BLOCKS
+    if bh == 0 or bw == 0:
+        return 1.0
+    stds = [
+        float(residual[r*bh:(r+1)*bh, c*bw:(c+1)*bw].std())
+        for r in range(_FFT_LOC_BLOCKS) for c in range(_FFT_LOC_BLOCKS)
+    ]
+    stds.sort()
+    med = stds[len(stds)//2]
+    return stds[-1] / (med + 1e-6)
 
 
 def _rule_predict(rgb_array: np.ndarray, sensitivity: float = 0.5) -> tuple[str, float]:
@@ -114,23 +144,28 @@ def _rule_predict(rgb_array: np.ndarray, sensitivity: float = 0.5) -> tuple[str,
     Two-check quality gate.  A frame is GOOD unless a check positively
     identifies a defect — absence of features is good (a clean slide).
 
-    CHECK 1 — Blob / fibre detection (shape-based):
-      Find dark contours, drop the ones that are elongated horizontal lines
-      (aspect ≥ 8 = scratch, ignored at any thickness/width).  Of the rest,
-      flag any that is large enough (area, sensitivity-scaled) and genuinely
-      dark (darkening gate — soft grey halos are skipped).  Catches blobs,
-      fibres and dust regardless of how wide they sprawl.
+    CHECK 1 — Blob / fibre detection (shape-based, scratch-erased):
+      Work on DARKNESS below the local background (large morphological close),
+      thresholded adaptively against the frame's own darkness statistics — on
+      grainy substrates (PET film) the bar rises with the texture, so grain
+      never reaches the blob scan.  Horizontal scratch RUNS are then erased
+      from the mask pixel-by-pixel (they are the sample's own structure, at
+      any density), a small opening drops leftover speckle, and whatever
+      remains compact, large and genuinely dark is a nudgeable defect.
+      Erasing runs (not whole contours) keeps working when dense scratches
+      merge into 2-D clusters, and still isolates a blob sitting ON a line.
 
-    CHECK 2 — FFT residual (diffuse non-horizontal signal):
+    CHECK 2 — FFT residual (diffuse non-horizontal signal), localised:
       Strip horizontal frequency content from the 2D FFT; horizontal lines —
-      any thickness — leave almost no residual, while diffuse non-horizontal
-      artefacts (watermarks, smears) leave a large one.  Flags frames whose
-      defect has no clean contour but still breaks horizontal symmetry.
+      any thickness — leave almost no residual.  A large residual is only a
+      defect if it is spatially CONCENTRATED (watermark, smudge, fibre);
+      uniform substrate texture also leaves a big residual, but covers the
+      whole frame — no stage nudge can avoid it, so it must read "good".
 
     Logic:
-      • blob_bad      → bad (localised dark non-line contour)
-      • fft_certain   → bad (strong diffuse non-horizontal signal)
-      • otherwise     → good   (clean frame, or horizontal scratches only)
+      • blob_bad                    → bad (localised dark non-line object)
+      • fft_certain AND localised   → bad (diffuse but concentrated defect)
+      • otherwise                   → good (clean, scratches, or texture)
     """
     import cv2
 
@@ -152,49 +187,135 @@ def _rule_predict(rgb_array: np.ndarray, sensitivity: float = 0.5) -> tuple[str,
     min_dark      = 0.30 - 0.10 * s        # lenient=0.30      strict=0.20
     fft_gate      = 0.75 - 0.25 * s        # lenient=0.75      strict=0.50
 
-    # ── Check 2: blob / fibre detection (shape-based, two-pass) ──────────────
-    # A defect contour must be: large enough (area), NOT an elongated line
-    # (aspect), and genuinely dark (darkening gate skips soft grey halos).
-    def _scan(mask: np.ndarray) -> float:
-        worst = 0.0
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        for cnt in contours:
-            area = cv2.contourArea(cnt)
-            if area < blob_min_area:
-                continue
-            _, _, w, h = cv2.boundingRect(cnt)
-            if w / max(h, 1) >= _ASPECT_LINE_MIN:   # elongated horizontal line → ignore
-                continue
-            cnt_mask = np.zeros(gray.shape, np.uint8)
-            cv2.drawContours(cnt_mask, [cnt], -1, 255, -1)
-            mean_inside = float(cv2.mean(gray, mask=cnt_mask)[0])
-            if (mean_v - mean_inside) / (mean_v + 1e-6) < min_dark:
-                continue                            # soft grey halo → ignore
-            worst = max(worst, area / img_pixels)
-        return worst
+    # ── Check 1: blob / fibre detection ──────────────────────────────────────
+    # Darkness below the local background, thresholded against the frame's own
+    # statistics: clean glass → low bar (faint fibres caught); grainy PET →
+    # bar above the grain, only genuinely dark objects survive.
+    bg = cv2.morphologyEx(gray, cv2.MORPH_CLOSE,
+                          cv2.getStructuringElement(cv2.MORPH_RECT, (31, 31)))
+    darkness = cv2.subtract(bg, gray)
+    d_mean, d_std = float(darkness.mean()), float(darkness.std())
+    # Local term: dark vs the local background — catches thin fibres/edges even
+    # under uneven lighting, with the bar riding above the substrate grain.
+    # Global term: absolutely dark — a solid object WIDER than the close kernel
+    # becomes its own "background" (local darkness reads 0 inside it), so big
+    # debris is only visible to an absolute threshold.
+    dark_mask = (
+        (darkness > max(15.0, d_mean + 2.5 * d_std))
+        | (gray < mean_v - 1.5 * std_v)
+    ).astype(np.uint8) * 255
 
-    thr = max(0, int(mean_v - 1.5 * std_v))
-    _, dark_mask = cv2.threshold(gray, thr, 255, cv2.THRESH_BINARY_INV)
+    def _elongation(cnt) -> float:
+        """Rotated-rect elongation — unlike bbox aspect it also reads tilted
+        line remnants as lines (a 213×27 bbox at 6° is elongation ~12)."""
+        (_, _), (rw, rh), _ = cv2.minAreaRect(cnt)
+        return max(rw, rh) / max(min(rw, rh), 1.0)
 
-    # Pass A — raw mask: catches isolated blobs/fibres (incl. elongated smudges).
-    worst_blob_frac = _scan(dark_mask)
+    def _dark_enough(cnt_or_mask) -> bool:
+        mean_inside = float(cv2.mean(gray, mask=cnt_or_mask)[0])
+        return (mean_v - mean_inside) / (mean_v + 1e-6) >= min_dark
 
-    # Pass B — morphological opening erases thin scratches, isolating any blob
-    # that sits ON a line (which Pass A fuses with the line and discards as a
-    # high-aspect "line").  This is the fix for defects resting on a scratch.
-    kernel    = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
-                                          (_BLOB_OPEN_KERNEL, _BLOB_OPEN_KERNEL))
-    open_mask = cv2.morphologyEx(dark_mask, cv2.MORPH_OPEN, kernel)
-    worst_blob_frac = max(worst_blob_frac, _scan(open_mask))
+    worst_blob_frac = 0.0
+
+    # Pass A — CURVED FIBRES: judge each connected component WHOLE by how much
+    # of it lies in horizontal scratch RUNS.  Scratches — however dense, even
+    # merged into 2-D clusters — are made of long runs (coverage ≈ 1); a curved
+    # fibre only touches runs where its tangent goes horizontal (coverage ≲ 0.3).
+    # Judging coverage instead of erasing runs keeps the fibre in one piece.
+    run_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (_SCRATCH_RUN, 1))
+    scratch_runs = cv2.morphologyEx(dark_mask, cv2.MORPH_OPEN, run_kernel)
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(
+        (dark_mask > 0).astype(np.uint8), connectivity=8)
+    for i in range(1, n):
+        x, y, w, h, a = stats[i]
+        if a < blob_min_area:
+            continue
+        comp = (labels[y:y+h, x:x+w] == i)
+        run_cov = float(scratch_runs[y:y+h, x:x+w][comp].mean()) / 255.0
+        if run_cov >= 0.5:
+            continue                     # scratch structure (line/cluster/smear)
+        comp_mask = np.zeros(gray.shape, np.uint8)
+        comp_mask[y:y+h, x:x+w][comp] = 255
+        cnts, _ = cv2.findContours(comp_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not cnts:
+            continue
+        cnt = max(cnts, key=cv2.contourArea)
+        if _elongation(cnt) >= _ASPECT_LINE_MIN:
+            continue                     # straight line at any angle → not debris
+        if not _dark_enough(comp_mask):
+            continue                     # soft grey halo → ignore
+        worst_blob_frac = max(worst_blob_frac, a / img_pixels)
+
+    def _line_continues(x, y, w, h) -> bool:
+        """A thick scratch SEGMENT looks compact after opening, but the scratch
+        it belongs to continues beyond the segment at similar thickness; debris
+        ends where it ends (a blob ON a thin line only continues thinly).  Look
+        40 px left and right of the bbox: if the dark rows there amount to at
+        least half the candidate's thickness, this is scratch structure."""
+        need = max(2, h // 2)
+        for x0, x1 in ((max(0, x - 40), x), (x + w, min(img_w, x + w + 40))):
+            if x1 - x0 < 15:
+                continue                 # at the frame edge — can't judge this side
+            strip = dark_mask[y:y + h, x0:x1]
+            rows = int((strip.sum(axis=1) / 255 >= 8).sum())
+            if rows >= need:
+                return True
+        return False
+
+    # Pass B — SOLID BLOBS: an ellipse opening erases thin lines and fibres in
+    # any direction but a compact chunk keeps its core.  The floor is a real
+    # chunk size (≥1200 px² ≈ 20 px radius) so knots where thick scratches
+    # overlap don't read as debris; elongated remnants drop via elongation; a
+    # remnant whose structure continues past its ends is a scratch segment.
+    blob_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    blob_mask = cv2.morphologyEx(dark_mask, cv2.MORPH_OPEN, blob_kernel)
+    contours, _ = cv2.findContours(blob_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    for cnt in contours:
+        area = cv2.contourArea(cnt)      # outer contour → holes don't shrink it
+        if area < max(blob_min_area, 1200):
+            continue
+        if _elongation(cnt) >= _ASPECT_LINE_MIN:
+            continue
+        bx, by, bw, bh = cv2.boundingRect(cnt)
+        if _line_continues(bx, by, bw, bh):
+            continue                     # thick scratch segment → sample structure
+        cnt_mask = np.zeros(gray.shape, np.uint8)
+        cv2.drawContours(cnt_mask, [cnt], -1, 255, -1)
+        if not _dark_enough(cnt_mask):
+            continue
+        worst_blob_frac = max(worst_blob_frac, area / img_pixels)
+
+    # Pass C — BIG DEBRIS RIDING ON A SCRATCH: when a chunk sits on a line of
+    # comparable mask thickness, Pass B's opening reconnects them into one
+    # elongated contour and the chunk is dropped as "line".  A hard erosion
+    # with NO re-dilation kills any line ≤14 px thick outright, so only the
+    # chunk's core is left standing, wherever it sits.
+    core_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+    core_mask = cv2.erode(dark_mask, core_kernel)
+    contours, _ = cv2.findContours(core_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    for cnt in contours:
+        if cv2.contourArea(cnt) < 250:   # core of a ≥~36 px chunk after the −7 px rim
+            continue
+        if _elongation(cnt) >= _ASPECT_LINE_MIN:
+            continue                     # thick smear core → sample structure
+        # measure the chunk at (roughly) its true extent: re-dilate just this core
+        cm = np.zeros(gray.shape, np.uint8)
+        cv2.drawContours(cm, [cnt], -1, 255, -1)
+        cm = cv2.dilate(cm, core_kernel)
+        if not _dark_enough(cm):
+            continue
+        area = float((cm > 0).sum())
+        worst_blob_frac = max(worst_blob_frac, area / img_pixels)
 
     blob_bad      = worst_blob_frac > 0.0005
     blob_bad_conf = round(min(worst_blob_frac / 0.005, 1.0), 4)
 
-    # ── Check 3: FFT residual ─────────────────────────────────────────────────
-    fft_ratio = _fft_residual_ratio(gray)
+    # ── Check 2: FFT residual, localised ─────────────────────────────────────
+    fft_ratio, residual = _fft_residual_ratio(gray)
+    localised = _residual_localisation(residual) >= _FFT_LOC_MIN
 
-    fft_certain  = fft_ratio > fft_gate
-    fft_bad      = fft_ratio > _FFT_RESIDUAL_BAD
+    fft_certain  = fft_ratio > fft_gate and localised
+    fft_bad      = fft_ratio > _FFT_RESIDUAL_BAD and localised
     fft_bad_conf = round(
         min((fft_ratio - _FFT_RESIDUAL_BAD) / (1.0 - _FFT_RESIDUAL_BAD), 1.0), 4
     ) if fft_bad else 0.0

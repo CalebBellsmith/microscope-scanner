@@ -365,58 +365,62 @@ def _detect_accurate(rgb: np.ndarray):
     """
     Independent, accuracy-first scratch detector (no MATLAB constraint).
 
-    Strategy — measure only genuine HORIZONTAL scratches and reject the
-    artefacts the scanner already knows about (round specs, grey dots/halos,
-    non-horizontal fibres/blobs):
+    Strategy — measure only genuine HORIZONTAL scratches, measure them to their
+    FULL faint extent, and reject the artefacts the scanner already knows about
+    (round specs, dust chains, grey halos, substrate texture, diagonal rig
+    artefacts):
 
-      1. Estimate the bright background and take each pixel's DARKNESS below it
-         (scratches are darker than the slide).  Working on local darkness makes
-         detection robust to uneven lighting.
-      2. Threshold by CONTRAST (darkness vs. background noise) — soft grey
-         halos are low-contrast and fall out here.
-      3. Morphologically OPEN with a horizontal line element — only pixels that
-         belong to a horizontal run survive, erasing round specs/dust and
-         vertical/diagonal features.
-      4. Keep dark components that overlap a horizontal seed AND look like a
-         line, not a blob.  Tuned against the 20-set / 2,400-image legacy
-         corpus (visual defect study):
-           - length >= 18 px          (dust specks/clusters are shorter)
-           - aspect (w/h) >= 2.6      (dots and dot-pairs are ~1:1)
-           - if thicker than 12 px, aspect must be >= 4 (smudges/halos)
-         Their dark-pixel area is the scratch area.
+      1. Estimate the bright background (large morphological close) and work on
+         each pixel's DARKNESS below it — robust to uneven lighting.
+      2. STRONG pass (confirmation): threshold at mean + 1.0*std, open with a
+         horizontal line element, and gate components like a line, not a blob
+         (length >= 18 px, aspect >= 2.6; thick components need a wide seed run
+         — the comet-smear exception).  These are the confirmed scratch CORES.
+      3. HYSTERESIS (full extent): threshold again at a weaker mean + 0.45*std.
+         A weak component is accepted when it contains a confirmed core — the
+         faint tails and gaps of a real scratch are connected to its dark core,
+         so the scratch is measured end-to-end instead of only its darkest
+         fragments (fixes systematic under-measurement).  If the weak extent
+         degenerates into a blob (grain flood / merger with junk) the scratch
+         falls back to its strong core instead of being dropped.
+      4. FAINT-STREAK pass (matched filter): a horizontal running mean of the
+         darkness image boosts faint horizontal lines ~5x in SNR while diluting
+         dust dots and diagonals.  Long/thin components of the smoothed map are
+         accepted only if their median per-column peak darkness clears a
+         texture-adaptive gate max(22, mean + 1.5*std) — real faint streaks are
+         consistently darker than grain, chance dust-dot chains are not.
+      5. Union of all accepted pixels is re-labelled so touching pieces merge
+         into single scratches; each final component is one scratch.
 
+    Tuned and visually verified against the 30-set (glass + PET) corpus.
     Returns (area, count, objects, outlines).
     """
     import cv2
     grey = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
-    H, W = grey.shape
 
     # 1. Background (bright) via a large morphological close, then darkness below it
     bg_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (31, 31))
     background = cv2.morphologyEx(grey, cv2.MORPH_CLOSE, bg_kernel)
     darkness   = cv2.subtract(background, grey)          # >0 where darker than bg
 
-    # 2. Contrast threshold — grey halos / gradients are weak here and excluded
     d_mean, d_std = float(darkness.mean()), float(darkness.std())
-    thr = max(8.0, d_mean + 1.0 * d_std)
-    dark_mask = (darkness > thr).astype(np.uint8)
+    thr_hi = max(8.0, d_mean + 1.0 * d_std)
+    thr_lo = max(5.0, d_mean + 0.45 * d_std)
+    strong = (darkness > thr_hi).astype(np.uint8)
+    weak   = (darkness > thr_lo).astype(np.uint8)
 
-    # 3. Horizontal seeds — open with a wide-short element to keep only h-runs
-    h_kernel   = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 1))
-    horiz_seed = cv2.morphologyEx(dark_mask, cv2.MORPH_OPEN, h_kernel)
+    # 2. Strong pass — confirmed scratch cores (gates as before)
+    h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 1))
+    seed = cv2.morphologyEx(strong, cv2.MORPH_OPEN, h_kernel)
 
-    # 4. Keep dark components that are horizontal scratches
-    n, labels, stats, _ = cv2.connectedComponentsWithStats(dark_mask, connectivity=8)
-    area = 0
-    count = 0
-    objs = []
-    outlines = []
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(strong, connectivity=8)
+    core_ids = []
     for i in range(1, n):
         x, y, w, h, a = stats[i]
         if a < 30 or w < 18:             # tiny specks / too short to be a line
             continue
         comp = labels[y:y + h, x:x + w] == i
-        if not horiz_seed[y:y + h, x:x + w][comp].any():
+        if not seed[y:y + h, x:x + w][comp].any():
             continue                     # no horizontal core → spec / blob / halo
         aspect = w / max(h, 1)
         if aspect < 2.6:                 # dots & merged dot-pairs are ~1:1
@@ -425,19 +429,65 @@ def _detect_accurate(rgb: np.ndarray):
             # Thick and squat — usually a smudge/halo blob.  EXCEPTION: dense
             # abrasion smears ("comet" gouges, PET sets) are thick too, but
             # unlike dust/smudges they contain long horizontal streak runs.
-            # Accept when some row of the component carries a wide seed run.
-            seed_in = horiz_seed[y:y + h, x:x + w].astype(bool) & comp
+            seed_in = seed[y:y + h, x:x + w].astype(bool) & comp
             if int(seed_in.sum(axis=1).max()) < 40:
                 continue
+        core_ids.append(i)
+    core_mask = np.isin(labels, core_ids)
+
+    # 3. Hysteresis — weak components that extend a confirmed core
+    nw, labw, stw, _ = cv2.connectedComponentsWithStats(weak, connectivity=8)
+    core_labels = np.unique(labw[core_mask]) if core_mask.any() else np.array([], int)
+    union = np.zeros(weak.shape, bool)
+    for j in (int(v) for v in core_labels if v != 0):
+        x, y, w, h, a = stw[j]
+        comp = labw == j
+        if h > 40 and w / max(h, 1) < 3.0:
+            # weak extent became a blob (grain flood / merged with junk):
+            # keep the confirmed strong core only, never drop the scratch
+            union |= comp & core_mask
+        else:
+            union |= comp
+
+    # 4. Faint-streak pass — matched filter for faint horizontal lines
+    sm = cv2.blur(darkness.astype(np.float32), (25, 1))
+    thr_f = max(2.5, float(sm.mean()) + 1.0 * float(sm.std()))
+    faint = (sm > thr_f).astype(np.uint8)
+    faint = cv2.morphologyEx(faint, cv2.MORPH_CLOSE,
+                             cv2.getStructuringElement(cv2.MORPH_RECT, (11, 1)))
+    nf, labf, stf, _ = cv2.connectedComponentsWithStats(faint, connectivity=8)
+    med_gate = max(22.0, d_mean + 1.5 * d_std)   # texture-adaptive darkness gate
+    for k in range(1, nf):
+        x, y, w, h, a = stf[k]
+        if w < 45 or h > 10 or a < 60 or w / max(h, 1) < 6.0:
+            continue
+        compb = labf[y:y + h, x:x + w] == k
+        d = darkness[y:y + h, x:x + w].astype(np.float32).copy()
+        d[~compb] = 0
+        # real faint line: consistently darker than grain along its whole run;
+        # chance dust-dot chain: only spikes at the dots
+        if float(np.median(d.max(axis=0))) < med_gate:
+            continue
+        union |= labf == k
+
+    # 5. Final recount on the union — touching pieces merge into one scratch
+    nu, labu, stu, _ = cv2.connectedComponentsWithStats(
+        union.astype(np.uint8), connectivity=8)
+    area = 0
+    count = 0
+    objs = []
+    outlines = []
+    for m in range(1, nu):
+        x, y, w, h, a = stu[m]
         area += int(a)
         count += 1
         objs.append({"scratch_num": count, "width_px": int(h),
                      "length_px": int(w), "area_px": int(a)})
-        # outline for the overlay (contour of this component)
-        cm = (labels == i).astype(np.uint8)
+        # outline for the overlay (largest contour of this component)
+        cm = (labu == m).astype(np.uint8)
         cnts, _ = cv2.findContours(cm, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if cnts:
-            c = cnts[0][:, 0, :]
+            c = max(cnts, key=cv2.contourArea)[:, 0, :]
             outlines.append((count, np.column_stack([c[:, 1], c[:, 0]]).astype(float)))
 
     return area, count, objs, outlines
@@ -1103,6 +1153,9 @@ class AnalysisPipeline:
                         if (f.endswith(".jpg") or f.endswith(".png"))
                         and not f.endswith("_overlay.png")
                         and f not in processed
+                        # Frames the autofocus gave up on are saved as
+                        # NNN_soft.jpg for the record — never analysed.
+                        and "_soft" not in f
                         # Analysis-only mode: process ONLY the numbered capture
                         # frames 000..030, nothing else.  (Live/"both" capture
                         # writes its own frames, so no need to filter there.)

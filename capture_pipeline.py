@@ -56,9 +56,9 @@ class CapturePipeline:
                  output_dir, set_name, leg,
                  rows, cols, x_spacing, y_spacing,
                  quality_threshold=0.5,
-                 review_mode="none", review_fn=None, blur_threshold=2500.0,
+                 review_mode="none", review_fn=None, blur_threshold=3000.0,
                  good_dir=None, bad_dir=None,
-                 z_step=200, z_range=2000, z_dir=1, nudge_scale=0.4,
+                 z_step=300, z_range=10000, nudge_scale=0.4,
                  on_progress=None, on_frame=None, on_done=None, on_error=None):
         """
         camera            : camera object (ToupTekCamera / OpenCVCamera)
@@ -88,9 +88,13 @@ class CapturePipeline:
         good_dir / bad_dir: if set, reviewed frames are copied here (kept→good,
                             rejected→bad) to grow the ML training dataset.
         z_step / z_range  : autofocus half-steps per probe, and the max ± travel
-                            the search may span (safety bound against runaway).
-        z_dir             : +1 or −1 — which firmware Z direction is "into focus"
-                            (set at calibration; the search probes both ways).
+                            the search may span.  The Z axis is a continuous
+                            roller with no hard travel limit, so z_range is only
+                            a runaway guard — the search normally stops itself
+                            at the focus peak.  Which direction is "into focus"
+                            is discovered by probing (never configured): each
+                            search remembers its winning direction and probes
+                            that way first on the next field.
         on_progress(done, total) : called after each image is captured
         on_frame(frame)          : called with each saved frame (for GUI display)
         on_done()                : called when all images have been captured
@@ -112,8 +116,11 @@ class CapturePipeline:
         self._bad_dir     = bad_dir
         self._z_step      = int(z_step)
         self._z_range     = int(z_range)
-        self._z_dir       = 1 if int(z_dir) >= 0 else -1
+        self._z_dir       = 1       # preferred FIRST-probe direction — re-learned
+                                    # from every search's winner, never configured
         self._z_disabled  = False   # set if the Z stepper doesn't respond (no HW)
+        self._last_soft   = False   # last keeper still soft after escalation →
+                                    # saved with a _soft filename tag
         self._nudge_scale = float(nudge_scale)   # defect-avoidance jump strength
         self._on_progress = on_progress or (lambda done, total: None)
         self._on_frame    = on_frame    or (lambda img: None)
@@ -146,6 +153,12 @@ class CapturePipeline:
     # the (long-exposure) photo is taken.  Raise if photos still look smeared;
     # lower to shave time once you know the stage settles quickly.
     SETTLE_S = 0.5
+
+    # Autofocus escalation: when the normal search's best frame is still below
+    # the blur threshold, retry once with wider probes over the full roller
+    # range (the Z axis is continuous — 10000 is a runaway guard, not a limit).
+    ESCALATE_MULT  = 3
+    ESCALATE_RANGE = 10000
 
     @staticmethod
     def _rung_start(row):
@@ -206,7 +219,15 @@ class CapturePipeline:
                     frame = self._acquire_keeper()
                     if frame is not None:
                         img_num = row * cols + col + 1   # positional filename
-                        path = os.path.join(self._out, f"{img_num:03d}.jpg")
+                        # A field that stayed soft even after the escalated
+                        # focus search is saved for the record but tagged, so
+                        # analysis (which only accepts pure NNN names) skips it.
+                        tag = "_soft" if self._last_soft else ""
+                        path = os.path.join(self._out, f"{img_num:03d}{tag}.jpg")
+                        if tag:
+                            print(f"[capture] image {img_num:03d} still out of "
+                                  f"focus after escalated search — saved as "
+                                  f"{os.path.basename(path)} (excluded from analysis)")
                         self._save(frame, path)
                         self._on_frame(frame)
 
@@ -259,8 +280,8 @@ class CapturePipeline:
     # stays flat for sharp frames — the old E/c² over-punished dark scratches.
     # _SPEC_SCALE aligns the spec-fallback range with the scratch-tier range
     # so ONE threshold serves both.  In-focus frames read ≈4000-8000, soft
-    # ones ≲2100 — default GUI threshold 2500 (flags ~1.5% of the archive,
-    # all visually degraded/soft).
+    # ones ≲2100 — default GUI threshold 3000 (bench-tested; sits in the wide
+    # gap between the soft and sharp score bands).
     _FOCUS_SCALE = 10.0
     _SPEC_SCALE  = 0.76
 
@@ -296,7 +317,8 @@ class CapturePipeline:
         mask = cv2.dilate(mask, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)))
         return mask, darkness.astype(np.float64)
 
-    def _focus_score(self, frame) -> float:
+    @classmethod
+    def _focus_score(cls, frame) -> float:
         """
         Two-tier focus score, higher = sharper.
 
@@ -322,14 +344,14 @@ class CapturePipeline:
         """
         import cv2
         gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
-        mask, darkness = self._horizontal_scratch_mask(gray)
+        mask, darkness = cls._horizontal_scratch_mask(gray)
         sel = mask > 0
-        if int(sel.sum()) >= self._FOCUS_MIN_PIXELS:
+        if int(sel.sum()) >= cls._FOCUS_MIN_PIXELS:
             contrast = float(darkness[sel].mean()) + 1e-6
-            if contrast >= self._FOCUS_MIN_CONTRAST:
+            if contrast >= cls._FOCUS_MIN_CONTRAST:
                 gy = cv2.Sobel(gray.astype(np.float64), cv2.CV_64F, 0, 1, ksize=3)
                 edge_energy = float((gy[sel] ** 2).mean())
-                return self._FOCUS_SCALE * edge_energy / contrast
+                return cls._FOCUS_SCALE * edge_energy / contrast
 
         # Spec fallback — small dark spots against a smooth local background.
         bg = cv2.morphologyEx(
@@ -338,14 +360,14 @@ class CapturePipeline:
         dk = cv2.subtract(bg, gray).astype(np.float64)
         thr = max(8.0, dk.mean() + 2.0 * dk.std())
         spots = dk > thr
-        if int(spots.sum()) < self._FOCUS_MIN_SPOTS:
+        if int(spots.sum()) < cls._FOCUS_MIN_SPOTS:
             return float("inf")
         g64 = gray.astype(np.float64)
         gx = cv2.Sobel(g64, cv2.CV_64F, 1, 0, ksize=3)
         gy = cv2.Sobel(g64, cv2.CV_64F, 0, 1, ksize=3)
         edge_energy = float(((gx ** 2 + gy ** 2)[spots]).mean())
         contrast = float(dk[spots].mean()) + 1e-6
-        return self._SPEC_SCALE * self._FOCUS_SCALE * edge_energy / contrast
+        return cls._SPEC_SCALE * cls._FOCUS_SCALE * edge_energy / contrast
 
     def _acquire_keeper(self):
         """
@@ -357,6 +379,7 @@ class CapturePipeline:
           manual    — always hand the frame to the operator.
           autofocus — if the frame is soft, drive Z to refocus and re-capture.
         """
+        self._last_soft = False             # set again only if autofocus gives up
         frame = self._best_frame()          # defect-nudge — ALWAYS
         if frame is None:
             return None
@@ -449,13 +472,17 @@ class CapturePipeline:
             there — so residual backlash in the final Z position doesn't hurt the
             image, it only sets the (nearby) start for the next field, which will
             re-focus itself anyway.
-          • Travel is hard-bounded to ±z_range as a runaway safety stop.
-          • If neither direction improves, we return to the start and keep the
-            original (best available) frame.
+          • The winning probe direction is remembered (self._z_dir) so the next
+            field's search tries the likely direction first — one probe saved
+            per field once the rig's Z sense is known.
+          • If the peak found is still below the blur threshold, the search
+            ESCALATES once: wider probes (×3 step) over the full ±ESCALATE_RANGE.
+            The Z axis is a continuous roller with no hard limit, so the range
+            bound is only a runaway guard.
+          • A field still soft after escalation is kept (best we have) but
+            flagged via self._last_soft, which tags the saved filename so
+            analysis skips it.
         """
-        step      = self._z_step
-        max_steps = max(1, self._z_range // max(step, 1))
-
         cur_z = 0                                   # net Z applied during this search
         s0    = self._focus_score(soft_frame)
         best_s, best_z = s0, 0
@@ -473,34 +500,44 @@ class CapturePipeline:
             f = self._wait_for_frame()
             return (float("-inf") if f is None else self._focus_score(f))
 
-        # Probe +dir; if that doesn't beat the start, probe −dir.
-        up = self._z_dir * step
-        s_up = score_at(up)
-        if s_up > best_s:
-            best_s, best_z, direction = s_up, up, self._z_dir
-        else:
-            dn = -self._z_dir * step
-            s_dn = score_at(dn)
-            if s_dn > best_s:
-                best_s, best_z, direction = s_dn, dn, -self._z_dir
+        def climb(step, bound, best_s, best_z):
+            """Probe one step each way from best_z (learned direction first),
+            then hill-climb the uphill way until a step stops improving.
+            Remembers the winning direction for the next search."""
+            up = best_z + self._z_dir * step
+            s_up = score_at(up)
+            if s_up > best_s:
+                best_s, best_z, direction = s_up, up, self._z_dir
             else:
-                go_to(0)                            # neither way better — restore
-                return self._best_frame()
+                dn = best_z - self._z_dir * step
+                s_dn = score_at(dn)
+                if s_dn > best_s:
+                    best_s, best_z, direction = s_dn, dn, -self._z_dir
+                else:
+                    return best_s, best_z          # neither way improves
+            self._z_dir = direction                # learned: probe here first next time
+            while not self._stop_event.is_set():
+                target = best_z + direction * step
+                if abs(target) > bound:            # runaway guard
+                    break
+                s = score_at(target)
+                if s > best_s:
+                    best_s, best_z = s, target
+                else:
+                    break                          # passed the peak
+            return best_s, best_z
 
-        # Hill-climb in the winning direction until a step stops improving.
-        steps = 1
-        while steps < max_steps and not self._stop_event.is_set():
-            target = best_z + direction * step
-            if abs(target) > self._z_range:         # safety bound
-                break
-            s = score_at(target)
-            if s > best_s:
-                best_s, best_z = s, target
-                steps += 1
-            else:
-                break                               # passed the peak
+        best_s, best_z = climb(self._z_step, self._z_range, best_s, best_z)
 
+        # Still soft?  Escalate once: wider probes, full roller range.  Catches
+        # fields whose focus peak lies beyond the normal search's reach.
+        if best_s < self._blur_thresh and not self._stop_event.is_set():
+            best_s, best_z = climb(self._z_step * self.ESCALATE_MULT,
+                                   self.ESCALATE_RANGE, best_s, best_z)
+
+        self._last_soft = best_s < self._blur_thresh
         # Settle at the best height and take the defect-nudged keeper there.
+        # (best_z is 0 when nothing improved — that restores the start height.)
         go_to(best_z)
         return self._best_frame()
 
@@ -665,3 +702,12 @@ def _centroid_nudge(frame: np.ndarray,
     nudge_y = int(NUDGE_SIGN_Y * dy_frac * y_spacing * NUDGE_SCALE)
 
     return nudge_x, nudge_y
+
+
+def focus_score(frame) -> float:
+    """
+    Module-level access to the two-tier focus metric (higher = sharper,
+    +inf = blank field with nothing to judge).  Used by the GUI's
+    Auto-calibrate tour, which scores frames without building a pipeline.
+    """
+    return CapturePipeline._focus_score(frame)
