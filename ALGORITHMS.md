@@ -261,6 +261,21 @@ just under it (one 304-px line missed by under 2 points). Length-as-evidence
 sidesteps the σ-inflation trap: you don't need a frame-relative darkness argument
 for something that is provably too long and too straight to be noise.
 
+- **Ultra-faint route (third pass).** The `L = 51` filter is re-run at a *lower*
+  pixel threshold (`mean + 0.6σ`), accepting only runs **≥ 150 px long, ≤ 8 px
+  thin, aspect ≥ 18**, at a softer darkness gate `max(15, mean + 0.6σ)`. This
+  recovers the very faintest full-length scratches on badly abraded frames.
+  **The 150 px floor is a measured boundary, not a guess:** at this faintness,
+  candidate darkness on real scratches (medians 40–54) overlaps chance texture
+  ridges on *control-sample* PET (36–42) almost completely — darkness cannot
+  separate them — but the longest chance texture ridge measured on control PET
+  is **~127 px**. Length is therefore the only honest discriminator. Shorter
+  faint wisps are deliberately **not** counted: adding them was tested and put
+  ~10 false scratches on a control frame, and a false scratch on a control
+  corrupts the control-vs-treatment comparison the instrument exists to make.
+  This is a knowingly accepted floor (≲ 1% of frame area on the worst frames),
+  not an oversight.
+
 ### 2.4 Stage 4 — remove dust specs that touch scratches
 
 A spec sitting near or on a scratch is the hardest contaminant, because the weak
@@ -533,17 +548,19 @@ runtime varies with frame content.
 |---|---:|---:|---:|---|
 | **Focus detect** (`_focus_score`) | **≈ 32 ms** | 28–36 ms | ~31 | O(pixels) |
 | **Spec detect** (`_rule_predict`) | **≈ 50 ms** | 48–52 ms | ~20 | O(pixels) |
-| **Accurate analysis** (`_detect_accurate`) | **≈ 57 ms** | 41–65 ms | ~18 | O(pixels) + O(components) |
+| **Accurate analysis** (`_detect_accurate`) | **≈ 63 ms** | 47–71 ms | ~16 | O(pixels) + O(components) |
 | **Legacy analysis** (`_detect_legacy`) | **≈ 274 ms** | 225–362 ms | ~4 | O(columns × peaks) |
 
 Per-frame detail (median ms):
 
 | Frame | Focus | Spec | Accurate | Legacy |
 |---|---:|---:|---:|---:|
-| glass clean | 36 | 50 | 41 | 362 |
-| glass swarm | 31 | 49 | 62 | 225 |
-| PET textured | 28 | 52 | 59 | 262 |
-| PET failing | 33 | 48 | 65 | 247 |
+| glass clean | 36 | 50 | 47 | 362 |
+| glass swarm | 31 | 49 | 68 | 225 |
+| PET textured | 28 | 52 | 65 | 262 |
+| PET failing | 33 | 48 | 71 | 247 |
+
+(Accurate-mode times include the v6.1 ultra-faint third scan, ≈ +6 ms.)
 
 ### What these numbers mean in practice
 
@@ -555,11 +572,11 @@ Per-frame detail (median ms):
   Neither is a bottleneck; the scan is dominated by mechanical motion, not
   computation.
 
-- **Accurate mode is fast enough for interactive analysis.** ~57 ms/frame means a
+- **Accurate mode is fast enough for interactive analysis.** ~63 ms/frame means a
   full 30-frame leg analyses in under 2 seconds, and the whole 3,600-frame
-  archive in ~3.5 minutes single-threaded (well under a minute across 6 cores).
+  archive in ~4 minutes single-threaded (well under a minute across 6 cores).
 
-- **Legacy mode is the outlier, by design.** At ~274 ms it is ~5× slower than
+- **Legacy mode is the outlier, by design.** At ~274 ms it is ~4× slower than
   accurate mode. The cost is almost entirely the **per-column peak detection**:
   it calls `scipy.signal.find_peaks` **1,024 times per image** (once per column),
   a sequential Python loop. That is inherent to faithfully reproducing the MATLAB
@@ -573,7 +590,7 @@ Per-frame detail (median ms):
 - **Focus and spec detect are content-flat** (~±10%): they run a fixed set of
   whole-image operations (morphology, Sobel/FFT, one components pass) whose cost
   depends on pixel count, not on how many scratches are present.
-- **Accurate mode rises with clutter** (41 ms clean → 65 ms failing-PET): its
+- **Accurate mode rises with clutter** (47 ms clean → 71 ms failing-PET): its
   later stages iterate over *connected components*, and dirty/heavily-scratched
   frames have far more of them. Still bounded and modest.
 - **Legacy mode is *fastest* on the busiest frames** (362 ms clean → 225 ms
@@ -583,7 +600,7 @@ Per-frame detail (median ms):
   peak-finding loop, not the eventual scratch count.
 
 > Absolute times scale with CPU and image resolution; treat them as *relative*
-> guidance. The ratios (legacy ≈ 5× accurate; focus/spec cheap) hold regardless
+> guidance. The ratios (legacy ≈ 4× accurate; focus/spec cheap) hold regardless
 > of machine. To re-measure on the target hardware, time each entry point
 > (`_detect_legacy`, `_detect_accurate`, `_rule_predict`, `_focus_score`) on a
 > handful of real frames after one warm-up call.
