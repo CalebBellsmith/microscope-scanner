@@ -435,6 +435,37 @@ def _detect_accurate(rgb: np.ndarray):
         core_ids.append(i)
     core_mask = np.isin(labels, core_ids)
 
+    # 2b. Dust-dot excision: a spec TOUCHING a scratch gets bridged to it by
+    # the weak mask and would be swallowed into the scratch's extent by the
+    # hysteresis merge.  Classic dust dots — compact, roundish, solid strong
+    # components — are cut out of the weak mask first so they detach.  The
+    # excision test is HORIZONTAL CONTEXT, not shape alone: a dash inside a
+    # stippled scratch, or a dot the line passes straight through, has dark
+    # structure on BOTH flanks at its own rows and is left in place; an
+    # isolated spec (even one hanging off a line's side) has empty flanks.
+    img_w = weak.shape[1]
+    chain = cv2.morphologyEx(weak, cv2.MORPH_CLOSE,
+                             cv2.getStructuringElement(cv2.MORPH_RECT, (41, 1)))
+    dot_mask = np.zeros(weak.shape, np.uint8)
+    for i in range(1, n):
+        x, y, w, h, a = stats[i]
+        if not (30 <= a <= 400 and w <= 25 and h <= 25):
+            continue
+        if w / max(h, 1) >= 2.2 or a / float(w * h) < 0.45:
+            continue                                 # elongated / hollow → not a dot
+        lx0, lx1 = max(0, x - 20), max(0, x - 5)
+        rx0, rx1 = min(img_w, x + w + 5), min(img_w, x + w + 20)
+        both = ((chain[y:y + h, lx0:lx1].any(axis=1)) &
+                (chain[y:y + h, rx0:rx1].any(axis=1)))
+        if int(both.sum()) >= 2:
+            continue                                 # in a line/stipple chain → keep
+        comp = labels[y:y + h, x:x + w] == i
+        dot_mask[y:y + h, x:x + w][comp] = 1
+    if dot_mask.any():
+        dot_mask = cv2.dilate(dot_mask,
+                              cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)))
+        weak = weak & (1 - dot_mask)
+
     # 3. Hysteresis — weak components that extend a confirmed core
     nw, labw, stw, _ = cv2.connectedComponentsWithStats(weak, connectivity=8)
     core_labels = np.unique(labw[core_mask]) if core_mask.any() else np.array([], int)
@@ -449,26 +480,113 @@ def _detect_accurate(rgb: np.ndarray):
         else:
             union |= comp
 
-    # 4. Faint-streak pass — matched filter for faint horizontal lines
-    sm = cv2.blur(darkness.astype(np.float32), (25, 1))
-    thr_f = max(2.5, float(sm.mean()) + 1.0 * float(sm.std()))
-    faint = (sm > thr_f).astype(np.uint8)
-    faint = cv2.morphologyEx(faint, cv2.MORPH_CLOSE,
-                             cv2.getStructuringElement(cv2.MORPH_RECT, (11, 1)))
-    nf, labf, stf, _ = cv2.connectedComponentsWithStats(faint, connectivity=8)
-    med_gate = max(22.0, d_mean + 1.5 * d_std)   # texture-adaptive darkness gate
-    for k in range(1, nf):
-        x, y, w, h, a = stf[k]
-        if w < 45 or h > 10 or a < 60 or w / max(h, 1) < 6.0:
+    # 4. Faint-streak pass — matched filters for faint horizontal lines.
+    # Two acceptance routes per component:
+    #   • standard: length ≥ 45 with median per-column darkness above the
+    #     texture-adaptive gate max(22, mean + 1.5σ) — real faint lines are
+    #     consistently darker than grain, chance dust-dot chains only spike
+    #     at the dots;
+    #   • long-thin: a CONTINUOUS run ≥ 120 px that stays ≤ 10 px thin cannot
+    #     be chance texture (noise chains top out near 100 px), so it only
+    #     needs the softer gate max(25, mean + 1.0σ).  On heavily scratched
+    #     frames σ is inflated by the scratches themselves and the standard
+    #     gate over-adapts — this route is what still catches their faint
+    #     full-width lines.
+    # The second, longer filter (51 px) doubles the SNR boost for long lines,
+    # reaching streaks too faint for the 25 px filter; only the long-thin
+    # route applies at that scale.
+    med_gate  = max(22.0, d_mean + 1.5 * d_std)
+    thin_gate = max(25.0, d_mean + 1.0 * d_std)
+
+    def _faint_scan(filt_len, min_w, standard_route):
+        sm = cv2.blur(darkness.astype(np.float32), (filt_len, 1))
+        thr_f = max(2.5, float(sm.mean()) + 1.0 * float(sm.std()))
+        faint = (sm > thr_f).astype(np.uint8)
+        faint = cv2.morphologyEx(faint, cv2.MORPH_CLOSE,
+                                 cv2.getStructuringElement(cv2.MORPH_RECT, (11, 1)))
+        nf, labf, stf, _ = cv2.connectedComponentsWithStats(faint, connectivity=8)
+        add = np.zeros(darkness.shape, bool)
+        for k in range(1, nf):
+            x, y, w, h, a = stf[k]
+            if w < min_w or h > 10 or a < 60 or w / max(h, 1) < 6.0:
+                continue
+            compb = labf[y:y + h, x:x + w] == k
+            d = darkness[y:y + h, x:x + w].astype(np.float32).copy()
+            d[~compb] = 0
+            med = float(np.median(d.max(axis=0)))
+            if standard_route and w >= 45 and med >= med_gate:
+                add |= labf == k
+            elif w >= 120 and w / max(h, 1) >= 12.0 and med >= thin_gate:
+                add |= labf == k
+        return add
+
+    union |= _faint_scan(25, 45, standard_route=True)
+    union |= _faint_scan(51, 120, standard_route=False)
+
+    # 4b. Dot-bulge shave: a dust spec dark enough to FUSE with a thin scratch
+    # in the strong mask can't be excised as a component — it shows up as a
+    # short, fat bulge on an otherwise thin line: thickness spikes past
+    # max(2.5×, +8 px) the line's median over ≤ 34 columns (specs run up to
+    # ~30 px), with the line continuing ≥ 15 columns on BOTH sides.
+    # Comet-smear heads sit at the END of their scratch (and thick smear
+    # bodies have median thickness > 15), so they never match.
+    # The bulge is shaved back to the band spanned by the flanking columns.
+    nu0, labu0, stu0, _ = cv2.connectedComponentsWithStats(
+        union.astype(np.uint8), connectivity=8)
+    for m in range(1, nu0):
+        x, y, w, h, a = stu0[m]
+        if w < 60 or h < 12:
+            continue                                 # nothing to shave
+        comp = labu0[y:y + h, x:x + w] == m
+        thick = comp.sum(axis=0)
+        nz = thick > 0
+        if not nz.any():
             continue
-        compb = labf[y:y + h, x:x + w] == k
-        d = darkness[y:y + h, x:x + w].astype(np.float32).copy()
-        d[~compb] = 0
-        # real faint line: consistently darker than grain along its whole run;
-        # chance dust-dot chain: only spikes at the dots
-        if float(np.median(d.max(axis=0))) < med_gate:
-            continue
-        union |= labf == k
+        med_t = float(np.median(thick[nz]))
+        if med_t > 15:
+            continue                                 # thick body (smear/gouge)
+        bulge = thick > max(2.5 * med_t, med_t + 8.0)
+        c = 0
+        while c < w:
+            if not bulge[c]:
+                c += 1
+                continue
+            c1 = c
+            while c1 < w and bulge[c1]:
+                c1 += 1
+            if (c1 - c) <= 34 and c >= 15 and (w - c1) >= 15:
+                # reference band = MEDIAN row extent of the flanking columns,
+                # skipping the 3 nearest (the spec's halo bleeds into those,
+                # and a min/max band would stretch to the whole bulge)
+                ref = [np.nonzero(comp[:, rc])[0]
+                       for rc in list(range(max(0, c - 17), max(0, c - 3))) +
+                                 list(range(min(w, c1 + 3), min(w, c1 + 17)))
+                       if thick[rc] > 0]
+                if ref:
+                    y0 = int(np.median([r.min() for r in ref])) - 3
+                    y1 = int(np.median([r.max() for r in ref])) + 3
+                    rows = np.arange(comp.shape[0])[:, None]
+                    clip = comp[:, c:c1] & ((rows < y0) | (rows > y1))
+                    # only shave a genuine DOT: never sever the line (every
+                    # bulge column keeps band pixels), and the clipped region
+                    # must be ONE compact roundish blob — thickness wobble of
+                    # a real scratch clips as several thin slivers and is left
+                    # alone
+                    ok = clip.any() and not (
+                        ((comp[:, c:c1] & ~clip).sum(axis=0) == 0).any())
+                    if ok:
+                        ncl, _, scl, _ = cv2.connectedComponentsWithStats(
+                            clip.astype(np.uint8), connectivity=8)
+                        ok = ncl == 2
+                        if ok:
+                            _, _, cw, ch, ca = scl[1]
+                            ok = (cw <= 34 and ch <= 30 and ca >= 30
+                                  and ca / float(cw * ch) >= 0.35)
+                    if ok:
+                        gmask = np.zeros_like(comp)
+                        gmask[:, c:c1] = clip
+                        union[y:y + h, x:x + w] &= ~gmask
+            c = c1
 
     # 5. Final recount on the union — touching pieces merge into one scratch
     nu, labu, stu, _ = cv2.connectedComponentsWithStats(
@@ -479,6 +597,9 @@ def _detect_accurate(rgb: np.ndarray):
     outlines = []
     for m in range(1, nu):
         x, y, w, h, a = stu[m]
+        if a < 30:
+            continue    # crumbs left by the dot shave — every gate upstream
+                        # already requires >= 30 px, so nothing real is lost
         area += int(a)
         count += 1
         objs.append({"scratch_num": count, "width_px": int(h),
