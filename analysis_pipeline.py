@@ -524,8 +524,8 @@ def _detect_accurate(rgb: np.ndarray):
                 add |= labf == k
         return add
 
-    union |= _faint_scan(25, 45, standard_route=True)
-    union |= _faint_scan(51, 120, standard_route=False)
+    faint_evid = _faint_scan(25, 45, standard_route=True)
+    faint_evid |= _faint_scan(51, 120, standard_route=False)
     # ULTRA-FAINT route: a lower pixel threshold (mean + 0.6σ) with the 51 px
     # filter, accepting ONLY very long, very thin, very straight runs
     # (>= 150 px, <= 8 px, aspect >= 18) at a softer darkness gate.  Measured
@@ -536,7 +536,8 @@ def _detect_accurate(rgb: np.ndarray):
     # substrate's own texture and is deliberately NOT counted — a false
     # scratch on a control sample corrupts the control-vs-treatment
     # comparison this instrument exists to make.
-    union |= _faint_scan(51, 150, standard_route=False, thr_k=0.6, ultra_only=True)
+    faint_evid |= _faint_scan(51, 150, standard_route=False, thr_k=0.6, ultra_only=True)
+    union |= faint_evid
 
     # 4b. Dot-bulge shave: a dust spec dark enough to FUSE with a thin scratch
     # in the strong mask can't be excised as a component — it shows up as a
@@ -603,6 +604,28 @@ def _detect_accurate(rgb: np.ndarray):
                         union[y:y + h, x:x + w] &= ~gmask
             c = c1
 
+    # 4c. Halo trim: a DARK line carries a wide optical/JPEG blur skirt, and
+    # the absolute weak threshold wades into it — on soft-optics PET frames
+    # the counted mask ran several px wider than the visible line (operator-
+    # verified at 5x zoom).  Trim RELATIVELY: within each scratch, per column,
+    # drop pixels fainter than a quarter of that column's own peak darkness.
+    # Quarter-max sits between strict half-max (FWHM) width and the full
+    # skirt — where the visible edge is.  Faint lines (peak ≈ threshold) are
+    # untouched, so this cannot undo the faint-extent recovery; and since
+    # every column keeps its peak, no scratch loses length or connectivity.
+    nu0, labu0, stu0, _ = cv2.connectedComponentsWithStats(
+        union.astype(np.uint8), connectivity=8)
+    dark_f = darkness.astype(np.float32)
+    for m in range(1, nu0):
+        x, y, w, h, a = stu0[m]
+        comp = labu0[y:y + h, x:x + w] == m
+        d = dark_f[y:y + h, x:x + w].copy()
+        d[~comp] = 0
+        floor = 0.25 * d.max(axis=0)
+        halo = comp & (d < floor[None, :])
+        if halo.any():
+            union[y:y + h, x:x + w] &= ~halo
+
     # 5. Final recount on the union — touching pieces merge into one scratch
     nu, labu, stu, _ = cv2.connectedComponentsWithStats(
         union.astype(np.uint8), connectivity=8)
@@ -610,11 +633,20 @@ def _detect_accurate(rgb: np.ndarray):
     count = 0
     objs = []
     outlines = []
+    evid = core_mask | faint_evid
     for m in range(1, nu):
         x, y, w, h, a = stu[m]
         if a < 30:
             continue    # crumbs left by the dot shave — every gate upstream
                         # already requires >= 30 px, so nothing real is lost
+        comp = labu[y:y + h, x:x + w] == m
+        # a final piece must carry its own EVIDENCE (a confirmed core or a
+        # faint-route detection) or at least be shaped like a line — halo
+        # pads that only rode along with a scratch and were separated by the
+        # halo trim have neither, and are not scratches
+        if not evid[y:y + h, x:x + w][comp].any():
+            if w / max(h, 1) < 3.0 or a < 60:
+                continue
         area += int(a)
         count += 1
         objs.append({"scratch_num": count, "width_px": int(h),
