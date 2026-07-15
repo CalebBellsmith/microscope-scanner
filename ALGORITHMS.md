@@ -6,7 +6,7 @@ over the alternatives. It is the reference behind the code, not a substitute for
 it: where a constant matters, the value is given, but the source of truth is the
 file named in each section.
 
-The system has four independent algorithmic subsystems:
+The system has five independent algorithmic subsystems:
 
 | Subsystem | File | Job |
 |---|---|---|
@@ -16,7 +16,7 @@ The system has four independent algorithmic subsystems:
 | **Focus** | `capture_pipeline.py` (`_focus_score`, `_autofocus_search`) | Decide if a frame is sharp, and drive Z to make it sharp |
 | **Defect / spec classifier** | `ml_inference.py` (`_rule_predict`) | Decide if a frame has avoidable debris worth nudging away from |
 
-Per-image runtimes for all four are in [§6 Performance](#6-performance--how-fast-each-algorithm-runs).
+Per-image runtimes are in [§6 Performance](#6-performance--how-fast-each-algorithm-runs).
 
 A recurring idea ties them together, so it is worth stating once up front.
 
