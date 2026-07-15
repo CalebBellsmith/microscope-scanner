@@ -345,14 +345,44 @@ Three properties make the trim safe:
 Corpus impact: −15% mean leg area (−6 to −23%), counts stable — a pure
 thickness correction, not a sensitivity change.
 
-### 2.6 Stage 5 — recount
+
+### 2.6 Stage 4d — horizontal-only: reject diagonals, verticals and curves
+
+Only **horizontal** marks are abrasion on this rig; diagonal and curved marks
+are handling damage. The per-component gates (aspect, seed) reject a diagonal
+that stands alone — but a diagonal **attached to or crossing** a real
+horizontal scratch rides into the count as part of that component. Operator
+review caught exactly this (a curved handling scratch outlined on a PET frame).
+
+Three layers remove non-horizontal structure without touching real lines:
+
+1. **Pixel filter**: keep only pixels belonging to horizontal runs — close
+   (11×1) first so stippled dashes fuse into their line, open (15×1) so only
+   ≥ 15 px runs survive, then a small dilation so the trimmed line keeps its
+   edges. Geometry does the work: a genuine scratch at a slight slope still
+   forms long row-runs (a 4 px line at 5° has ~45 px runs); anything steeper
+   than ~15° falls apart into short row-segments and is erased. Comet-smear
+   heads are wide on every row, so they are untouched.
+2. **Orientation gate**: small final pieces (< 400 px) must actually lie
+   horizontal — principal-axis angle ≤ 25°. Remnants of curves tilt 30–70°.
+3. **Squat/loop gate**: (< 150 px & aspect < 2.2) or (< 400 px & aspect < 1.8)
+   drops loops and pads that have no meaningful axis at all.
+
+Verified on the hardest case (an S-shaped curve crossing two counted lines):
+body, fragments and loop all rejected, the crossing lines stay fully traced.
+Known residue, accepted deliberately: the ~100 px knot where a curve crosses
+a counted line (inseparable without damaging the line) and locally-horizontal
+micro-segments of a curve (indistinguishable from a real tiny scratch without
+global curve tracing) — < 0.5 % of frame area on the worst frame.
+
+### 2.7 Stage 5 — recount
 
 Union all accepted pixels and re-label with 8-connectivity, so touching pieces
 merge into single scratches. Components below 30 px (crumbs left by the shave)
 are dropped — every upstream gate already required ≥ 30 px, so nothing real is
 lost. Each surviving component is one scratch; its pixel count is its area.
 
-### 2.7 How it was validated
+### 2.8 How it was validated
 
 A fixed panel of 12 deliberately hard "sentinel" frames (dense swarm, noise-only,
 sparse-faint, heavy-dust, stippled wiper, textured PET, diagonals+smears, comet
