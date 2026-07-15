@@ -626,6 +626,26 @@ def _detect_accurate(rgb: np.ndarray):
         if halo.any():
             union[y:y + h, x:x + w] &= ~halo
 
+    # 4d. Horizontal-structure filter: only HORIZONTAL marks are abrasion —
+    # diagonal/vertical branches (curved handling scratches, diagonal tails)
+    # can ride into the count attached to a real horizontal scratch, since
+    # component gates judge the component as a whole.  Keep only pixels that
+    # belong to horizontal runs: close (11,1) first so stippled dashes fuse
+    # into their line, open (15,1) so only >=15 px runs survive, then dilate
+    # a little so the kept line retains its trimmed edges.  Geometry note:
+    # a genuine scratch with a slight slope still forms long row-runs
+    # (a 4 px line at 5 deg has ~45 px runs); anything steeper than ~15 deg
+    # falls apart into short row-segments and is erased — which is the rig's
+    # definition of "not abrasion".  Comet-smear heads are wide every row,
+    # so they are untouched.
+    u8 = union.astype(np.uint8)
+    hruns = cv2.morphologyEx(u8, cv2.MORPH_CLOSE,
+                             cv2.getStructuringElement(cv2.MORPH_RECT, (11, 1)))
+    hruns = cv2.morphologyEx(hruns, cv2.MORPH_OPEN,
+                             cv2.getStructuringElement(cv2.MORPH_RECT, (15, 1)))
+    hruns = cv2.dilate(hruns, cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5)))
+    union &= hruns.astype(bool)
+
     # 5. Final recount on the union — touching pieces merge into one scratch
     nu, labu, stu, _ = cv2.connectedComponentsWithStats(
         union.astype(np.uint8), connectivity=8)
@@ -640,6 +660,21 @@ def _detect_accurate(rgb: np.ndarray):
             continue    # crumbs left by the dot shave — every gate upstream
                         # already requires >= 30 px, so nothing real is lost
         comp = labu[y:y + h, x:x + w] == m
+        # small squat pieces are never scratches — they are what remains of a
+        # diagonal/curve after the horizontal filter (fragments, loops), or a
+        # separated pad; real scratch fragments are wider than tall
+        aspect = w / max(h, 1)
+        if (a < 150 and aspect < 2.2) or (a < 400 and aspect < 1.8):
+            continue
+        # small pieces must also LIE horizontal: remnants of curved/diagonal
+        # marks have a steep principal axis, real scratch fragments ~0°
+        if a < 400:
+            ys, xs = np.nonzero(comp)
+            xs = xs - xs.mean(); ys = ys - ys.mean()
+            theta = 0.5 * np.arctan2(2 * (xs * ys).mean(),
+                                     (xs * xs).mean() - (ys * ys).mean())
+            if abs(np.degrees(theta)) > 25.0:
+                continue
         # a final piece must carry its own EVIDENCE (a confirmed core or a
         # faint-route detection) or at least be shaped like a line — halo
         # pads that only rode along with a scratch and were separated by the
