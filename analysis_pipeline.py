@@ -1201,17 +1201,50 @@ def collect_sets(parent_dir: str) -> list:
     return sets
 
 
+def _cgroup_key(name: str) -> str:
+    """Leading C-token of a set name ('C39_a_b' → 'C39'); full name if none."""
+    import re
+    m = re.match(r"\s*(C\d+)", name or "", re.IGNORECASE)
+    return m.group(1).upper() if m else (name or "")
+
+
+def _group_by_cgroup(per_set: list) -> list:
+    """Bucket per_set entries by C-group, ordered by numeric C value.
+
+    per_set entries are (name, leg_means, avg, std_legs); returns a list of
+    (group_key, [entries…]) with C-numbered groups sorted ascending and any
+    non-matching names appended in first-seen order.
+    """
+    import re
+    order, buckets = [], {}
+    for entry in per_set:
+        k = _cgroup_key(entry[0])
+        if k not in buckets:
+            buckets[k] = []
+            order.append(k)
+        buckets[k].append(entry)
+
+    def sort_key(k):
+        m = re.match(r"C(\d+)$", k)
+        return (0, int(m.group(1))) if m else (1, k)
+
+    order.sort(key=sort_key)
+    return [(k, buckets[k]) for k in order]
+
+
 def write_summarize_format(parent_dir: str, sets: list, out_path: str = None) -> str:
     """
     Combine many sets into one workbook mirroring the C8 'Data set' layout:
       • a horizontal block per set — raw per-image areas (BL/BR/FL/FR) → descStats
         → ANOVA table → pairwise comparisons;
-      • two summary tables underneath — Film leg-means with per-set Average and
-        STDEV of Legs plus aggregate Average/STDEV/RANGE, then an identical
-        'Outliers Removed' copy where outlier cells are FLAGGED RED (never
-        deleted): a leg cell is flagged if its mean lies outside the pooled
-        leg-mean mean ± 1.96·stdev, and an Average cell if the set average lies
-        outside the set-average mean ± 1.96·stdev.
+      • a second 'By C-group' tab — for each C-group (sets sharing a leading
+        C-token, e.g. "C39", "C51") a pair of Film summary tables: leg-means with
+        per-set Average and STDEV of Legs plus aggregate Average/STDEV/RANGE, then
+        an identical 'Outliers Removed' copy where outlier cells are FLAGGED RED
+        (never deleted).  A leg cell is flagged if its mean lies outside that
+        group's leg-mean mean ± 1.96·stdev, and an Average cell if the set average
+        lies outside the group's set-average mean ± 1.96·stdev — so each sample is
+        judged against its own replicates, not the whole run.
     Returns the written path.
     """
     import datetime
@@ -1232,14 +1265,17 @@ def write_summarize_format(parent_dir: str, sets: list, out_path: str = None) ->
     ws = wb.active
     ws.title = "S1"
 
-    def cell(r, c, value, *, bold=False, fill=None, box=False, ctr=False, font=None):
-        x = ws.cell(row=r, column=c, value=value)
-        if bold:  x.font = HDR
-        if font:  x.font = font
-        if fill:  x.fill = fill
-        if box:   x.border = BOX
-        if ctr:   x.alignment = CTR
-        return x
+    def make_cell(target):
+        def cell(r, c, value, *, bold=False, fill=None, box=False, ctr=False, font=None):
+            x = target.cell(row=r, column=c, value=value)
+            if bold:  x.font = HDR
+            if font:  x.font = font
+            if fill:  x.fill = fill
+            if box:   x.border = BOX
+            if ctr:   x.alignment = CTR
+            return x
+        return cell
+    cell = make_cell(ws)
 
     # Metadata header (top-left, rows 1-3): fill the date; leave the rest blank.
     cell(1, 1, "Date Completed", bold=True)
@@ -1295,15 +1331,26 @@ def write_summarize_format(parent_dir: str, sets: list, out_path: str = None) ->
         std_legs = float(np.std(list(leg_means.values()), ddof=1)) if len(leg_means) > 1 else 0.0
         per_set.append((name, leg_means, avg, std_legs))
 
-    # ── Bottom: the two Film summary tables (below every top block) ─────────────
-    start_row = BLOCK_TOP + 3 + N_IMG + len(_desc_stats([0])) + 3 + 6 + 4
-    grand_row = _write_summary_table(
-        ws, start_row, "", per_set, legs_order,
-        cell, HDR, FILL_STAT, FILL_RED, FONT_RED, flag_outliers=False)
-
-    _write_summary_table(
-        ws, grand_row + 3, "Outliers Removed", per_set, legs_order,
-        cell, HDR, FILL_STAT, FILL_RED, FONT_RED, flag_outliers=True)
+    # ── Second tab: one Film summary pair per C-group ───────────────────────────
+    # The set name begins with a C-group token (e.g. "C39 …", "C51 …"); every set
+    # sharing that token is a replicate of the same group.  Each group gets its own
+    # plain + 'Outliers Removed' pair, and outliers are judged *within the group*
+    # (mean ± 1.96·stdev of that group's own leg-means / set-averages), so a single
+    # off sample stands out against its true replicates rather than the whole run.
+    ws2 = wb.create_sheet("By C-group")
+    cell2 = make_cell(ws2)
+    r2 = 1
+    for gname, gsets in _group_by_cgroup(per_set):
+        n = len(gsets)
+        cell2(r2, 1, f"{gname}  ({n} sample{'s' if n != 1 else ''})", bold=True)
+        r2 += 2
+        r2 = _write_summary_table(
+            ws2, r2, "", gsets, legs_order,
+            cell2, HDR, FILL_STAT, FILL_RED, FONT_RED, flag_outliers=False)
+        r2 = _write_summary_table(
+            ws2, r2 + 3, "Outliers Removed", gsets, legs_order,
+            cell2, HDR, FILL_STAT, FILL_RED, FONT_RED, flag_outliers=True)
+        r2 += 5
 
     out_path = out_path or os.path.join(
         parent_dir, f"{os.path.basename(os.path.abspath(parent_dir))}_summary.xlsx")
