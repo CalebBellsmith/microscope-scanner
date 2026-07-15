@@ -12,6 +12,7 @@ The system has four independent algorithmic subsystems:
 |---|---|---|
 | **Legacy analysis** | `analysis_pipeline.py` (`_detect_legacy`) | Reproduce the old MATLAB scratch numbers exactly, for continuity |
 | **Accurate analysis** | `analysis_pipeline.py` (`_detect_accurate`) | Measure genuine scratches as correctly as the optics allow |
+| **Defect-aware analysis** | `analysis_pipeline.py` (`_detect_defect_aware`) | Legacy's measurement and scale, with defects excluded from the count |
 | **Focus** | `capture_pipeline.py` (`_focus_score`, `_autofocus_search`) | Decide if a frame is sharp, and drive Z to make it sharp |
 | **Defect / spec classifier** | `ml_inference.py` (`_rule_predict`) | Decide if a frame has avoidable debris worth nudging away from |
 
@@ -167,6 +168,39 @@ The takeaway stated in the code: this is an **algorithm-to-algorithm** map
 there is **one unified calibration** and no per-substrate mode — a PET-only refit
 was tried and could not beat the unified fit even on its own data, so the extra
 mode would add complexity for no gain.
+
+
+### 1.4 Defect-aware mode — legacy's ruler, minus the defects
+
+A third analysis mode sits between the other two: **the legacy measurement
+with defects excluded.** It runs the exact MATLAB-faithful pipeline (§1.1) and
+keeps legacy's per-scratch width/length characterisation and calibrated scale,
+but applies one extra acceptance gate (`_defect_gate`) after the MATLAB gates:
+
+- **dots / specs / bubbles / blob chains** — too short (< 18 px) or too square
+  (aspect < 2.6; a bubble ring and a spec both sit near 1:1);
+- **smears / chunky drag marks** — thick AND squat (row-span > 12 px with
+  aspect < 4). Deliberately NO comet-smear exception here: accurate mode
+  counts smears by design, this mode excludes them by design;
+- **non-horizontal marks** — the component's principal axis must lie within
+  25° of horizontal, rejecting diagonals, verticals and steep curve segments
+  that MATLAB's row-span < column-span test lets by.
+
+**The calibration subtlety.** The linear calibration (§1.2) must see the same
+population it was fitted on — its count-hinge features encode the noise-
+squiggle regime, and feeding them *filtered* counts extrapolates (in testing,
+a noise-only frame's calibrated area went UP 11% after filtering). So the
+calibration always runs on the full MATLAB-accepted population, and the
+calibrated total is then scaled by the **raw-area fraction that survived the
+defect filter**. Two properties follow by construction: the number stays on
+legacy's scale, and defect-aware can never read higher than legacy on the
+same frame — the gap between the two columns IS the defect contamination.
+
+Validated against legacy on the sentinel panel: byte-identical legacy output
+(the refactor changed nothing), clean scratch frames within 0.7% of legacy,
+and the removals landing exactly where defects live — noise-only control
+−53%, diagonal-contaminated frame −21%, textured control −15%. Runtime is
+legacy's (~274 ms/frame): the same pipeline plus a per-component gate.
 
 ---
 

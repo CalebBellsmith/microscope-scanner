@@ -483,7 +483,9 @@ class MainWindow(QMainWindow):
         method_lay.setSpacing(3)
         self._method_combo = _NoScrollComboBox()
         self._method_combo.addItem("Legacy  (MATLAB-faithful)", "legacy")
-        self._method_combo.addItem("Accurate  (defect-aware)",  "accurate")
+        self._method_combo.addItem("Defect-aware  (legacy scale, defects excluded)",
+                                   "defect_aware")
+        self._method_combo.addItem("Accurate  (full-extent measurement)", "accurate")
         self._method_combo.currentIndexChanged.connect(self._on_method_changed)
         method_lay.addWidget(self._method_combo)
         self._method_hint = QLabel(
@@ -757,11 +759,18 @@ class MainWindow(QMainWindow):
     <p><b>Legacy</b> — reproduces the original MATLAB numbers (calibrated to
     within ~4% of them across 30 archived sets).  Use when you need continuity
     with historical data.</p>
-    <p><b>Accurate</b> — defect-aware detector: measures genuine horizontal
-    abrasion scratches (including dense "comet" smears) end-to-end — faint tails
-    and whole faint lines included — and rejects dust dots, dot-pairs, smudges,
-    substrate texture and diagonal handling marks.  Use for the truest scratch
-    area on a fresh sample.</p>
+    <p><b>Defect-aware</b> — the SAME measurement and scale as Legacy, but with
+    defects excluded from the count: no smears, no diagonal/vertical/curved
+    marks, no bubbles/dots/specs.  On a clean sample it reads ≈ Legacy; on a
+    dirty one it reads lower, and the gap between the two IS the defect
+    contamination.  Use when you want MATLAB-comparable numbers that only
+    count real horizontal scratches.</p>
+    <p><b>Accurate</b> — independent full-extent detector: measures genuine
+    horizontal abrasion scratches (including dense "comet" smears) end-to-end —
+    faint tails and whole faint lines included, blur halo excluded — and
+    rejects dust dots, dot-pairs, smudges, substrate texture and
+    diagonal/vertical/curved handling marks.  Its own scale (not MATLAB's).
+    Use for the truest scratch area on a fresh sample.</p>
 
     <h3>Review during capture (focus handling)</h3>
     <p>All four modes always run the <b>defect nudge</b> (a small stage move that
@@ -1071,8 +1080,16 @@ class MainWindow(QMainWindow):
         self._analysis_method = self._method_combo.currentData()
         if self._analysis_method == "accurate":
             self._method_hint.setText(
-                "Independent detector — measures only horizontal scratches, "
-                "rejecting specs, grey halos and non-horizontal defects."
+                "Independent detector — measures each horizontal scratch to "
+                "its full faint extent, rejecting specs, smears' halos and "
+                "non-horizontal defects.  Its own scale (not MATLAB's)."
+            )
+        elif self._analysis_method == "defect_aware":
+            self._method_hint.setText(
+                "Legacy measurement with defects excluded: no smears, no "
+                "diagonals/verticals/curves, no bubbles/dots/specs.  Same "
+                "scale as Legacy — reads slightly lower; the gap is the "
+                "defect contamination."
             )
         else:
             self._method_hint.setText(
@@ -1717,8 +1734,33 @@ class MainWindow(QMainWindow):
             self._statusbar.showMessage("Summarize: no sets found.")
             return
 
+        # Let the user name the output workbook (saved into the parent folder).
+        default_name = f"{os.path.basename(os.path.abspath(parent))}_summary"
+        name, ok = QInputDialog.getText(
+            self, "Name the summary workbook",
+            f"Combining {len(sets)} set(s).\nFile name for the summary "
+            f"workbook (saved in {os.path.basename(parent) or parent}):",
+            text=default_name)
+        if not ok:
+            self._statusbar.showMessage("Summarize cancelled.")
+            return
+        name = "".join(ch for ch in name.strip() if ch not in '\\/:*?"<>|')
+        if not name:
+            name = default_name
+        if not name.lower().endswith(".xlsx"):
+            name += ".xlsx"
+        out_path = os.path.join(parent, name)
+        if os.path.exists(out_path):
+            resp = QMessageBox.question(
+                self, "File exists",
+                f"{name} already exists in this folder.\nOverwrite it?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if resp != QMessageBox.Yes:
+                self._statusbar.showMessage("Summarize cancelled — file exists.")
+                return
+
         try:
-            out_path = write_summarize_format(parent, sets)
+            out_path = write_summarize_format(parent, sets, out_path=out_path)
         except Exception as e:
             QMessageBox.critical(self, "Summarize failed",
                                  f"Could not write the summary workbook:\n{e}")

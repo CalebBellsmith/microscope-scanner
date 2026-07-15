@@ -223,6 +223,8 @@ def detect_scratches(image_path: str, mode: str = "legacy") -> dict:
 
     if mode == "accurate":
         area, count, objs, outlines = _detect_accurate(rgb)
+    elif mode == "defect_aware":
+        area, count, objs, outlines = _detect_defect_aware(rgb)
     else:
         area, count, objs, outlines = _detect_legacy(rgb)
 
@@ -283,10 +285,15 @@ def _legacy_calibrate(objects: list) -> int:
     return max(0, int(round(est)))
 
 
-def _detect_legacy(rgb: np.ndarray):
+def _detect_legacy(rgb: np.ndarray, _component_filter=None):
     """MATLAB-faithful detector. Returns (area, count, objects, outlines).
     The returned area is calibrated to the original MATLAB implementation —
-    see _LEGACY_CAL_COEFFS."""
+    see _LEGACY_CAL_COEFFS.
+
+    _component_filter(prop, y_del, x_del, area) -> bool, when given, is an
+    EXTRA acceptance gate applied after the MATLAB gates — used by the
+    defect-aware mode to reject defects the original algorithm counted.
+    """
     grey = _to_grey_adjusted(rgb)
     old_grey = grey.copy()
 
@@ -320,6 +327,11 @@ def _detect_legacy(rgb: np.ndarray):
     scratch_count = 0
     scratch_objects = []
     accepted_outlines = []   # (scratch_num, boundary coords) for the overlay
+    all_objects = []         # every MATLAB-accepted component (pre-filter):
+    raw_all = 0              # the calibration must see the SAME population it
+                             # was fitted on, or its count-hinge features
+                             # extrapolate (filtered counts pushed a noise
+                             # frame's calibrated area UP 11%)
 
     for prop in props:
         area = prop.area
@@ -343,10 +355,20 @@ def _detect_legacy(rgb: np.ndarray):
         x_del = boundary[:, 1].max() - boundary[:, 1].min()  # col span
 
         if metric < THRESHOLD and x_del > y_del:
-            sum_scratch += area
-            scratch_count += 1
             width = int(y_del)
             length = int(x_del)
+            all_objects.append({
+                "scratch_num": len(all_objects) + 1,
+                "width_px": width,
+                "length_px": length,
+                "area_px": area,
+            })
+            raw_all += area
+            if (_component_filter is not None
+                    and not _component_filter(prop, y_del, x_del, area)):
+                continue
+            sum_scratch += area
+            scratch_count += 1
             scratch_objects.append({
                 "scratch_num": scratch_count,
                 "width_px": width,
@@ -356,9 +378,60 @@ def _detect_legacy(rgb: np.ndarray):
             accepted_outlines.append((scratch_count, boundary))
 
     # Calibrate the total onto the original MATLAB numbers (per-scratch
-    # details stay raw; only the headline area is mapped).
-    cal_area = _legacy_calibrate(scratch_objects)
+    # details stay raw; only the headline area is mapped).  The calibration
+    # always runs on the FULL MATLAB-accepted population it was fitted on;
+    # in defect-aware mode the calibrated total is then scaled by the raw
+    # fraction that survived the defect filter — same scale as legacy, and
+    # defect-aware can never read higher than legacy on the same frame.
+    cal_full = _legacy_calibrate(all_objects)
+    if _component_filter is None:
+        return cal_full, scratch_count, scratch_objects, accepted_outlines
+    cal_area = int(round(cal_full * (sum_scratch / max(raw_all, 1))))
     return cal_area, scratch_count, scratch_objects, accepted_outlines
+
+
+def _defect_gate(prop, y_del, x_del, area) -> bool:
+    """
+    Extra acceptance gate for DEFECT-AWARE mode: True only for clean
+    horizontal line scratches.  Everything here is a rejection the original
+    MATLAB algorithm did not have:
+
+      • dots / specs / bubbles / blob chains — too short or too square
+        (a bubble ring and a spec both have aspect ≈ 1);
+      • smears / chunky drag marks — thick AND squat.  Note: NO comet-smear
+        exception here (accurate mode counts smears by design; this mode
+        excludes them by design);
+      • non-horizontal marks — the principal axis of the pixel mass must lie
+        within 25° of horizontal, which rejects diagonals, verticals and the
+        steep parts of curves that the row-span < column-span test lets by.
+    """
+    aspect = x_del / max(y_del, 1.0)
+    if x_del < 18 or aspect < 2.6:
+        return False
+    if y_del > 12 and aspect < 4.0:
+        return False
+    ys, xs = np.nonzero(prop.image)
+    xs = xs - xs.mean()
+    ys = ys - ys.mean()
+    theta = 0.5 * np.arctan2(2 * (xs * ys).mean(),
+                             (xs * xs).mean() - (ys * ys).mean())
+    if abs(np.degrees(theta)) > 25.0:
+        return False
+    return True
+
+
+def _detect_defect_aware(rgb: np.ndarray):
+    """
+    DEFECT-AWARE mode: the legacy (MATLAB-faithful) scratch measurement —
+    same mask pipeline, same per-scratch width/length characterisation, same
+    calibration, so its numbers sit on the SAME SCALE as legacy mode — but
+    with defects excluded from the count: smears, non-horizontal marks
+    (diagonals / verticals / curves) and round defects (bubbles, dots,
+    specs).  On a clean sample it reads ≈ legacy; the gap between the two
+    modes on a dirty sample IS the defect contamination.
+    Returns (area, count, objects, outlines) like the other detectors.
+    """
+    return _detect_legacy(rgb, _component_filter=_defect_gate)
 
 
 def _detect_accurate(rgb: np.ndarray):
