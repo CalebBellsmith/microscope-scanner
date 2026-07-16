@@ -510,6 +510,22 @@ class MainWindow(QMainWindow):
         self._esp_port_edit.setPlaceholderText("auto  or  COM3 / /dev/cu.usbserial…")
         conn_lay.addLayout(_row("ESP32 (serial):", self._esp_port_edit))
 
+        # Optional wireless link: talk to the ESP32 over WiFi instead of USB.
+        # Wired stays the default for real scans; this is for remote/demo use.
+        self._wireless_chk = QCheckBox("Wireless (WiFi)")
+        self._wireless_chk.setToolTip(
+            "Command the ESP32 over WiFi instead of USB serial.\n"
+            "Requires firmware built with USE_WIFI 1.  The camera is still a\n"
+            "USB device on this PC, so only the motion link goes wireless.")
+        self._esp_host_edit = QLineEdit("")
+        self._esp_host_edit.setPlaceholderText("ESP32 IP  e.g. 192.168.1.50")
+        self._esp_host_edit.setEnabled(False)
+        self._wireless_chk.toggled.connect(self._esp_host_edit.setEnabled)
+        self._wireless_chk.toggled.connect(
+            lambda on: self._esp_port_edit.setEnabled(not on))
+        conn_lay.addWidget(self._wireless_chk)
+        conn_lay.addLayout(_row("ESP32 IP:", self._esp_host_edit))
+
         self._connect_btn = QPushButton("Connect")
         self._connect_btn.clicked.connect(self._on_connect)
         conn_lay.addWidget(self._connect_btn)
@@ -1231,9 +1247,16 @@ class MainWindow(QMainWindow):
         # ── 3. Motor (optional — warn but keep the camera alive on failure) ──
         if self._motor is None:
             try:
-                esp_txt = self._esp_port_edit.text().strip()
-                port = None if esp_txt.lower() == "auto" else esp_txt
-                self._motor = MotorController(port=port)
+                if self._wireless_chk.isChecked():
+                    host = self._esp_host_edit.text().strip()
+                    if not host:
+                        raise RuntimeError(
+                            "Wireless is selected but no ESP32 IP was entered.")
+                    self._motor = MotorController(host=host)
+                else:
+                    esp_txt = self._esp_port_edit.text().strip()
+                    port = None if esp_txt.lower() == "auto" else esp_txt
+                    self._motor = MotorController(port=port)
                 self._motor.open()
             except Exception as e:
                 self._motor = None
@@ -1247,7 +1270,8 @@ class MainWindow(QMainWindow):
         if self._motor is not None:
             self._connect_btn.setText("Connected ✓")
             self._connect_btn.setEnabled(False)
-            self._statusbar.showMessage("Connected — camera and ESP32 ready")
+            self._statusbar.showMessage(
+                f"Connected — camera and ESP32 ready ({self._motor.transport})")
         else:
             # Camera up but ESP missing — let the user reconnect it without restart
             self._connect_btn.setText("Reconnect ESP32")

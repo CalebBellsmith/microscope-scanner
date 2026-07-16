@@ -30,6 +30,23 @@
                                      ESP32 on USB — share a COMMON GROUND)
 */
 
+// ── Optional wireless transport ───────────────────────────────────────────
+// Wired USB serial is the default and is ALWAYS active.  Set USE_WIFI to 1 and
+// fill in the credentials below to ALSO accept the identical command protocol
+// over a TCP socket (the PC app's "Wireless" mode connects to <ESP32 IP>:3232).
+// With USE_WIFI 0 the WiFi code is not compiled at all, so the default build is
+// byte-for-byte the serial-only firmware — flip this only for remote/demo use.
+#define USE_WIFI 0
+#if USE_WIFI
+  #include <WiFi.h>
+  const char*    WIFI_SSID = "YOUR_SSID";
+  const char*    WIFI_PASS = "YOUR_PASSWORD";
+  const uint16_t WIFI_PORT = 3232;          // must match _TCP_PORT in motor.py
+  WiFiServer wifiServer(WIFI_PORT);
+  WiFiClient wifiClient;
+  String     wifiLine = "";
+#endif
+
 // ── Stepper pin assignments ───────────────────────────────────────────────
 const int X_PINS[4] = {19, 18, 5, 17};
 const int Y_PINS[4] = {27, 26, 25, 33};
@@ -108,11 +125,13 @@ void moveXY(int nx, int ny) {
 // ── Serial command parser ─────────────────────────────────────────────────
 String inputLine = "";   // accumulates characters until a newline arrives
 
-void handleCommand(String cmd) {
+// `out` is where the reply goes: Serial for a wired command, the WiFiClient for
+// a wireless one.  Both are Arduino Print streams, so the body is unchanged.
+void handleCommand(String cmd, Print &out) {
   cmd.trim();
 
   if (cmd == "HOME") {
-    Serial.println("OK");
+    out.println("OK");
     return;
   }
 
@@ -121,37 +140,37 @@ void handleCommand(String cmd) {
     String rest = cmd.substring(8);
     rest.trim();
     int sp = rest.indexOf(' ');
-    if (sp < 0) { Serial.println("ERR MOVE XY needs two values"); return; }
+    if (sp < 0) { out.println("ERR MOVE XY needs two values"); return; }
     int nx = rest.substring(0, sp).toInt();
     int ny = rest.substring(sp + 1).toInt();
     moveXY(nx, ny);
-    Serial.println("OK");
+    out.println("OK");
     return;
   }
 
   if (cmd.startsWith("MOVE X ")) {
     int n = cmd.substring(7).toInt();
     stepN(X_PINS, xStepIndex, n, X_STEP_DELAY_US);
-    Serial.println("OK");
+    out.println("OK");
     return;
   }
 
   if (cmd.startsWith("MOVE Y ")) {
     int n = cmd.substring(7).toInt();
     stepN(Y_PINS, yStepIndex, n, Y_STEP_DELAY_US);
-    Serial.println("OK");
+    out.println("OK");
     return;
   }
 
   if (cmd.startsWith("MOVE Z ")) {
     int n = cmd.substring(7).toInt();
     stepN(Z_PINS, zStepIndex, n, Z_STEP_DELAY_US);
-    Serial.println("OK");
+    out.println("OK");
     return;
   }
 
-  Serial.print("ERR unknown command: ");
-  Serial.println(cmd);
+  out.print("ERR unknown command: ");
+  out.println(cmd);
 }
 
 // ── Initialisation ────────────────────────────────────────────────────────
@@ -164,18 +183,54 @@ void setup() {
     pinMode(Z_PINS[p], OUTPUT); digitalWrite(Z_PINS[p], LOW);
   }
 
+#if USE_WIFI
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  // Wait briefly for a connection; don't block forever if WiFi is unavailable
+  // so the wired path still comes up.
+  for (int i = 0; i < 40 && WiFi.status() != WL_CONNECTED; i++) delay(250);
+  if (WiFi.status() == WL_CONNECTED) {
+    wifiServer.begin();
+    wifiServer.setNoDelay(true);           // send each reply immediately (low latency)
+    Serial.print("WIFI ");
+    Serial.println(WiFi.localIP());        // note the IP to type into the app
+  } else {
+    Serial.println("WIFI FAILED");
+  }
+#endif
+
   Serial.println("READY");
 }
 
-// ── Main loop — read serial bytes and build commands ──────────────────────
+// ── Main loop — read command bytes from whichever transport is active ──────
 void loop() {
+  // Wired USB serial (always active)
   while (Serial.available()) {
     char c = Serial.read();
     if (c == '\n') {
-      handleCommand(inputLine);
+      handleCommand(inputLine, Serial);
       inputLine = "";
     } else {
       inputLine += c;
     }
   }
+
+#if USE_WIFI
+  // Wireless: accept one client at a time and read its command lines.
+  if (!wifiClient || !wifiClient.connected()) {
+    wifiClient = wifiServer.available();   // adopt a newly-connected client
+    wifiLine   = "";
+  }
+  if (wifiClient && wifiClient.connected()) {
+    while (wifiClient.available()) {
+      char c = wifiClient.read();
+      if (c == '\n') {
+        handleCommand(wifiLine, wifiClient);
+        wifiLine = "";
+      } else {
+        wifiLine += c;
+      }
+    }
+  }
+#endif
 }
