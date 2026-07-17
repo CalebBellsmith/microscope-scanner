@@ -36,11 +36,11 @@
 // over a TCP socket (the PC app's "Wireless" mode connects to <ESP32 IP>:3232).
 // With USE_WIFI 0 the WiFi code is not compiled at all, so the default build is
 // byte-for-byte the serial-only firmware — flip this only for remote/demo use.
-#define USE_WIFI 0
+#define USE_WIFI 1
 #if USE_WIFI
   #include <WiFi.h>
-  const char*    WIFI_SSID = "YOUR_SSID";
-  const char*    WIFI_PASS = "YOUR_PASSWORD";
+  const char*    WIFI_SSID = "Alchemy";
+  const char*    WIFI_PASS = "Exoshield6X";
   const uint16_t WIFI_PORT = 3232;          // must match _TCP_PORT in motor.py
   WiFiServer wifiServer(WIFI_PORT);
   WiFiClient wifiClient;
