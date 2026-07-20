@@ -217,3 +217,16 @@ class MotorController:
         resp = self._command(b"HOME\n".decode())
         if resp != "OK":
             raise RuntimeError(f"HOME failed: {resp!r}")
+
+    def beep(self, duty: int = 200, ms: int = 2000):
+        """Sound the buzzer at `duty` (0-255 volume) for `ms` milliseconds.
+
+        The firmware arms the beep and replies OK immediately (it self-stops
+        after `ms`), so this returns right away and never blocks the caller for
+        the beep duration.  Raises RuntimeError if the firmware rejects it
+        (e.g. firmware without BEEP support) so callers can warn quietly.
+        """
+        duty = max(0, min(255, int(duty)))
+        resp = self._command(f"BEEP {duty} {int(ms)}\n")
+        if resp != "OK":
+            raise RuntimeError(f"BEEP failed: {resp!r}")

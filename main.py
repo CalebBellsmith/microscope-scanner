@@ -111,12 +111,13 @@ TRAINING_BAD_DIR  = os.path.join(TRAINING_DIR, "bad")
 
 class PrezeroDialog(QDialog):
     """
-    Brief modal reminder shown right after the user starts a leg, telling them
-    the stage must be pre-zeroed at the leg origin.  It auto-dismisses after a
-    short countdown (a "flash"), and Enter dismisses it immediately.  Returns
-    QDialog.Accepted to proceed with the scan, Rejected (Esc) to abort.
+    Modal reminder shown right after the user starts a leg, telling them the
+    stage must be pre-zeroed at the leg origin.  It waits for the operator with
+    no countdown — Enter proceeds with the scan, Esc aborts — so there's always
+    time to physically position the stage before any motion happens.  Returns
+    QDialog.Accepted to proceed, Rejected (Esc) to abort.
     """
-    def __init__(self, parent=None, seconds=3):
+    def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Ready to scan")
         self.setModal(True)
@@ -129,33 +130,13 @@ class PrezeroDialog(QDialog):
         f = QFont(); f.setPointSize(12); f.setBold(True); msg.setFont(f)
         lay.addWidget(msg)
 
-        self._remaining = int(seconds)
-        self._hint = QLabel()
-        self._hint.setAlignment(Qt.AlignCenter)
-        self._hint.setStyleSheet("color:#888; font-size:10px;")
-        lay.addWidget(self._hint)
-        self._refresh_hint()
-
-        self._timer = QTimer(self)
-        self._timer.timeout.connect(self._tick)
-        self._timer.start(1000)
-
-    def _refresh_hint(self):
-        self._hint.setText(
-            f"Starting in {self._remaining}…   (press Enter to start now, Esc to cancel)"
-        )
-
-    def _tick(self):
-        self._remaining -= 1
-        if self._remaining <= 0:
-            self._timer.stop()
-            self.accept()
-        else:
-            self._refresh_hint()
+        hint = QLabel("Press Enter to start,  Esc to cancel.")
+        hint.setAlignment(Qt.AlignCenter)
+        hint.setStyleSheet("color:#888; font-size:10px;")
+        lay.addWidget(hint)
 
     def keyPressEvent(self, e):
         if e.key() in (Qt.Key_Return, Qt.Key_Enter):
-            self._timer.stop()
             self.accept()
         else:
             super().keyPressEvent(e)   # Esc → reject (cancel the scan)
@@ -410,7 +391,7 @@ class MainWindow(QMainWindow):
         self._btn_review_auto = QRadioButton("Auto-pause")
         self._btn_review_man  = QRadioButton("Manual")
         self._btn_review_af   = QRadioButton("Autofocus")
-        self._btn_review_none.setChecked(True)
+        self._btn_review_af.setChecked(True)   # autofocus is the default
         for b in (self._btn_review_none, self._btn_review_auto,
                   self._btn_review_man, self._btn_review_af):
             b.setFocusPolicy(Qt.NoFocus)
@@ -530,6 +511,26 @@ class MainWindow(QMainWindow):
         self._connect_btn.clicked.connect(self._on_connect)
         conn_lay.addWidget(self._connect_btn)
         right.addWidget(self._conn_box)
+
+        # ── Leg-done buzzer ────────────────────────────────────────────────────
+        buzz_box = QGroupBox("Leg-done buzzer")
+        buzz_lay = QHBoxLayout(buzz_box)
+        buzz_lay.setSpacing(6)
+        buzz_lay.addWidget(QLabel("Volume:"))
+        self._buzz_slider = QSlider(Qt.Horizontal)
+        self._buzz_slider.setFocusPolicy(Qt.NoFocus)
+        self._buzz_slider.setRange(0, 255)
+        self._buzz_slider.setValue(200)
+        self._buzz_slider.setToolTip(
+            "Volume of the 2-second buzzer that sounds when a leg finishes "
+            "capturing.  0 = silent.  (Active buzzer: volume control is coarse.)")
+        buzz_lay.addWidget(self._buzz_slider, stretch=1)
+        self._buzz_test_btn = QPushButton("Test")
+        self._buzz_test_btn.setFocusPolicy(Qt.NoFocus)
+        self._buzz_test_btn.setToolTip("Sound the buzzer now at the set volume.")
+        self._buzz_test_btn.clicked.connect(self._on_test_buzzer)
+        buzz_lay.addWidget(self._buzz_test_btn)
+        right.addWidget(buzz_box)
 
         # ── Manual joystick mode ──────────────────────────────────────────────
         manual_box = QGroupBox("Manual control")
@@ -1535,10 +1536,36 @@ class MainWindow(QMainWindow):
         if mode == MODE_CAPTURE_ANALYZE:
             self._start_streaming_analysis(self._tmp_capture_dir, total)
 
+    def _sound_leg_done_buzzer(self, test: bool = False):
+        """Beep the ESP32 buzzer for 2 s at the slider's volume (leg-done alert).
+
+        Non-fatal: if the ESP32 isn't connected or the beep fails, it's just a
+        status message — a missing buzzer must never interrupt a scan."""
+        if self._motor is None:
+            if test:
+                QMessageBox.information(
+                    self, "No ESP32",
+                    "Connect the ESP32 first — the buzzer is wired to it.")
+            return
+        duty = self._buzz_slider.value()
+        if duty <= 0 and not test:
+            return   # muted
+        try:
+            self._motor.beep(duty, 2000)
+        except Exception as e:
+            self._statusbar.showMessage(f"Buzzer unavailable: {e}")
+
+    def _on_test_buzzer(self):
+        self._sound_leg_done_buzzer(test=True)
+
     def _on_capture_done(self):
         self._stop_btn.setEnabled(False)
         if getattr(self, "_run_aborted", False):
             return   # Stop was pressed — _on_stop handled cleanup.
+
+        # A leg just finished capturing — sound the buzzer so the operator knows
+        # to reposition (fires for both capture-only and capture+analyze).
+        self._sound_leg_done_buzzer()
 
         # Capture + Analyze streams analysis alongside capture.  The watcher is
         # still draining the last few images, so don't name/move yet — tell it
@@ -1919,6 +1946,26 @@ class MainWindow(QMainWindow):
         completed = {k: v for k, v in self._leg_results.items() if v is not None}
         if not completed:
             return
+
+        # Flash a warning (but still allow the export) if the set isn't a full
+        # 4 legs × 30 images.  Enter dismisses it and the export proceeds.
+        issues = []
+        if len(completed) != len(LEGS):
+            issues.append(f"{len(completed)} leg(s) present — expected {len(LEGS)}.")
+        for lg, res in sorted(completed.items()):
+            if len(res) != EXPECTED_IMAGES:
+                issues.append(f"{lg}: {len(res)} images — expected {EXPECTED_IMAGES}.")
+        if issues:
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Warning)
+            box.setWindowTitle("Incomplete set")
+            box.setText(
+                f"This set isn't a full {len(LEGS)} legs × {EXPECTED_IMAGES} images:\n\n"
+                + "\n".join(issues)
+                + "\n\nExporting anyway — press Enter to continue.")
+            box.setStandardButtons(QMessageBox.Ok)
+            box.setDefaultButton(QMessageBox.Ok)
+            box.exec_()
 
         try:
             use_legacy = self._export_group.checkedId() == 1

@@ -52,6 +52,16 @@ const int X_PINS[4] = {19, 18, 5, 17};
 const int Y_PINS[4] = {27, 26, 25, 33};
 const int Z_PINS[4] = {13, 14, 16, 4};   // focus stepper (autofocus) — DevKit-V1 safe GPIOs
 
+// ── Leg-done buzzer ───────────────────────────────────────────────────────
+// Active 5V buzzer on a spare GPIO.  Driven with analogWrite (PWM duty) so the
+// GUI volume slider maps to duty 0-255 — note an ACTIVE buzzer self-oscillates,
+// so duty gives only coarse volume control (a passive piezo would give fine
+// control).  The beep is NON-BLOCKING: BEEP arms it and returns OK immediately,
+// and loop() switches it off when its window expires, so it never holds up a
+// command or a move.  Wiring: buzzer + to GPIO 23, buzzer - to GND.
+const int BUZZER_PIN = 23;
+unsigned long buzzerOffAt = 0;    // millis() deadline; 0 = idle
+
 // Half-step sequence: 8 rows, each row drives one electrical step.
 const int STEP_SEQ[8][4] = {
   {1,0,0,0}, {1,1,0,0}, {0,1,0,0}, {0,1,1,0},
@@ -169,6 +179,25 @@ void handleCommand(String cmd, Print &out) {
     return;
   }
 
+  // BEEP <duty 0-255> <ms>  — arm the buzzer; loop() turns it off after <ms>.
+  if (cmd.startsWith("BEEP ")) {
+    String rest = cmd.substring(5);
+    rest.trim();
+    int sp   = rest.indexOf(' ');
+    int duty = rest.substring(0, sp < 0 ? rest.length() : sp).toInt();
+    long ms  = (sp < 0) ? 2000 : rest.substring(sp + 1).toInt();
+    duty = constrain(duty, 0, 255);
+    if (duty <= 0 || ms <= 0) {          // silent / off
+      analogWrite(BUZZER_PIN, 0);
+      buzzerOffAt = 0;
+    } else {
+      analogWrite(BUZZER_PIN, duty);
+      buzzerOffAt = millis() + (unsigned long)ms;
+    }
+    out.println("OK");
+    return;
+  }
+
   out.print("ERR unknown command: ");
   out.println(cmd);
 }
@@ -182,6 +211,9 @@ void setup() {
     pinMode(Y_PINS[p], OUTPUT); digitalWrite(Y_PINS[p], LOW);
     pinMode(Z_PINS[p], OUTPUT); digitalWrite(Z_PINS[p], LOW);
   }
+
+  pinMode(BUZZER_PIN, OUTPUT);
+  analogWrite(BUZZER_PIN, 0);          // buzzer silent at boot
 
 #if USE_WIFI
   WiFi.mode(WIFI_STA);
@@ -204,6 +236,13 @@ void setup() {
 
 // ── Main loop — read command bytes from whichever transport is active ──────
 void loop() {
+  // Turn the buzzer off once its beep window has elapsed (signed compare is
+  // rollover-safe).  Non-blocking, so it never delays command handling.
+  if (buzzerOffAt != 0 && (long)(millis() - buzzerOffAt) >= 0) {
+    analogWrite(BUZZER_PIN, 0);
+    buzzerOffAt = 0;
+  }
+
   // Wired USB serial (always active)
   while (Serial.available()) {
     char c = Serial.read();
