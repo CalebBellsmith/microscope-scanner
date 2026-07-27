@@ -227,7 +227,28 @@ void setup() {
     Serial.print("WIFI ");
     Serial.println(WiFi.localIP());        // note the IP to type into the app
   } else {
-    Serial.println("WIFI FAILED");
+    // Diagnostics: a bare "FAILED" doesn't say WHY.  Print the status code and
+    // scan for visible APs — that separates "our SSID isn't visible at all"
+    // (5 GHz-only / hidden / out of range) from "visible but auth was refused"
+    // (wrong password / WPA3-only).  The ESP32 radio is 2.4 GHz ONLY, so a
+    // 5 GHz network simply never appears in this list.
+    Serial.print("WIFI FAILED  status=");
+    Serial.println(WiFi.status());   // 1=no SSID found  4=auth/connect fail  6=disconnected
+    Serial.print("WIFI looking for SSID: ");
+    Serial.println(WIFI_SSID);
+    int n = WiFi.scanNetworks();
+    Serial.print("WIFI visible 2.4GHz networks: ");
+    Serial.println(n);
+    for (int i = 0; i < n; i++) {
+      Serial.print("  ");
+      Serial.print(WiFi.SSID(i));
+      Serial.print("   rssi=");
+      Serial.print(WiFi.RSSI(i));            // > -70 is comfortable, < -80 is marginal
+      Serial.print("  ch=");
+      Serial.print(WiFi.channel(i));
+      Serial.println(WiFi.encryptionType(i) == WIFI_AUTH_OPEN ? "  open" : "  secured");
+    }
+    Serial.println("WIFI (if your SSID is absent it is 5GHz, hidden, or out of range)");
   }
 #endif
 
