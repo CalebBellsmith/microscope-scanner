@@ -312,6 +312,20 @@ void loop() {
   }
 
 #if USE_WIFI
+  // The join only happened once, in setup().  If the AP reboots or the board
+  // roams badly, the link stays down forever and the PC just sees a connection
+  // timeout with no clue why.  Poll every 5 s and kick off a rejoin.  Both calls
+  // return immediately (association finishes in the background), so this cannot
+  // stall a move or a command.
+  static unsigned long wifiCheckAt = 0;
+  if ((long)(millis() - wifiCheckAt) >= 0) {
+    wifiCheckAt = millis() + 5000;
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.println("WIFI link lost — reconnecting");
+      WiFi.reconnect();
+    }
+  }
+
   // Wireless: accept one client at a time and read its command lines.
   if (!wifiClient || !wifiClient.connected()) {
     wifiClient = wifiServer.available();   // adopt a newly-connected client
