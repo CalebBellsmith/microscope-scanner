@@ -257,6 +257,11 @@ void setup() {
     Serial.print(WiFi.RSSI());
     Serial.print("  ch=");
     Serial.println(WiFi.channel());
+    // The board's own MAC.  Paste this into the router's DHCP reservation /
+    // "static lease" table against the IP above and the address stops drifting,
+    // so the app's IP field never has to be retyped.
+    Serial.print("WIFI mac=");
+    Serial.println(WiFi.macAddress());
   } else {
     // Diagnostics: a bare "FAILED" doesn't say WHY.  Print the status code and
     // scan for visible APs — that separates "our SSID isn't visible at all"
