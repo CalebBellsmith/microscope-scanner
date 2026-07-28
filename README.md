@@ -40,6 +40,31 @@ Edit `analysis_pipeline.py` → replace the body of `_analyze_image(self, image_
 | `train.py` | Fine-tune MobileNetV3-Small |
 | `firmware/firmware.ino` | ESP32 motor controller |
 
+## Wireless (optional)
+
+USB serial is the default and always works. To run the motion link over WiFi:
+
+**Rig hosts its own network (recommended).** `firmware.ino` ships with
+`WIFI_AP_MODE 1`, so the ESP32 broadcasts `AutoScope-Rig` / `autoscope2026` on
+channel 1 and always answers at the fixed address **192.168.4.1**. In the GUI,
+tick **Wireless (WiFi)** and leave **Join the rig's WiFi automatically** ticked —
+Connect switches this PC onto the rig's network, and Disconnect/exit puts it back
+on the one it came from. While joined to the rig the PC has no internet unless it
+is also on Ethernet.
+
+This mode exists because joining the house network was unreliable on site: the
+mesh kept handing the board between nodes on a band with 7 visible networks, and
+a stationary board lost ~50% of pings. Hosting our own link removes the mesh, the
+congestion and the DHCP lease, and needs no credentials at a demo venue.
+
+**Rig joins an existing network.** Set `WIFI_AP_MODE 0` and fill in `WIFI_SSID` /
+`WIFI_PASS`. The board prints its address as `WIFI <ip>` at boot — type that into
+the GUI's ESP32 IP field and untick auto-switch. It also prints `WIFI mac=…`, for
+a DHCP reservation so the address stops drifting.
+
+Auto-switching is Windows-only (it shells out to `netsh`). Elsewhere, or on a
+managed laptop that blocks scripted joins, untick it and switch networks by hand.
+
 ## Tuning parameters
 
 | Parameter | Where | Notes |

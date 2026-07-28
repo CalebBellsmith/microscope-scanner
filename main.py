@@ -498,18 +498,46 @@ class MainWindow(QMainWindow):
             "Command the ESP32 over WiFi instead of USB serial.\n"
             "Requires firmware built with USE_WIFI 1.  The camera is still a\n"
             "USB device on this PC, so only the motion link goes wireless.")
-        # The rig's ESP32 as observed over several boots.  Only a default — the
-        # board prints its real address as "WIFI <ip>" at boot, so if the router
-        # ever hands out a different one, read it off the serial monitor and type
-        # it here (a DHCP reservation on the router pins it for good).
-        self._esp_host_edit = QLineEdit("192.168.50.175")
-        self._esp_host_edit.setPlaceholderText("ESP32 IP  e.g. 192.168.1.50")
+        # 192.168.4.1 is the ESP32's fixed SoftAP address (firmware AP mode).
+        # Unlike a DHCP lease on the house network it can never drift, so this
+        # default is correct forever.  In station mode, put the address the board
+        # prints as "WIFI <ip>" at boot here instead.
+        self._esp_host_edit = QLineEdit("192.168.4.1")
+        self._esp_host_edit.setPlaceholderText("ESP32 IP  (192.168.4.1 in AP mode)")
         self._esp_host_edit.setEnabled(False)
         self._wireless_chk.toggled.connect(self._esp_host_edit.setEnabled)
         self._wireless_chk.toggled.connect(
             lambda on: self._esp_port_edit.setEnabled(not on))
         conn_lay.addWidget(self._wireless_chk)
         conn_lay.addLayout(_row("ESP32 IP:", self._esp_host_edit))
+
+        # Joining the rig's own network means leaving the house network, so do it
+        # on the user's behalf and put them back afterwards.  Off unless wireless
+        # is on; harmless to untick if the laptop's policy blocks scripted joins.
+        self._apswitch_chk = QCheckBox("Join the rig's WiFi automatically")
+        self._apswitch_chk.setChecked(True)
+        self._apswitch_chk.setEnabled(False)
+        self._apswitch_chk.setToolTip(
+            "On Connect, switch this PC onto the network the ESP32 broadcasts,\n"
+            "and switch back to the previous network on Disconnect or exit.\n"
+            "Windows only.  While joined to the rig this PC has no internet\n"
+            "unless it is also on Ethernet.")
+        self._ap_ssid_edit = QLineEdit("AutoScope-Rig")   # must match AP_SSID
+        self._ap_pass_edit = QLineEdit("autoscope2026")   # must match AP_PASS
+        self._ap_ssid_edit.setEnabled(False)
+        self._ap_pass_edit.setEnabled(False)
+        for w in (self._ap_ssid_edit, self._ap_pass_edit):
+            self._wireless_chk.toggled.connect(
+                lambda on, w=w: w.setEnabled(on and self._apswitch_chk.isChecked()))
+            self._apswitch_chk.toggled.connect(
+                lambda on, w=w: w.setEnabled(on and self._wireless_chk.isChecked()))
+        self._wireless_chk.toggled.connect(self._apswitch_chk.setEnabled)
+        conn_lay.addWidget(self._apswitch_chk)
+        conn_lay.addLayout(_row("Rig SSID:", self._ap_ssid_edit))
+        conn_lay.addLayout(_row("Rig password:", self._ap_pass_edit))
+
+        # SSID to restore when we're done, captured before we switch away.
+        self._prev_ssid = None
 
         self._connect_btn = QPushButton("Connect")
         self._connect_btn.clicked.connect(self._on_connect)
@@ -1220,6 +1248,44 @@ class MainWindow(QMainWindow):
 
     # ── Connection ────────────────────────────────────────────────────────────
 
+    def _join_rig_wifi(self):
+        """Switch this PC onto the network the ESP32 broadcasts, remembering the
+        one we came from so it can be restored later.
+
+        Silently does nothing unless wireless + auto-switch are both ticked.  A
+        failure here is raised, because carrying on would only produce a much
+        more confusing TCP timeout a second later.
+        """
+        if not (self._wireless_chk.isChecked() and self._apswitch_chk.isChecked()):
+            return
+        import netswitch
+        if not netswitch.supported():
+            return                       # non-Windows: user switches manually
+        ssid = self._ap_ssid_edit.text().strip()
+        if not ssid:
+            return
+        prev = netswitch.current_ssid()
+        if prev and prev != ssid:
+            self._prev_ssid = prev       # only overwrite if we're really moving
+        self._statusbar.showMessage(f"Joining {ssid}…")
+        QApplication.processEvents()     # let the status line paint before we block
+        netswitch.connect(ssid, self._ap_pass_edit.text())
+
+    def _restore_wifi(self):
+        """Put the PC back on the network it was using before we hijacked it."""
+        if not self._prev_ssid:
+            return
+        try:
+            import netswitch
+            if netswitch.supported() and netswitch.current_ssid() != self._prev_ssid:
+                netswitch.connect(self._prev_ssid, timeout=20)
+        except Exception as e:
+            # Never block shutdown over this — the user can always reconnect by
+            # hand, and an exception in closeEvent would be far more annoying.
+            print(f"[main] could not restore WiFi to {self._prev_ssid}: {e}")
+        finally:
+            self._prev_ssid = None
+
     def _on_connect(self):
         # ── 1. Camera (required for the live feed; fatal if it fails) ─────────
         if self._camera is None:
@@ -1257,6 +1323,7 @@ class MainWindow(QMainWindow):
                     if not host:
                         raise RuntimeError(
                             "Wireless is selected but no ESP32 IP was entered.")
+                    self._join_rig_wifi()      # no-op unless auto-switch is on
                     self._motor = MotorController(host=host)
                 else:
                     esp_txt = self._esp_port_edit.text().strip()
@@ -1265,6 +1332,9 @@ class MainWindow(QMainWindow):
                 self._motor.open()
             except Exception as e:
                 self._motor = None
+                # Don't strand the PC on the rig's network (and therefore off
+                # the internet) because the link failed — put it straight back.
+                self._restore_wifi()
                 QMessageBox.warning(
                     self, "ESP32 not connected",
                     f"The camera is live, but the motor controller could not "
@@ -2037,6 +2107,7 @@ class MainWindow(QMainWindow):
             self._camera.close()
         if self._motor:
             self._motor.close()
+        self._restore_wifi()      # hand the PC back to the network it came from
         event.accept()
 
 

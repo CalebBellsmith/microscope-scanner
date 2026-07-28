@@ -39,9 +39,42 @@
 #define USE_WIFI 1
 #if USE_WIFI
   #include <WiFi.h>
-  const char*    WIFI_SSID = "Alchemy";
-  const char*    WIFI_PASS = "Exoshield6X";
+
+  // Two ways to be wireless:
+  //   WIFI_AP_MODE 1 — the ESP32 HOSTS its own network and the PC joins it.
+  //   WIFI_AP_MODE 0 — the ESP32 JOINS an existing network (station mode).
+  //
+  // AP mode is the default because joining the house network proved unreliable
+  // on this site: "Alchemy" is a mesh whose nodes kept handing the board around
+  // (ch 3 one boot, ch 10 the next, RSSI −55 to −69) on a band with 7 visible
+  // networks, and a stationary board doing nothing but answering pings still
+  // lost ~50% of them.  Hosting our own link removes the mesh, the congestion
+  // and the DHCP lease from the picture, and it works at a venue where we have
+  // no credentials for the house WiFi.  Station mode is kept for the case where
+  // the PC must stay on the LAN at the same time.
+  #define WIFI_AP_MODE 1
+
   const uint16_t WIFI_PORT = 3232;          // must match _TCP_PORT in motor.py
+
+  #if WIFI_AP_MODE
+    // The network the rig broadcasts.  WPA2 needs a password of 8+ characters.
+    // Change both here and in the PC app (or type them into the GUI fields).
+    const char* AP_SSID = "AutoScope-Rig";
+    const char* AP_PASS = "autoscope2026";
+    // Channel 1 was completely empty in the site survey (the traffic sat on 3,
+    // 6 and 10), and 1/6/11 are the non-overlapping trio on 2.4 GHz.
+    const int   AP_CHANNEL  = 1;
+    const int   AP_MAX_CONN = 4;
+    // SoftAP address is FIXED, so unlike DHCP it can never drift: the PC app
+    // always dials 192.168.4.1 and there is no IP to look up or retype.
+    const IPAddress AP_IP     (192, 168, 4, 1);
+    const IPAddress AP_GATEWAY(192, 168, 4, 1);
+    const IPAddress AP_SUBNET (255, 255, 255, 0);
+  #else
+    const char* WIFI_SSID = "Alchemy";
+    const char* WIFI_PASS = "Exoshield6X";
+  #endif
+
   WiFiServer wifiServer(WIFI_PORT);
   WiFiClient wifiClient;
   String     wifiLine = "";
@@ -219,7 +252,33 @@ void setup() {
   pinMode(BUZZER_PIN, OUTPUT);
   analogWrite(BUZZER_PIN, 0);          // buzzer silent at boot
 
-#if USE_WIFI
+#if USE_WIFI && WIFI_AP_MODE
+  // ── Host our own network ────────────────────────────────────────────────
+  // No join, no association, no DHCP lease, no mesh to be handed between: the
+  // radio simply starts advertising and waits.  That removes every failure mode
+  // we hit in station mode, and the address is fixed so nothing has to be
+  // looked up.  softAPConfig() must be called BEFORE softAP().
+  WiFi.persistent(false);
+  WiFi.mode(WIFI_AP);
+  WiFi.softAPConfig(AP_IP, AP_GATEWAY, AP_SUBNET);
+  bool apUp = WiFi.softAP(AP_SSID, AP_PASS, AP_CHANNEL, false, AP_MAX_CONN);
+  WiFi.setSleep(false);            // no modem sleep — steadier command latency
+  if (apUp) {
+    wifiServer.begin();
+    wifiServer.setNoDelay(true);
+    Serial.print("WIFI AP up, ssid=");
+    Serial.print(AP_SSID);
+    Serial.print("  ch=");
+    Serial.println(AP_CHANNEL);
+    Serial.print("WIFI ");
+    Serial.println(WiFi.softAPIP());     // 192.168.4.1 — what the app dials
+    Serial.print("WIFI mac=");
+    Serial.println(WiFi.softAPmacAddress());
+  } else {
+    Serial.println("WIFI AP FAILED to start — use the USB cable");
+  }
+
+#elif USE_WIFI
   // The failures we saw reported status=0 (WL_IDLE_STATUS) after the timeout —
   // NOT 1 (no such SSID) or 4 (auth refused).  Idle means the join never even
   // got under way, so waiting longer on the same begin() achieves nothing; what
@@ -311,12 +370,13 @@ void loop() {
     }
   }
 
-#if USE_WIFI
-  // The join only happened once, in setup().  If the AP reboots or the board
-  // roams badly, the link stays down forever and the PC just sees a connection
-  // timeout with no clue why.  Poll every 5 s and kick off a rejoin.  Both calls
-  // return immediately (association finishes in the background), so this cannot
-  // stall a move or a command.
+#if USE_WIFI && !WIFI_AP_MODE
+  // Station mode only.  The join only happened once, in setup(); if the AP
+  // reboots or the board roams badly the link stays down forever and the PC
+  // just sees a connection timeout with no clue why.  Poll every 5 s and kick
+  // off a rejoin.  Both calls return immediately (association finishes in the
+  // background), so this cannot stall a move or a command.  In AP mode there is
+  // nothing to rejoin — we ARE the network — so this is compiled out.
   static unsigned long wifiCheckAt = 0;
   if ((long)(millis() - wifiCheckAt) >= 0) {
     wifiCheckAt = millis() + 5000;
@@ -325,8 +385,12 @@ void loop() {
       WiFi.reconnect();
     }
   }
+#endif
 
-  // Wireless: accept one client at a time and read its command lines.
+#if USE_WIFI
+  // Wireless: accept one client at a time and read its command lines.  Identical
+  // in both modes — the server doesn't care whether we joined a network or are
+  // hosting one, only that a client dialled port 3232.
   if (!wifiClient || !wifiClient.connected()) {
     wifiClient = wifiServer.available();   // adopt a newly-connected client
     wifiLine   = "";
