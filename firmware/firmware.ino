@@ -79,16 +79,11 @@ const int STEP_SEQ[8][4] = {
 // below 900 (prior validated-safe rate was ~1200 µs).
 const int X_STEP_DELAY_US = 900;   // rung axis (short moves)
 const int Y_STEP_DELAY_US = 900;   // sweep axis — 900 is the safe floor (700 skips)
-// Z is NOT on the X/Y rate.  A 28BYJ-48 stalls somewhere around 1000 half-steps
-// per second unloaded, and 900 us is 1111/s — i.e. X and Y run slightly OVER the
-// motor's ceiling and get away with it, but the focus axis did not: it stuttered
-// and dropped steps, worse in one direction than the other (pull-IN torque from
-// a standstill is much lower than running torque, so the direction with a hair
-// more friction is the one that slips).  1600 us = 625 half-steps/s sits well
-// inside spec.  Focus moves are tiny, so the extra time is unnoticeable.
-const int Z_STEP_DELAY_US  = 1600;  // focus axis — 625 half-steps/s, inside spec
-const int Z_START_DELAY_US = 3200;  // first/last steps: slow, for breakaway torque
-const int Z_RAMP_STEPS     = 60;    // half-steps spent easing in and easing out
+// Z runs at the same validated rate as X and Y.  Slowing it to 1600 us and
+// ramping it did NOT fix the focus axis stuttering, so the cause is hardware
+// (suspect coil / driver channel / connector) and the rate is left matching the
+// two axes that are known good.
+const int Z_STEP_DELAY_US = 900;   // focus axis — same validated rate as X/Y
 
 int xStepIndex = 0;   // current position in the 8-step table for X
 int yStepIndex = 0;   // current position in the 8-step table for Y
@@ -115,32 +110,6 @@ void stepN(const int pins[4], int &stepIndex, int n, int delayUs) {
     delayMicroseconds(delayUs);
   }
   deenergise(pins);
-}
-
-// Drive the Z (focus) stepper with an acceleration ramp.  Starting a stepper at
-// full rate demands pull-IN torque, which is the weakest number on the motor's
-// curve; easing in from Z_START_DELAY_US and easing back out at the end lets it
-// break away cleanly and settle without overshooting.  Ramp length is clamped so
-// short moves still get a symmetric ramp instead of a half one.
-void stepZ(int n) {
-  int  dir   = (n >= 0) ? 1 : -1;
-  long count = abs((long)n);
-  long ramp  = min((long)Z_RAMP_STEPS, count / 2);
-
-  for (long i = 0; i < count; i++) {
-    long fromEnd = count - 1 - i;
-    long into    = min(i, fromEnd);          // steps from the nearest end
-    int  d       = Z_STEP_DELAY_US;
-    if (ramp > 0 && into < ramp)
-      d = Z_START_DELAY_US -
-          (int)((long)(Z_START_DELAY_US - Z_STEP_DELAY_US) * into / ramp);
-    stepAxisOnce(Z_PINS, zStepIndex, dir);
-    delayMicroseconds(d);
-  }
-  // Hold the final phase briefly before cutting current, so the rotor settles on
-  // the commanded detent rather than relaxing back a step as the field collapses.
-  delayMicroseconds(3000);
-  deenergise(Z_PINS);
 }
 
 // Drive BOTH steppers concurrently.  A Bresenham distribution spreads the
@@ -209,7 +178,7 @@ void handleCommand(String cmd, Print &out) {
 
   if (cmd.startsWith("MOVE Z ")) {
     int n = cmd.substring(7).toInt();
-    stepZ(n);
+    stepN(Z_PINS, zStepIndex, n, Z_STEP_DELAY_US);
     out.println("OK");
     return;
   }

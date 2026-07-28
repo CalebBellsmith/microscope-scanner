@@ -498,7 +498,11 @@ class MainWindow(QMainWindow):
             "Command the ESP32 over WiFi instead of USB serial.\n"
             "Requires firmware built with USE_WIFI 1.  The camera is still a\n"
             "USB device on this PC, so only the motion link goes wireless.")
-        self._esp_host_edit = QLineEdit("192.168.50.172")
+        # The rig's ESP32 as observed over several boots.  Only a default — the
+        # board prints its real address as "WIFI <ip>" at boot, so if the router
+        # ever hands out a different one, read it off the serial monitor and type
+        # it here (a DHCP reservation on the router pins it for good).
+        self._esp_host_edit = QLineEdit("192.168.50.175")
         self._esp_host_edit.setPlaceholderText("ESP32 IP  e.g. 192.168.1.50")
         self._esp_host_edit.setEnabled(False)
         self._wireless_chk.toggled.connect(self._esp_host_edit.setEnabled)
