@@ -10,6 +10,7 @@ Scratch detection is a Python translation of the provided MATLAB algorithm:
   - Scratch area = total pixels inside accepted boundaries
 """
 import os
+import re
 import json
 import time
 import math
@@ -1220,35 +1221,88 @@ def collect_sets(parent_dir: str) -> list:
     return sets
 
 
-def _cgroup_key(name: str) -> str:
-    """Leading C-token of a set name ('C39_a_b' → 'C39'); full name if none."""
-    import re
-    m = re.match(r"\s*(C\d+)", name or "", re.IGNORECASE)
-    return m.group(1).upper() if m else (name or "")
+_TEMPLATE_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "templates", "wet_abrasion_template.xlsx")
+
+# A control is any set with "control" anywhere in its name, case-insensitive —
+# "Control S1", "control B24", "S1 control" all match.  Controls are laid out
+# after a black separator column and summarised in their own tables, so the
+# reference films are never averaged in with the samples under test.
+_CONTROL_RE = re.compile(r"control", re.I)
+
+# Z threshold for outlier removal.  Reverse-engineered from the reference
+# workbook: 1.96 reproduces every published Average and STDEV at every pass, on
+# both the test films and the controls.  (The 1.5-IQR limits shown on the
+# BoxPlots tab do NOT drive removal — they would have dropped two cells in pass
+# one, where the sheet dropped only the single worst.)
+_OUTLIER_Z = 1.96
 
 
-def _group_by_cgroup(per_set: list) -> list:
-    """Bucket per_set entries by C-group, ordered by numeric C value.
+def _is_control(set_name: str) -> bool:
+    return bool(_CONTROL_RE.search(set_name or ""))
 
-    per_set entries are (name, leg_means, avg, std_legs); returns a list of
-    (group_key, [entries…]) with C-numbered groups sorted ascending and any
-    non-matching names appended in first-seen order.
+
+def _zscore_passes(per_set: list, z: float = _OUTLIER_Z) -> list:
+    """Iteratively drop leg means beyond ±z·σ of the pooled group.
+
+    Returns one CUMULATIVE removed-key set per pass; an empty list means the
+    group was clean on the first look.  Each key is (set_index, leg).
+
+    The reference sheet removes one pass at a time and recomputes the mean and
+    stdev from the survivors before looking again, which is why a cell can sit
+    inside the limit on pass one and outside it on pass two.  Iterating to a
+    fixed point reproduces that, and also explains why the test films needed two
+    passes while the controls settled after one.
     """
-    import re
-    order, buckets = [], {}
-    for entry in per_set:
-        k = _cgroup_key(entry[0])
-        if k not in buckets:
-            buckets[k] = []
-            order.append(k)
-        buckets[k].append(entry)
+    keys = [(i, lg) for i, (_n, lm, _a, _s) in enumerate(per_set) for lg in lm]
+    vals = {k: per_set[k[0]][1][k[1]] for k in keys}
+    removed, passes = set(), []
+    while len(passes) < 10:                      # hard stop; never seen past 2
+        live = [k for k in keys if k not in removed]
+        if len(live) < 3:
+            break
+        v = [vals[k] for k in live]
+        m, s = float(np.mean(v)), float(np.std(v, ddof=1))
+        if s == 0:
+            break
+        flagged = {k for k in live if abs((vals[k] - m) / s) > z}
+        if not flagged:
+            break
+        removed |= flagged
+        passes.append(set(removed))
+    return passes
 
-    def sort_key(k):
-        m = re.match(r"C(\d+)$", k)
-        return (0, int(m.group(1))) if m else (1, k)
 
-    order.sort(key=sort_key)
-    return [(k, buckets[k]) for k in order]
+def _live_stats(per_set: list, legs_order: list, removed: set) -> dict:
+    """Summary numbers for a group with `removed` leg cells excluded.
+
+    Excluded cells are still WRITTEN to the sheet (flagged red) — they are only
+    left out of the arithmetic, so the reader can always see what was dropped.
+    """
+    live = {}                                     # (set_idx, leg) → value
+    for i, (_n, lm, _a, _s) in enumerate(per_set):
+        for lg, v in lm.items():
+            if (i, lg) not in removed:
+                live[(i, lg)] = v
+    all_v = list(live.values())
+    per_leg = {lg: [v for (i, l), v in live.items() if l == lg] for lg in legs_order}
+    n = len(all_v)
+    std = float(np.std(all_v, ddof=1)) if n > 1 else 0.0
+    return {
+        "live":      live,
+        "leg_avg":   {lg: (sum(x) / len(x) if x else None) for lg, x in per_leg.items()},
+        "leg_std":   {lg: (float(np.std(x, ddof=1)) if len(x) > 1 else None)
+                      for lg, x in per_leg.items()},
+        "grand":     (sum(all_v) / n if n else None),
+        "std":       std,
+        # CONFIDENCE(0.05, sigma, n).  The reference sheet hard-codes n=16 on the
+        # raw table, which is right only when all four legs of four sets survive
+        # — it understates the controls (n=8).  The real count is used here.
+        "ci":        (1.959963985 * std / math.sqrt(n)) if n > 1 else None,
+        "range":     (max(all_v) - min(all_v)) if all_v else None,
+        "n":         n,
+    }
 
 
 def write_summarize_format(parent_dir: str, sets: list, out_path: str = None) -> str:
@@ -1279,10 +1333,23 @@ def write_summarize_format(parent_dir: str, sets: list, out_path: str = None) ->
     BOX  = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
     CTR  = Alignment(horizontal="center")
 
+    # Fully-opaque black (FF alpha).  A bare "000000" is stored with alpha 00,
+    # which some readers treat as transparent rather than black.
+    FILL_BLACK = PatternFill("solid", start_color="FF000000", end_color="FF000000")
+
     legs_order = _SUMMARY_LEG_ORDER
     wb = openpyxl.Workbook()
     ws = wb.active
-    ws.title = "S1"
+    # The main tab carries the batch name — the folder the sets were captured
+    # into.  Excel forbids []:*?/\ in a sheet title and caps it at 31 chars.
+    batch = os.path.basename(os.path.abspath(parent_dir))
+    ws.title = (re.sub(r"[\[\]:*?/\\]", "-", batch)[:31] or "Summary")
+
+    # Test films first, then the controls — the split drives both the raw block
+    # and the summary tables below it.  Order within each group is preserved.
+    test_sets = [s for s in sets if not _is_control(s[0])]
+    ctrl_sets = [s for s in sets if _is_control(s[0])]
+    sets = test_sets + ctrl_sets
 
     def make_cell(target):
         def cell(r, c, value, *, bold=False, fill=None, box=False, ctr=False, font=None):
@@ -1296,9 +1363,9 @@ def write_summarize_format(parent_dir: str, sets: list, out_path: str = None) ->
         return cell
     cell = make_cell(ws)
 
-    # Metadata header (top-left, rows 1-3): fill the date; leave the rest blank.
+    # Metadata header (rows 1-3): labels only — who ran it and the run order are
+    # facts the scanner has no way to know, so they are left blank to fill in.
     cell(1, 1, "Date Completed", bold=True)
-    ws.cell(row=1, column=2, value=datetime.date.today().strftime("%d-%b-%Y"))
     cell(2, 1, "Completed By", bold=True)
     cell(3, 1, "Notes", bold=True)
 
@@ -1306,11 +1373,23 @@ def write_summarize_format(parent_dir: str, sets: list, out_path: str = None) ->
     BLOCK_TOP  = 5                        # first block row (leaves rows 1-3 for meta)
     N_IMG      = 30                       # expected images per leg (layout spacing)
     SET_WIDTH  = len(legs_order) * 2      # 2 columns (name, area) per leg
-    SET_STRIDE = SET_WIDTH + 1            # one spacer column between sets
+    SET_STRIDE = SET_WIDTH                # blocks sit flush; no spacer column
     per_set = []                          # cache computed values for the summary
 
+    # Column of the black separator, and the first control column after it.
+    # The separator only exists when there is something on BOTH sides of it —
+    # an all-control run would otherwise paint column 1 black over its own data.
+    n_test    = len(test_sets)
+    split     = bool(test_sets and ctrl_sets)
+    BLACK_COL = 1 + n_test * SET_STRIDE if split else None
+    CTRL_COL0 = (BLACK_COL + 1) if split else (1 if ctrl_sets else None)
+
+    def set_col0(i):
+        """First column of set i, stepping over the black column for controls."""
+        return 1 + i * SET_STRIDE + (1 if (split and i >= n_test) else 0)
+
     for i, (name, data) in enumerate(sets):
-        c0 = 1 + i * SET_STRIDE
+        c0 = set_col0(i)
         cell(BLOCK_TOP, c0, name, bold=True)
         for j, leg in enumerate(legs_order):
             nc = c0 + j * 2               # image-name column for this leg
@@ -1350,26 +1429,66 @@ def write_summarize_format(parent_dir: str, sets: list, out_path: str = None) ->
         std_legs = float(np.std(list(leg_means.values()), ddof=1)) if len(leg_means) > 1 else 0.0
         per_set.append((name, leg_means, avg, std_legs))
 
-    # ── Second tab: one Film summary pair per C-group ───────────────────────────
-    # The set name begins with a C-group token (e.g. "C39 …", "C51 …"); every set
-    # sharing that token is a replicate of the same group.  Each group gets its own
-    # plain + 'Outliers Removed' pair, and outliers are judged *within the group*
-    # (mean ± 1.96·stdev of that group's own leg-means / set-averages), so a single
-    # off sample stands out against its true replicates rather than the whole run.
-    ws2 = wb.create_sheet("By C-group")
-    cell2 = make_cell(ws2)
-    r2 = 1
-    for gname, gsets in _group_by_cgroup(per_set):
-        n = len(gsets)
-        cell2(r2, 1, f"{gname}  ({n} sample{'s' if n != 1 else ''})", bold=True)
-        r2 += 2
-        r2 = _write_summary_table(
-            ws2, r2, "", gsets, legs_order,
-            cell2, HDR, FILL_STAT, FILL_RED, FONT_RED, flag_outliers=False)
-        r2 = _write_summary_table(
-            ws2, r2 + 3, "Outliers Removed", gsets, legs_order,
-            cell2, HDR, FILL_STAT, FILL_RED, FONT_RED, flag_outliers=True)
-        r2 += 5
+    # The black separator column: it runs the full height of the raw block AND
+    # the summary tables below, so the eye never has to work out where the test
+    # films stop and the reference controls begin.
+    stats_h  = len(_desc_stats([0]))
+    anova_h  = 12                                   # 4 ANOVA rows + gap + 6 pairs
+    raw_last = BLOCK_TOP + 3 + N_IMG + stats_h + anova_h
+
+    # ── Summary tables: test films on the left, controls past the black column ──
+    # Each group is judged against ITS OWN pool, so a control is never compared
+    # against the films under test (and vice versa).  Outlier cells keep their
+    # value and are flagged red; only the arithmetic excludes them.
+    per_test = per_set[:n_test]
+    per_ctrl = per_set[n_test:]
+
+    # Stages are written index-by-index so the test and control tables stay
+    # ROW-ALIGNED across the black column even when the groups hold a different
+    # number of sets or need a different number of passes — the raw pair sits
+    # side by side, then pass 1 beside pass 1, and so on.
+    def stages_for(group):
+        if not group:
+            return []
+        passes = _zscore_passes(group)
+        out = [("", set())]
+        for pi, removed in enumerate(passes, 1):
+            # One pass is labelled plainly; two or more are numbered, matching
+            # how the reference sheet distinguishes them.
+            out.append((("Outliers Removed" if len(passes) == 1
+                         else f"Outliers Removed - {pi} pass"), removed))
+        return out
+
+    cols = [(per_test, stages_for(per_test), 1)]
+    if per_ctrl and CTRL_COL0:
+        cols.append((per_ctrl, stages_for(per_ctrl), CTRL_COL0))
+
+    sum_top = raw_last + 3
+    r = sum_top
+    for si in range(max(len(s) for _g, s, _c in cols)):
+        ends = []
+        for group, stages, col0 in cols:
+            if si >= len(stages):
+                continue
+            title, removed = stages[si]
+            ends.append(_write_fmt_summary_table(
+                ws, r, col0, title, group, legs_order, removed,
+                cell, HDR, FILL_STAT, FILL_RED, FONT_RED))
+        r = max(ends) + 2
+    last_rows = [r]
+
+    if BLACK_COL:
+        for rr in range(BLOCK_TOP, max(last_rows) + 1):
+            ws.cell(row=rr, column=BLACK_COL).fill = FILL_BLACK
+        ws.column_dimensions[
+            openpyxl.utils.get_column_letter(BLACK_COL)].width = 2.5
+
+    # ── Remaining tabs ────────────────────────────────────────────────────────
+    _copy_template_tab(wb)
+    _write_ttest_tab(wb, per_test, per_ctrl, sets, n_test)
+    _write_boxplots_tab(wb, per_test, per_ctrl, legs_order, batch,
+                        cellmaker=make_cell, HDR=HDR, FILL_STAT=FILL_STAT,
+                        FILL_RED=FILL_RED, FONT_RED=FONT_RED)
 
     out_path = out_path or os.path.join(
         parent_dir, f"{os.path.basename(os.path.abspath(parent_dir))}_summary.xlsx")
@@ -1377,65 +1496,219 @@ def write_summarize_format(parent_dir: str, sets: list, out_path: str = None) ->
     return out_path
 
 
-def _write_summary_table(ws, top, title, per_set, legs_order,
-                         cell, HDR, FILL_STAT, FILL_RED, FONT_RED, flag_outliers):
-    """Write one Film summary table starting at row `top`; return its last row."""
+def _write_fmt_summary_table(ws, top, col0, title, group, legs_order, removed,
+                             cell, HDR, FILL_STAT, FILL_RED, FONT_RED):
+    """One Film summary table at (top, col0).  Returns its last row.
+
+    Columns: Film | <legs> | Average | STDEV of Legs | 95% Confidence Interval,
+    then Average / STDEV rows across sets and a RANGE line.  Cells in `removed`
+    are written with their real value but flagged red, and every statistic on
+    the table ignores them — the reference sheet blanks them instead, which
+    loses the evidence of what was dropped.
+    """
     r = top
     if title:
-        cell(r, 1, title, bold=True)
+        cell(r, col0, title, bold=True)
         r += 1
-    headers = ["Film"] + legs_order + ["Average", "STDEV of Legs", "95% Confidence Interval"]
-    for c, h in enumerate(headers, start=1):
-        cell(r, c, h, bold=True, fill=FILL_STAT, box=True)
+    headers = ["Film"] + legs_order + ["Average", "STDEV of Legs",
+                                       "95% Confidence Interval"]
+    for j, h in enumerate(headers):
+        cell(r, col0 + j, h, bold=True, fill=FILL_STAT, box=True, ctr=True)
     r += 1
 
-    # Outlier reference distributions (pooled across sets).
-    all_leg_means = [m for _n, lm, _a, _s in per_set for m in lm.values()]
-    set_avgs      = [a for _n, _lm, a, _s in per_set]
-    lm_mean = sum(all_leg_means) / len(all_leg_means) if all_leg_means else 0.0
-    lm_std  = float(np.std(all_leg_means, ddof=1)) if len(all_leg_means) > 1 else 0.0
-    av_mean = sum(set_avgs) / len(set_avgs) if set_avgs else 0.0
-    av_std  = float(np.std(set_avgs, ddof=1)) if len(set_avgs) > 1 else 0.0
-
-    def outlier(val, mu, sd):
-        return sd > 0 and abs(val - mu) > 1.96 * sd
-
-    for name, leg_means, avg, std_legs in per_set:
-        cell(r, 1, name, box=True)
-        for c, leg in enumerate(legs_order, start=2):
-            v = leg_means.get(leg)
-            x = cell(r, c, round(v, 1) if v is not None else "", box=True)
-            if flag_outliers and v is not None and outlier(v, lm_mean, lm_std):
-                x.fill = FILL_RED; x.font = FONT_RED
-        ax = cell(r, 2 + len(legs_order), round(avg, 1), box=True)
-        if flag_outliers and outlier(avg, av_mean, av_std):
-            ax.fill = FILL_RED; ax.font = FONT_RED
-        cell(r, 3 + len(legs_order), round(std_legs, 1), box=True)
+    st = _live_stats(group, legs_order, removed)
+    for i, (name, lm, _a, _s) in enumerate(group):
+        cell(r, col0, name, box=True)
+        kept = []
+        for j, lg in enumerate(legs_order):
+            if lg not in lm:
+                cell(r, col0 + 1 + j, "", box=True)
+                continue
+            flagged = (i, lg) in removed
+            c = cell(r, col0 + 1 + j, round(lm[lg], 1), box=True,
+                     fill=FILL_RED if flagged else None)
+            if flagged:
+                c.font = FONT_RED
+            else:
+                kept.append(lm[lg])
+        cell(r, col0 + 1 + len(legs_order),
+             round(sum(kept) / len(kept), 1) if kept else "", box=True)
+        cell(r, col0 + 2 + len(legs_order),
+             round(float(np.std(kept, ddof=1)), 1) if len(kept) > 1 else "", box=True)
         r += 1
 
-    # Aggregate rows: per-leg Average / STDEV across sets, plus pooled stats.
-    avg_col = 2 + len(legs_order)
-    cell(r, 1, "Average", bold=True, box=True)
-    for c, leg in enumerate(legs_order, start=2):
-        col_vals = [lm[leg] for _n, lm, _a, _s in per_set if leg in lm]
-        cell(r, c, round(sum(col_vals) / len(col_vals), 1) if col_vals else "", box=True)
-    cell(r, avg_col, round(av_mean, 1), box=True)
-    cell(r, avg_col + 1, round(lm_std, 1), box=True)            # pooled STDEV of Legs
-    ci = 1.96 * lm_std / (len(all_leg_means) ** 0.5) if all_leg_means else 0.0
-    cell(r, avg_col + 2, round(ci, 1), box=True)               # 95% CI
+    def num(v):
+        return round(v, 1) if isinstance(v, float) else ""
+
+    cell(r, col0, "Average", bold=True, fill=FILL_STAT, box=True)
+    for j, lg in enumerate(legs_order):
+        cell(r, col0 + 1 + j, num(st["leg_avg"][lg]), fill=FILL_STAT, box=True)
+    cell(r, col0 + 1 + len(legs_order), num(st["grand"]), fill=FILL_STAT, box=True)
+    cell(r, col0 + 2 + len(legs_order), num(st["std"]),   fill=FILL_STAT, box=True)
+    cell(r, col0 + 3 + len(legs_order), num(st["ci"]),    fill=FILL_STAT, box=True)
     r += 1
 
-    cell(r, 1, "STDEV", bold=True, box=True)
-    for c, leg in enumerate(legs_order, start=2):
-        col_vals = [lm[leg] for _n, lm, _a, _s in per_set if leg in lm]
-        sd = float(np.std(col_vals, ddof=1)) if len(col_vals) > 1 else 0.0
-        cell(r, c, round(sd, 1), box=True)
+    cell(r, col0, "STDEV", bold=True, fill=FILL_STAT, box=True)
+    for j, lg in enumerate(legs_order):
+        cell(r, col0 + 1 + j, num(st["leg_std"][lg]), fill=FILL_STAT, box=True)
     r += 1
 
-    cell(r, 1, "RANGE", bold=True, box=True)
-    rng = (max(all_leg_means) - min(all_leg_means)) if all_leg_means else 0.0
-    cell(r, 2, round(rng, 3), box=True)
+    cell(r, col0 + 1 + len(legs_order), "RANGE", bold=True)
+    cell(r, col0 + 2 + len(legs_order),
+         round(st["range"], 3) if st["range"] is not None else "")
     return r
+
+
+def _copy_template_tab(wb):
+    """Clone the Template tab from the shipped workbook, formulas and all.
+
+    The tab is a formula-driven outlier worksheet (IQR limits, Z scores, a
+    normal-fit histogram and a Chi-squared cell) with conditional formatting on
+    top.  It is copied verbatim rather than reimplemented: the formulas are the
+    lab's, not ours, and openpyxl writes them straight through for Excel or
+    Sheets to evaluate on open.  A missing template is not fatal — the data
+    tabs are still worth having — so this degrades to a warning.
+    """
+    from copy import copy as _copy
+    import openpyxl
+    if not os.path.exists(_TEMPLATE_PATH):
+        print(f"[analysis] template not found at {_TEMPLATE_PATH}; skipping tab")
+        return
+    src = openpyxl.load_workbook(_TEMPLATE_PATH)["Template"]
+    dst = wb.create_sheet("Template")
+    for row in src.iter_rows():
+        for c in row:
+            t = dst.cell(row=c.row, column=c.column, value=c.value)
+            if c.has_style:
+                t.font = _copy(c.font);   t.fill = _copy(c.fill)
+                t.border = _copy(c.border); t.alignment = _copy(c.alignment)
+                t.number_format = c.number_format
+    for rng, rules in src.conditional_formatting._cf_rules.items():
+        for rule in rules:
+            dst.conditional_formatting.add(str(rng.sqref), _copy(rule))
+    for k, d in src.column_dimensions.items():
+        dst.column_dimensions[k].width = d.width
+    for k, d in src.row_dimensions.items():
+        dst.row_dimensions[k].height = d.height
+    for m in src.merged_cells.ranges:
+        dst.merged_cells.add(str(m))
+
+
+def _write_ttest_tab(wb, per_test, per_ctrl, sets, n_test):
+    """Two stacked columns of raw image areas, test vs control, plus the t-test.
+
+    TTEST(...,2,3) is two-tailed, two-sample assuming UNEQUAL variance
+    (Welch's) — the right choice here, since a test film and a control have no
+    reason to share a variance.  The formula is written rather than a computed
+    number so the value updates if rows are edited by hand afterwards.
+    """
+    from openpyxl.styles import Font
+    ws = wb.create_sheet("T-Test")
+    ws["A1"] = "Test Batch";  ws["F1"] = "Control"
+    ws["A3"] = "image name";  ws["B3"] = "scratch area (pixels)"
+    ws["D3"] = "T-Test"
+    ws["F3"] = "image name";  ws["G3"] = "scratch area (pixels)"
+    for c in ("A1", "F1", "A3", "B3", "D3", "F3", "G3"):
+        ws[c].font = Font(bold=True)
+
+    def dump(group_sets, name_col, val_col):
+        r = 4
+        for name, data in group_sets:
+            for lg in _SUMMARY_LEG_ORDER:
+                for k, a in enumerate(data.get(lg, [])):
+                    ws.cell(row=r, column=name_col, value=f"{k + 1:03d}.jpg")
+                    # Written as a NUMBER on purpose: one text-formatted value
+                    # ("30,309") in the reference workbook was enough to make
+                    # TTEST return #NUM! for the whole sheet.
+                    ws.cell(row=r, column=val_col, value=int(a))
+                    r += 1
+        return r - 1
+
+    last_t = dump(sets[:n_test], 1, 2)
+    last_c = dump(sets[n_test:], 6, 7)
+    if last_t >= 4 and last_c >= 4:
+        ws["D4"] = f"=TTEST(B4:B{last_t},G4:G{last_c},2,3)"
+
+
+def _write_boxplots_tab(wb, per_test, per_ctrl, legs_order, batch,
+                        cellmaker, HDR, FILL_STAT, FILL_RED, FONT_RED):
+    """Per-pass summary tables, IQR limits, and a stock-chart box plot.
+
+    Excel has no box-plot type that openpyxl can emit, but a STOCK chart drawn
+    over (minimum, Q1, Q3, maximum) renders as exactly that — which is why the
+    reference workbook feeds one from a table it labels "sheets formatted".
+    Google Sheets imports an Excel stock chart as a candlestick, so the chart
+    survives the conversion this workbook always goes through.
+    """
+    from openpyxl.chart import StockChart, Reference
+    from openpyxl.chart.axis import ChartLines
+    from openpyxl.chart.updown_bars import UpDownBars
+    from openpyxl.utils import get_column_letter
+
+    ws = wb.create_sheet("BoxPlots")
+    cell = cellmaker(ws)
+    chart_rows = []          # (label, first data row of the block)
+    r = 2
+
+    for label, group in (("Test", per_test), ("Control", per_ctrl)):
+        if not group:
+            continue
+        passes = _zscore_passes(group)
+        stages = [("", set())]
+        for pi, removed in enumerate(passes, 1):
+            stages.append((("Outliers Removed" if len(passes) == 1
+                            else f"Outliers Removed - {pi} pass"), removed))
+        for title, removed in stages:
+            head = r + (1 if title else 0)
+            r = _write_fmt_summary_table(ws, r, 1, title, group, legs_order,
+                                         removed, cell, HDR, FILL_STAT,
+                                         FILL_RED, FONT_RED)
+            first, last = head + 1, head + len(group)
+            st = _live_stats(group, legs_order, removed)
+            vals = sorted(st["live"].values())
+            if len(vals) >= 4:
+                q1, med, q3 = (float(np.percentile(vals, p)) for p in (25, 50, 75))
+                iqr = q3 - q1
+                cols = ["Median", "Q1", "Q3", "Max", "Min", "IQR",
+                        "+1.5 IQR (outliers)", "-1.5 IQR (outliers)"]
+                nums = [med, q1, q3, max(vals), min(vals), iqr,
+                        # The reference sheet's "1.5 IQR" columns actually add a
+                        # bare IQR; these are the real 1.5x limits.
+                        q3 + 1.5 * iqr, q1 - 1.5 * iqr]
+                cell(head, 10, "Interquartile Limits", bold=True)
+                for j, (cn, v) in enumerate(zip(cols, nums)):
+                    cell(head + 1, 10 + j, cn, bold=True, fill=FILL_STAT, box=True)
+                    cell(head + 2, 10 + j, round(v, 1), box=True)
+                nm = f"{batch} {title}".strip() if title else f"{batch} Raw"
+                chart_rows.append((f"{label} — {nm}",
+                                   min(vals), q1, q3, max(vals)))
+            r += 2
+
+    # Chart source table — the column order IS the stock-chart contract:
+    # minimum, Q1, Q3, maximum (low, open, close, high).
+    if chart_rows:
+        top = r + 1
+        cell(top, 19, "Box Plot Graphing (sheets formatted)", bold=True)
+        for j, h in enumerate(["Film", "minimum", "Q1", "Q3", "maximum"]):
+            cell(top + 1, 19 + j, h, bold=True, fill=FILL_STAT, box=True)
+        for i, (nm, lo, q1, q3, hi) in enumerate(chart_rows):
+            cell(top + 2 + i, 19, nm, box=True)
+            for j, v in enumerate((lo, q1, q3, hi)):
+                cell(top + 2 + i, 20 + j, round(float(v), 1), box=True)
+
+        first, last = top + 2, top + 1 + len(chart_rows)
+        ch = StockChart()
+        data = Reference(ws, min_col=20, max_col=23, min_row=top + 1, max_row=last)
+        cats = Reference(ws, min_col=19, min_row=first, max_row=last)
+        ch.add_data(data, titles_from_data=True)
+        ch.set_categories(cats)
+        ch.title = f"{batch} — scratch area by leg"
+        ch.y_axis.title = "scratch area (pixels)"
+        ch.hiLowLines = ChartLines()      # the whisker line
+        ch.upDownBars = UpDownBars()      # the box between Q1 and Q3
+        for s in ch.series:
+            s.graphicalProperties.line.noFill = True
+        ws.add_chart(ch, f"{get_column_letter(19)}{last + 3}")
 
 
 # ── Pipeline class ────────────────────────────────────────────────────────────
