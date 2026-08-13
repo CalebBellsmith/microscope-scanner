@@ -643,9 +643,34 @@ class CapturePipeline:
 
     @staticmethod
     def _save(rgb_array, path):
-        """Save a numpy RGB array as a JPEG at quality 95, no chroma subsampling."""
+        """Save a numpy RGB array as a JPEG at quality 95, no chroma subsampling.
+
+        Written to a temporary name and then renamed into place.  The analysis
+        watcher polls this directory and analyses whatever it has not seen yet;
+        saving straight to `path` publishes the final filename the instant PIL
+        opens it, so the watcher could pick the file up while it was still being
+        written and fail on a truncated JPEG.  os.replace() is atomic on both
+        Windows and POSIX, so the watcher only ever observes a complete file.
+
+        The temp name deliberately does NOT end in .jpg/.png — the watcher
+        filters on those extensions, so a partly-written file is invisible to it
+        rather than merely unlucky.
+        """
         from PIL import Image
-        Image.fromarray(rgb_array).save(path, quality=95, subsampling=0)
+        tmp = f"{path}.part"
+        try:
+            # format must be explicit: PIL infers it from the extension, and the
+            # temp name deliberately does not end in .jpg.
+            Image.fromarray(rgb_array).save(tmp, format="JPEG",
+                                            quality=95, subsampling=0)
+            os.replace(tmp, path)
+        except Exception:
+            # Never leave a stray .part behind to be mistaken for a real capture.
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
 
 
 # ── Centroid nudge helper ─────────────────────────────────────────────────────

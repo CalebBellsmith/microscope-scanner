@@ -1147,6 +1147,25 @@ def _is_numbered_frame(fname: str) -> bool:
     return stem.isdigit() and 0 <= int(stem) <= EXPECTED_IMAGES
 
 
+# A file younger than this is assumed to be mid-write and left for the next
+# poll.  Comfortably longer than a JPEG flush, far shorter than the gap between
+# two captures, so it never delays a scan.
+_SETTLE_SECONDS = 0.25
+
+
+def _is_settled(path: str) -> bool:
+    """True if `path` was last modified long enough ago to be safe to read.
+
+    A missing file counts as unsettled rather than raising: it means the file
+    vanished between listdir() and here (a rename in progress), so skipping it
+    this round is exactly right.
+    """
+    try:
+        return (time.time() - os.path.getmtime(path)) >= _SETTLE_SECONDS
+    except OSError:
+        return False
+
+
 def _read_set_areas(workbook_path: str) -> dict:
     """
     Read one set's per-leg image scratch areas from its results workbook.
@@ -1426,6 +1445,14 @@ class AnalysisPipeline:
     Watches leg_dir (set_dir/leg/) for new images and processes them.
     When done, triggers set-level Excel export via on_leg_done callback.
     """
+
+    # A frame that fails to analyse is retried rather than abandoned — a single
+    # unlucky read used to cost a whole image out of the 30.  Three attempts is
+    # enough to ride out any transient (a file still flushing, a momentary lock)
+    # while still giving up promptly on a genuinely unreadable file.
+    _MAX_ATTEMPTS = 3
+    _RETRY_DELAY  = 0.4      # seconds to wait when every candidate was deferred
+
     def __init__(self, leg_dir,
                  on_progress=None, on_done=None, on_error=None,
                  on_image=None, total_expected=None, mode="legacy",
@@ -1465,6 +1492,7 @@ class AnalysisPipeline:
     def _run(self):
         try:
             processed = set()
+            attempts = {}          # fname → failed attempts so far
             all_results = []
             done = 0
             idle_ticks = 0
@@ -1483,9 +1511,15 @@ class AnalysisPipeline:
                         # frames 000..030, nothing else.  (Live/"both" capture
                         # writes its own frames, so no need to filter there.)
                         and (self._live_capture or _is_numbered_frame(f))
+                        # Belt and braces alongside the atomic save in
+                        # capture_pipeline: ignore anything written in the last
+                        # fraction of a second, so a file still being flushed by
+                        # some other writer is left alone until it settles.
+                        and _is_settled(os.path.join(self._dir, f))
                     )
                     if images:
                         idle_ticks = 0
+                        advanced = False       # did anything actually complete?
                         for fname in images:
                             if self._stop_event.is_set():
                                 break
@@ -1503,11 +1537,31 @@ class AnalysisPipeline:
                                 # Live preview of the annotated overlay
                                 self._on_image(result["overlay_path"], fname)
                             except Exception as e:
-                                rf.write(json.dumps({"file": fname, "error": str(e)}) + "\n")
+                                # A failure here used to retire the frame for good,
+                                # so one unlucky read cost a whole image out of the
+                                # 30 — the file was fine a moment later, but nothing
+                                # ever looked at it again.  Retry a few polls later
+                                # instead, and only give up (and record the error)
+                                # once it has genuinely failed _MAX_ATTEMPTS times.
+                                attempts[fname] = attempts.get(fname, 0) + 1
+                                if attempts[fname] < self._MAX_ATTEMPTS:
+                                    continue          # leave unprocessed; retry
+                                rf.write(json.dumps({
+                                    "file": fname,
+                                    "error": str(e),
+                                    "attempts": attempts[fname],
+                                }) + "\n")
                                 rf.flush()
                             processed.add(fname)
+                            advanced = True
                             done += 1
                             self._on_progress(done, self._total)
+                        # Every candidate was deferred for a retry.  Without a
+                        # pause the loop would spin at full CPU re-reading the
+                        # same half-written file, which is exactly the condition
+                        # that stops it settling.
+                        if not advanced:
+                            time.sleep(self._RETRY_DELAY)
                     else:
                         idle_ticks += 1
                         # While capture is still live, never stop on an idle gap
