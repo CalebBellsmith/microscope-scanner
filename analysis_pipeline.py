@@ -1209,11 +1209,18 @@ def collect_sets(parent_dir: str) -> list:
         new    = sorted(f for f in files if f.endswith("_results.xlsx"))
         legacy = sorted(f for f in files if f.endswith("_scratch_count.xlsx"))
         if new:
-            path, name = os.path.join(root, new[0]), new[0][:-len("_results.xlsx")]
+            path, stem = os.path.join(root, new[0]), new[0][:-len("_results.xlsx")]
         elif legacy:
-            path, name = os.path.join(root, legacy[0]), legacy[0][:-len("_scratch_count.xlsx")]
+            path, stem = os.path.join(root, legacy[0]), legacy[0][:-len("_scratch_count.xlsx")]
         else:
             continue
+        # Name the set after its FOLDER, not the workbook inside it.  The two
+        # drift apart — a folder called "Control C39 S1" can hold a workbook
+        # called "C39 S1_results.xlsx" — and the folder is what the operator
+        # actually types, so it is what control detection has to read.  Falling
+        # back to the workbook stem covers a set sitting loose in parent_dir.
+        name = (os.path.basename(root)
+                if os.path.abspath(root) != os.path.abspath(parent_dir) else stem)
         data = _read_set_areas(path)
         if data:
             sets.append((name, data))
@@ -1307,31 +1314,40 @@ def _live_stats(per_set: list, legs_order: list, removed: set) -> dict:
 
 def write_summarize_format(parent_dir: str, sets: list, out_path: str = None) -> str:
     """
-    Combine many sets into one workbook mirroring the C8 'Data set' layout:
-      • a horizontal block per set — raw per-image areas (BL/BR/FL/FR) → descStats
-        → ANOVA table → pairwise comparisons;
-      • a second 'By C-group' tab — for each C-group (sets sharing a leading
-        C-token, e.g. "C39", "C51") a pair of Film summary tables: leg-means with
-        per-set Average and STDEV of Legs plus aggregate Average/STDEV/RANGE, then
-        an identical 'Outliers Removed' copy where outlier cells are FLAGGED RED
-        (never deleted).  A leg cell is flagged if its mean lies outside that
-        group's leg-mean mean ± 1.96·stdev, and an Average cell if the set average
-        lies outside the group's set-average mean ± 1.96·stdev — so each sample is
-        judged against its own replicates, not the whole run.
+    Build the lab's wet-abrasion summary workbook, four tabs:
+      • <batch> — a horizontal block per set (raw per-image areas by leg →
+        descStats → ANOVA → pairwise), test films first, then a full-height
+        black separator column, then the controls.  Below them, paired summary
+        tables: test on the left, controls past the separator, one table per
+        outlier pass.  Outlier cells keep their value and are flagged red;
+        only the arithmetic excludes them.
+      • Template — the lab's outlier worksheet, copied verbatim with its
+        formulas and conditional formatting intact.
+      • T-Test — pooled image areas, test vs control, plus =TTEST(...,2,3).
+      • BoxPlots — per-pass tables, IQR limits, and a stock-chart box plot.
     Returns the written path.
     """
     import datetime
     import openpyxl
     from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 
-    HDR       = Font(bold=True)
-    FILL_HDR  = PatternFill("solid", start_color="D9E1F2")
-    FILL_STAT = PatternFill("solid", start_color="EBF1DE")
-    FILL_RED  = PatternFill("solid", start_color="FFC7CE")   # outlier flag
-    FONT_RED  = Font(color="9C0006", bold=True)
-    THIN = Side(style="thin")
-    BOX  = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
-    CTR  = Alignment(horizontal="center")
+    # Styling follows the lab's reference sheet rather than our own taste: Arial
+    # for structure (set names, leg headers, summary tables), Calibri 11 for raw
+    # data, essentially NO background fill, and borders only where they separate
+    # something — a grid drawn on every cell reads as noise at this density.
+    HDR       = Font(name="Arial", size=10, bold=True)
+    FONT_ARI  = Font(name="Arial", size=10)
+    FONT_BODY = Font(name="Calibri", size=11)
+    FILL_HDR  = PatternFill("solid", start_color="FFD9E1F2")
+    FILL_STAT = None                                   # reference uses no fill
+    FILL_TOT  = PatternFill("solid", start_color="FFFFF2CC")  # grand avg/stdev
+    FILL_RED  = PatternFill("solid", start_color="FFFFC7CE")  # outlier flag
+    FONT_RED  = Font(name="Arial", size=10, color="9C0006", bold=True)
+    THIN  = Side(style="thin")
+    THICK = Side(style="thick")
+    BOX   = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
+    CTR   = Alignment(horizontal="center")
+    FMT_1D, FMT_3D, FMT_SCI = "0.0", "0.000", "0.00E+00"
 
     # Fully-opaque black (FF alpha).  A bare "000000" is stored with alpha 00,
     # which some readers treat as transparent rather than black.
@@ -1365,9 +1381,12 @@ def write_summarize_format(parent_dir: str, sets: list, out_path: str = None) ->
 
     # Metadata header (rows 1-3): labels only — who ran it and the run order are
     # facts the scanner has no way to know, so they are left blank to fill in.
-    cell(1, 1, "Date Completed", bold=True)
-    cell(2, 1, "Completed By", bold=True)
-    cell(3, 1, "Notes", bold=True)
+    for ri, label in enumerate(("Date Completed", "Completed By", "Notes"), 1):
+        c = cell(ri, 1, label, font=FONT_ARI)
+        c.alignment = Alignment(horizontal="left")
+        c.border = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
+        ws.cell(row=ri, column=2).border = Border(right=THIN, top=THIN, bottom=THIN)
+    ws.column_dimensions["A"].width = 17.6
 
     # ── Top: one horizontal block per set (below the metadata header) ──────────
     BLOCK_TOP  = 5                        # first block row (leaves rows 1-3 for meta)
@@ -1388,39 +1407,73 @@ def write_summarize_format(parent_dir: str, sets: list, out_path: str = None) ->
         """First column of set i, stepping over the black column for controls."""
         return 1 + i * SET_STRIDE + (1 if (split and i >= n_test) else 0)
 
+    stats_labels = [lbl for lbl, _ in _desc_stats([0, 1])]
     for i, (name, data) in enumerate(sets):
         c0 = set_col0(i)
-        cell(BLOCK_TOP, c0, name, bold=True)
+        # Set name spans the whole block, leg names span their two columns —
+        # without the merges the headers float above the wrong column and the
+        # sheet reads as 48 unlabelled columns.
+        ws.merge_cells(start_row=BLOCK_TOP, start_column=c0,
+                       end_row=BLOCK_TOP, end_column=c0 + SET_WIDTH - 1)
+        h = cell(BLOCK_TOP, c0, name, ctr=True, font=FONT_ARI)
+        h.border = Border(left=THICK, right=THICK, top=THICK, bottom=THIN)
+
         for j, leg in enumerate(legs_order):
             nc = c0 + j * 2               # image-name column for this leg
-            cell(BLOCK_TOP + 1, nc, leg, bold=True, box=True, ctr=True)
-            cell(BLOCK_TOP + 2, nc,     "image name",            bold=True, box=True)
-            cell(BLOCK_TOP + 2, nc + 1, "scratch area (pixels)", bold=True, box=True)
+            ws.merge_cells(start_row=BLOCK_TOP + 1, start_column=nc,
+                           end_row=BLOCK_TOP + 1, end_column=nc + 1)
+            lc = cell(BLOCK_TOP + 1, nc, leg, ctr=True, font=FONT_ARI)
+            lc.border = Border(left=THICK if j == 0 else THIN,
+                               right=THICK if j == len(legs_order) - 1 else THIN,
+                               top=THIN, bottom=THIN)
+            edge_l = THICK if j == 0 else THIN
+            edge_r = THICK if j == len(legs_order) - 1 else None
+            cell(BLOCK_TOP + 2, nc,     "image name",            font=FONT_BODY)
+            cell(BLOCK_TOP + 2, nc + 1, "scratch area (pixels)", font=FONT_BODY)
+            ws.cell(row=BLOCK_TOP + 2, column=nc).border = Border(left=edge_l)
+            if edge_r:
+                ws.cell(row=BLOCK_TOP + 2, column=nc + 1).border = Border(right=edge_r)
+
             areas = data.get(leg, [])
             r = BLOCK_TOP + 3
             for k, a in enumerate(areas):
-                cell(r, nc,     f"{k + 1:03d}.jpg", box=True)
-                cell(r, nc + 1, a,                  box=True)
+                c = cell(r, nc, f"{k + 1:03d}.jpg", font=FONT_BODY)
+                c.border = Border(left=edge_l)
+                v = cell(r, nc + 1, a, font=FONT_BODY)
+                if edge_r:
+                    v.border = Border(right=edge_r)
                 r += 1
             if areas:                     # descStats block below the raw rows
-                for label, value in _desc_stats(areas):
-                    cell(r, nc,     label, fill=FILL_STAT, box=True)
-                    cell(r, nc + 1, value, fill=FILL_STAT, box=True)
+                for si, (label, value) in enumerate(_desc_stats(areas)):
+                    top_s  = THIN  if si == 0 else None
+                    bot_s  = THICK if si == len(stats_labels) - 1 else None
+                    lc2 = cell(r, nc, label, font=FONT_BODY)
+                    lc2.border = Border(left=edge_l, top=top_s, bottom=bot_s)
+                    vc = cell(r, nc + 1, value, font=FONT_BODY)
+                    vc.border = Border(right=edge_r, top=top_s, bottom=bot_s)
+                    # Variance runs to ~1e9; scientific keeps the column narrow,
+                    # which is what the reference does with this row alone.
+                    if label == "sample variance":
+                        vc.number_format = FMT_SCI
                     r += 1
 
         # ANOVA + pairwise for this set (needs ≥2 legs)
         present = {lg: data[lg] for lg in legs_order if lg in data}
         if len(present) >= 2:
             anova_rows, pair_rows = _anova_rows(present, order=legs_order)
-            ar = BLOCK_TOP + 3 + N_IMG + len(_desc_stats([0])) + 2   # below the stats
+            ar = BLOCK_TOP + 3 + N_IMG + len(stats_labels) + 2   # below the stats
             for gi, arow in enumerate(anova_rows):
                 for dc, val in enumerate(arow):
-                    cell(ar, c0 + dc, val, bold=(gi == 0), box=True)
+                    c = cell(ar, c0 + dc, val, font=FONT_BODY)
+                    if gi == 0:
+                        c.font = HDR
+                    elif dc in (1, 3) and isinstance(val, (int, float)):
+                        c.number_format = FMT_SCI      # SS and MS are ~1e8-1e11
                 ar += 1
             ar += 1
             for prow in pair_rows:
                 for dc, val in enumerate(prow):
-                    cell(ar, c0 + dc, val, box=True)
+                    cell(ar, c0 + dc, val, font=FONT_BODY)
                 ar += 1
 
         # Per-set summary numbers (display leg order; only present legs count)
@@ -1506,56 +1559,81 @@ def _write_fmt_summary_table(ws, top, col0, title, group, legs_order, removed,
     the table ignores them — the reference sheet blanks them instead, which
     loses the evidence of what was dropped.
     """
+    from openpyxl.styles import Border, Side, Font, PatternFill, Alignment
+    THIN, THICK = Side(style="thin"), Side(style="thick")
+    ARI     = Font(name="Arial", size=10)
+    ARI_B   = Font(name="Arial", size=10, bold=True)
+    TOT     = PatternFill("solid", start_color="FFFFF2CC")
+    nlegs   = len(legs_order)
+    last_c  = col0 + 3 + nlegs
+
+    def put(rr, cc, v, *, font=ARI, fill=None, fmt="0.0", top=None, bottom=None):
+        c = ws.cell(row=rr, column=cc, value=v)
+        c.font = font
+        c.border = Border(left=THICK if cc == col0 else THIN,
+                          right=THICK if cc == last_c else THIN,
+                          top=top, bottom=bottom)
+        if fill:
+            c.fill = fill
+        if isinstance(v, float):
+            c.number_format = fmt
+        return c
+
     r = top
     if title:
-        cell(r, col0, title, bold=True)
+        cell(r, col0, title, font=ARI_B)
         r += 1
-    headers = ["Film"] + legs_order + ["Average", "STDEV of Legs",
-                                       "95% Confidence Interval"]
-    for j, h in enumerate(headers):
-        cell(r, col0 + j, h, bold=True, fill=FILL_STAT, box=True, ctr=True)
+    for j, h in enumerate(["Film"] + legs_order +
+                          ["Average", "STDEV of Legs", "95% Confidence Interval"]):
+        put(r, col0 + j, h, font=ARI_B, top=THICK, bottom=THIN)
     r += 1
 
     st = _live_stats(group, legs_order, removed)
     for i, (name, lm, _a, _s) in enumerate(group):
-        cell(r, col0, name, box=True)
+        put(r, col0, name)
         kept = []
         for j, lg in enumerate(legs_order):
             if lg not in lm:
-                cell(r, col0 + 1 + j, "", box=True)
+                put(r, col0 + 1 + j, None)
                 continue
             flagged = (i, lg) in removed
-            c = cell(r, col0 + 1 + j, round(lm[lg], 1), box=True,
-                     fill=FILL_RED if flagged else None)
+            c = put(r, col0 + 1 + j, round(lm[lg], 1),
+                    fill=FILL_RED if flagged else None)
             if flagged:
                 c.font = FONT_RED
             else:
                 kept.append(lm[lg])
-        cell(r, col0 + 1 + len(legs_order),
-             round(sum(kept) / len(kept), 1) if kept else "", box=True)
-        cell(r, col0 + 2 + len(legs_order),
-             round(float(np.std(kept, ddof=1)), 1) if len(kept) > 1 else "", box=True)
+        put(r, col0 + 1 + nlegs,
+            round(sum(kept) / len(kept), 1) if kept else None)
+        put(r, col0 + 2 + nlegs,
+            round(float(np.std(kept, ddof=1)), 1) if len(kept) > 1 else None)
+        put(r, col0 + 3 + nlegs, None)
         r += 1
 
     def num(v):
-        return round(v, 1) if isinstance(v, float) else ""
+        return round(v, 1) if isinstance(v, float) else None
 
-    cell(r, col0, "Average", bold=True, fill=FILL_STAT, box=True)
+    put(r, col0, "Average", font=ARI_B, top=THIN)
     for j, lg in enumerate(legs_order):
-        cell(r, col0 + 1 + j, num(st["leg_avg"][lg]), fill=FILL_STAT, box=True)
-    cell(r, col0 + 1 + len(legs_order), num(st["grand"]), fill=FILL_STAT, box=True)
-    cell(r, col0 + 2 + len(legs_order), num(st["std"]),   fill=FILL_STAT, box=True)
-    cell(r, col0 + 3 + len(legs_order), num(st["ci"]),    fill=FILL_STAT, box=True)
+        put(r, col0 + 1 + j, num(st["leg_avg"][lg]), top=THIN)
+    # The grand average and its stdev are the numbers people quote, so the
+    # reference tints just those two — the only fill on the whole table.
+    put(r, col0 + 1 + nlegs, num(st["grand"]), fill=TOT, top=THIN)
+    put(r, col0 + 2 + nlegs, num(st["std"]),   fill=TOT, top=THIN)
+    put(r, col0 + 3 + nlegs, num(st["ci"]),    top=THIN)
     r += 1
 
-    cell(r, col0, "STDEV", bold=True, fill=FILL_STAT, box=True)
+    put(r, col0, "STDEV", font=ARI_B, bottom=THICK)
     for j, lg in enumerate(legs_order):
-        cell(r, col0 + 1 + j, num(st["leg_std"][lg]), fill=FILL_STAT, box=True)
+        put(r, col0 + 1 + j, num(st["leg_std"][lg]), bottom=THICK)
+    for j in range(1, 4):
+        put(r, col0 + j + nlegs, None, bottom=THICK)
     r += 1
 
-    cell(r, col0 + 1 + len(legs_order), "RANGE", bold=True)
-    cell(r, col0 + 2 + len(legs_order),
-         round(st["range"], 3) if st["range"] is not None else "")
+    ws.cell(row=r, column=col0 + 1 + nlegs, value="RANGE").font = ARI_B
+    rc = ws.cell(row=r, column=col0 + 2 + nlegs,
+                 value=round(st["range"], 3) if st["range"] is not None else None)
+    rc.font, rc.number_format = ARI, "0.000"
     return r
 
 
@@ -1640,8 +1718,9 @@ def _write_boxplots_tab(wb, per_test, per_ctrl, legs_order, batch,
     Google Sheets imports an Excel stock chart as a candlestick, so the chart
     survives the conversion this workbook always goes through.
     """
-    from openpyxl.chart import StockChart, Reference
+    from openpyxl.chart import StockChart, Reference, Series
     from openpyxl.chart.axis import ChartLines
+    from openpyxl.chart.data_source import StrRef
     from openpyxl.chart.updown_bars import UpDownBars
     from openpyxl.utils import get_column_letter
 
@@ -1698,16 +1777,27 @@ def _write_boxplots_tab(wb, per_test, per_ctrl, legs_order, batch,
 
         first, last = top + 2, top + 1 + len(chart_rows)
         ch = StockChart()
-        data = Reference(ws, min_col=20, max_col=23, min_row=top + 1, max_row=last)
+        # An Excel stock chart is Open-High-Low-Close and the series order IS
+        # the contract — feeding it in table order (min, Q1, Q3, max) gives the
+        # hi-low lines and up-down bars nothing coherent to span, so the boxes
+        # and whiskers silently vanish.  Map the quartiles onto OHLC instead:
+        #   Open = Q1 (col 21)   High = max (23)   Low = min (20)   Close = Q3 (22)
+        for col in (21, 23, 20, 22):
+            ser = Series(Reference(ws, min_col=col, min_row=top + 1, max_row=last),
+                         title_from_data=True)
+            ser.graphicalProperties.line.noFill = True   # points only; bars draw
+            ch.series.append(ser)
+        # Categories are film NAMES — they must be a string reference.  As a
+        # numeric one every label reads as 0 and the axis comes out blank.
         cats = Reference(ws, min_col=19, min_row=first, max_row=last)
-        ch.add_data(data, titles_from_data=True)
         ch.set_categories(cats)
-        ch.title = f"{batch} — scratch area by leg"
+        for ser in ch.series:
+            ser.cat.numRef, ser.cat.strRef = None, StrRef(f=str(cats))
+        ch.title = f"{batch} — scratch area distribution"
         ch.y_axis.title = "scratch area (pixels)"
-        ch.hiLowLines = ChartLines()      # the whisker line
-        ch.upDownBars = UpDownBars()      # the box between Q1 and Q3
-        for s in ch.series:
-            s.graphicalProperties.line.noFill = True
+        ch.hiLowLines = ChartLines()      # the whiskers, min → max
+        ch.upDownBars = UpDownBars()      # the box, Q1 → Q3
+        ch.height, ch.width = 9, 20
         ws.add_chart(ch, f"{get_column_letter(19)}{last + 3}")
 
 
