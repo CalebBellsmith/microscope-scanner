@@ -1324,7 +1324,8 @@ def write_summarize_format(parent_dir: str, sets: list, out_path: str = None) ->
       • Template — the lab's outlier worksheet, copied verbatim with its
         formulas and conditional formatting intact.
       • T-Test — pooled image areas, test vs control, plus =TTEST(...,2,3).
-      • BoxPlots — per-pass tables, IQR limits, and a stock-chart box plot.
+      • BoxPlots — per-pass tables, IQR limits, and a min/Q1/Q3/max table
+        laid out ready to chart from.
     Returns the written path.
     """
     import datetime
@@ -1783,20 +1784,13 @@ def _write_ttest_tab(wb, per_test, per_ctrl, sets, n_test):
 def _write_boxplots_tab(wb, per_test, per_ctrl, legs_order, batch,
                         cellmaker, HDR, FILL_STAT, FILL_RED, FONT_RED,
                         mean_refs=None):
-    """Per-pass summary tables, IQR limits, and a stock-chart box plot.
+    """Per-pass summary tables, IQR limits, and the box-plot source table.
 
-    Excel has no box-plot type that openpyxl can emit, but a STOCK chart drawn
-    over (minimum, Q1, Q3, maximum) renders as exactly that — which is why the
-    reference workbook feeds one from a table it labels "sheets formatted".
-    Google Sheets imports an Excel stock chart as a candlestick, so the chart
-    survives the conversion this workbook always goes through.
+    The tab ends at the numbers.  Excel has no box-plot type openpyxl can emit,
+    and the stock-chart substitute rendered badly once the workbook was
+    converted to a Google Sheet, so the drawing is left to whoever wants it —
+    the (minimum, Q1, Q3, maximum) table is laid out ready to chart from.
     """
-    from openpyxl.chart import StockChart, Reference, Series
-    from openpyxl.chart.axis import ChartLines
-    from openpyxl.chart.data_source import StrRef
-    from openpyxl.chart.updown_bars import UpDownBars
-    from openpyxl.utils import get_column_letter
-
     ws = wb.create_sheet("BoxPlots")
     cell = cellmaker(ws)
     chart_rows = []          # (label, first data row of the block)
@@ -1817,7 +1811,6 @@ def _write_boxplots_tab(wb, per_test, per_ctrl, legs_order, batch,
             r = _write_fmt_summary_table(ws, r, 1, title, group, legs_order,
                                          removed, cell, HDR, FILL_STAT,
                                          FILL_RED, FONT_RED, mean_ref=mref)
-            first, last = head + 1, head + len(group)
             st = _live_stats(group, legs_order, removed)
             vals = sorted(st["live"].values())
             if len(vals) >= 4:
@@ -1838,8 +1831,8 @@ def _write_boxplots_tab(wb, per_test, per_ctrl, legs_order, batch,
                                    min(vals), q1, q3, max(vals)))
             r += 2
 
-    # Chart source table — the column order IS the stock-chart contract:
-    # minimum, Q1, Q3, maximum (low, open, close, high).
+    # Box-plot source table, kept in the reference sheet's column order:
+    # minimum, Q1, Q3, maximum.
     if chart_rows:
         top = r + 1
         cell(top, 19, "Box Plot Graphing (sheets formatted)", bold=True)
@@ -1850,30 +1843,10 @@ def _write_boxplots_tab(wb, per_test, per_ctrl, legs_order, batch,
             for j, v in enumerate((lo, q1, q3, hi)):
                 cell(top + 2 + i, 20 + j, round(float(v), 1), box=True)
 
-        first, last = top + 2, top + 1 + len(chart_rows)
-        ch = StockChart()
-        # An Excel stock chart is Open-High-Low-Close and the series order IS
-        # the contract — feeding it in table order (min, Q1, Q3, max) gives the
-        # hi-low lines and up-down bars nothing coherent to span, so the boxes
-        # and whiskers silently vanish.  Map the quartiles onto OHLC instead:
-        #   Open = Q1 (col 21)   High = max (23)   Low = min (20)   Close = Q3 (22)
-        for col in (21, 23, 20, 22):
-            ser = Series(Reference(ws, min_col=col, min_row=top + 1, max_row=last),
-                         title_from_data=True)
-            ser.graphicalProperties.line.noFill = True   # points only; bars draw
-            ch.series.append(ser)
-        # Categories are film NAMES — they must be a string reference.  As a
-        # numeric one every label reads as 0 and the axis comes out blank.
-        cats = Reference(ws, min_col=19, min_row=first, max_row=last)
-        ch.set_categories(cats)
-        for ser in ch.series:
-            ser.cat.numRef, ser.cat.strRef = None, StrRef(f=str(cats))
-        ch.title = f"{batch} — scratch area distribution"
-        ch.y_axis.title = "scratch area (pixels)"
-        ch.hiLowLines = ChartLines()      # the whiskers, min → max
-        ch.upDownBars = UpDownBars()      # the box, Q1 → Q3
-        ch.height, ch.width = 9, 20
-        ws.add_chart(ch, f"{get_column_letter(19)}{last + 3}")
+        # No chart object is emitted.  A stock chart was the only box-plot
+        # substitute openpyxl can write, and it did not survive the trip through
+        # Google Sheets cleanly.  The table above is the whole payload: select
+        # it and insert a candlestick chart if you want one drawn.
 
 
 # ── Pipeline class ────────────────────────────────────────────────────────────
