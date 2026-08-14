@@ -1512,21 +1512,39 @@ def write_summarize_format(parent_dir: str, sets: list, out_path: str = None) ->
                          else f"Outliers Removed - {pi} pass"), removed))
         return out
 
-    cols = [(per_test, stages_for(per_test), 1)]
+    # Live references back into the raw block: each leg cell in a summary table
+    # points at that leg's descStats "mean", and the set name at its header —
+    # so correcting a raw area re-flows the whole summary.  Sheet-qualified and
+    # quoted because the BoxPlots tab reuses the same tables.
+    from openpyxl.utils import get_column_letter as _colletter
+    MEAN_ROW = BLOCK_TOP + 3 + N_IMG              # first descStats row = mean
+    qname    = "'" + ws.title.replace("'", "''") + "'"
+
+    def make_mean_ref(offset):
+        def ref(i, leg):
+            c0i = set_col0(offset + i)
+            if leg == "NAME":
+                return f"{qname}!{_colletter(c0i)}${BLOCK_TOP}"
+            j = legs_order.index(leg)
+            return f"{qname}!{_colletter(c0i + j * 2 + 1)}${MEAN_ROW}"
+        return ref
+
+    cols = [(per_test, stages_for(per_test), 1, make_mean_ref(0))]
     if per_ctrl and CTRL_COL0:
-        cols.append((per_ctrl, stages_for(per_ctrl), CTRL_COL0))
+        cols.append((per_ctrl, stages_for(per_ctrl), CTRL_COL0,
+                     make_mean_ref(n_test)))
 
     sum_top = raw_last + 3
     r = sum_top
-    for si in range(max(len(s) for _g, s, _c in cols)):
+    for si in range(max(len(s) for _g, s, _c, _m in cols)):
         ends = []
-        for group, stages, col0 in cols:
+        for group, stages, col0, mref in cols:
             if si >= len(stages):
                 continue
             title, removed = stages[si]
             ends.append(_write_fmt_summary_table(
                 ws, r, col0, title, group, legs_order, removed,
-                cell, HDR, FILL_STAT, FILL_RED, FONT_RED))
+                cell, HDR, FILL_STAT, FILL_RED, FONT_RED, mean_ref=mref))
         r = max(ends) + 2
     last_rows = [r]
 
@@ -1541,7 +1559,8 @@ def write_summarize_format(parent_dir: str, sets: list, out_path: str = None) ->
     _write_ttest_tab(wb, per_test, per_ctrl, sets, n_test)
     _write_boxplots_tab(wb, per_test, per_ctrl, legs_order, batch,
                         cellmaker=make_cell, HDR=HDR, FILL_STAT=FILL_STAT,
-                        FILL_RED=FILL_RED, FONT_RED=FONT_RED)
+                        FILL_RED=FILL_RED, FONT_RED=FONT_RED,
+                        mean_refs=[m for _g, _s, _c, m in cols])
 
     out_path = out_path or os.path.join(
         parent_dir, f"{os.path.basename(os.path.abspath(parent_dir))}_summary.xlsx")
@@ -1550,7 +1569,8 @@ def write_summarize_format(parent_dir: str, sets: list, out_path: str = None) ->
 
 
 def _write_fmt_summary_table(ws, top, col0, title, group, legs_order, removed,
-                             cell, HDR, FILL_STAT, FILL_RED, FONT_RED):
+                             cell, HDR, FILL_STAT, FILL_RED, FONT_RED,
+                             mean_ref=None):
     """One Film summary table at (top, col0).  Returns its last row.
 
     Columns: Film | <legs> | Average | STDEV of Legs | 95% Confidence Interval,
@@ -1558,6 +1578,15 @@ def _write_fmt_summary_table(ws, top, col0, title, group, legs_order, removed,
     are written with their real value but flagged red, and every statistic on
     the table ignores them — the reference sheet blanks them instead, which
     loses the evidence of what was dropped.
+
+    With `mean_ref` (a callable (set_index, leg) → an absolute cell reference
+    for that leg's mean in the raw block) the table is written as LIVE FORMULAS
+    instead of literals: each leg cell points at its descStats mean, and every
+    statistic is an AVERAGE/STDEV over an explicit list of the surviving cells.
+    Enumerating the survivors rather than using a range is the whole trick — a
+    plain AVERAGE(B62:E62) would quietly pull the red-flagged outliers back in,
+    which is exactly what the pass exists to exclude.  Edit a raw area and the
+    summary follows; the outlier decisions stay put.
     """
     from openpyxl.styles import Border, Side, Font, PatternFill, Alignment
     THIN, THICK = Side(style="thin"), Side(style="thick")
@@ -1588,51 +1617,94 @@ def _write_fmt_summary_table(ws, top, col0, title, group, legs_order, removed,
         put(r, col0 + j, h, font=ARI_B, top=THICK, bottom=THIN)
     r += 1
 
-    st = _live_stats(group, legs_order, removed)
+    from openpyxl.utils import get_column_letter as _cl
+    st   = _live_stats(group, legs_order, removed)
+    live = st["live"]
+    body_top = r
+    kept_at  = {}                 # (set_idx, leg) → this table's cell address
+
     for i, (name, lm, _a, _s) in enumerate(group):
-        put(r, col0, name)
-        kept = []
+        put(r, col0, (f"={mean_ref(i, 'NAME')}" if mean_ref else name), fmt=None)
+        kept_refs = []
         for j, lg in enumerate(legs_order):
+            addr = f"{_cl(col0 + 1 + j)}{r}"
             if lg not in lm:
                 put(r, col0 + 1 + j, None)
                 continue
             flagged = (i, lg) in removed
-            c = put(r, col0 + 1 + j, round(lm[lg], 1),
-                    fill=FILL_RED if flagged else None)
+            val = f"={mean_ref(i, lg)}" if mean_ref else round(lm[lg], 1)
+            c = put(r, col0 + 1 + j, val, fill=FILL_RED if flagged else None)
+            c.number_format = "0.0"
             if flagged:
                 c.font = FONT_RED
             else:
-                kept.append(lm[lg])
-        put(r, col0 + 1 + nlegs,
-            round(sum(kept) / len(kept), 1) if kept else None)
-        put(r, col0 + 2 + nlegs,
-            round(float(np.std(kept, ddof=1)), 1) if len(kept) > 1 else None)
+                kept_refs.append(addr)
+                kept_at[(i, lg)] = addr
+        # Explicit survivor list, never a range — that is what keeps the red
+        # cells out of the arithmetic while leaving them on the sheet.
+        if mean_ref and kept_refs:
+            joined = ",".join(kept_refs)
+            put(r, col0 + 1 + nlegs, f"=AVERAGE({joined})")
+            put(r, col0 + 2 + nlegs,
+                f"=STDEV({joined})" if len(kept_refs) > 1 else None)
+        else:
+            kv = [lm[lg] for lg in legs_order
+                  if lg in lm and (i, lg) not in removed]
+            put(r, col0 + 1 + nlegs, round(sum(kv) / len(kv), 1) if kv else None)
+            put(r, col0 + 2 + nlegs,
+                round(float(np.std(kv, ddof=1)), 1) if len(kv) > 1 else None)
         put(r, col0 + 3 + nlegs, None)
         r += 1
 
     def num(v):
         return round(v, 1) if isinstance(v, float) else None
 
+    all_kept = list(kept_at.values())
+    col_kept = {lg: [a for (ii, l), a in kept_at.items() if l == lg]
+                for lg in legs_order}
+
+    def agg(fn, refs):
+        return f"={fn}({','.join(refs)})" if refs else None
+
     put(r, col0, "Average", font=ARI_B, top=THIN)
     for j, lg in enumerate(legs_order):
-        put(r, col0 + 1 + j, num(st["leg_avg"][lg]), top=THIN)
+        put(r, col0 + 1 + j,
+            agg("AVERAGE", col_kept[lg]) if mean_ref else num(st["leg_avg"][lg]),
+            top=THIN)
     # The grand average and its stdev are the numbers people quote, so the
     # reference tints just those two — the only fill on the whole table.
-    put(r, col0 + 1 + nlegs, num(st["grand"]), fill=TOT, top=THIN)
-    put(r, col0 + 2 + nlegs, num(st["std"]),   fill=TOT, top=THIN)
-    put(r, col0 + 3 + nlegs, num(st["ci"]),    top=THIN)
+    std_addr = f"{_cl(col0 + 2 + nlegs)}{r}"
+    put(r, col0 + 1 + nlegs,
+        agg("AVERAGE", all_kept) if mean_ref else num(st["grand"]),
+        fill=TOT, top=THIN)
+    put(r, col0 + 2 + nlegs,
+        agg("STDEV", all_kept) if mean_ref else num(st["std"]),
+        fill=TOT, top=THIN)
+    # CONFIDENCE wants the surviving count, not a hard-coded 16 as the
+    # reference uses — that only happens to be right for four full sets.
+    put(r, col0 + 3 + nlegs,
+        (f"=CONFIDENCE(0.05,{std_addr},{len(all_kept)})"
+         if (mean_ref and all_kept) else num(st["ci"])),
+        top=THIN)
     r += 1
 
     put(r, col0, "STDEV", font=ARI_B, bottom=THICK)
     for j, lg in enumerate(legs_order):
-        put(r, col0 + 1 + j, num(st["leg_std"][lg]), bottom=THICK)
+        refs = col_kept[lg]
+        put(r, col0 + 1 + j,
+            (agg("STDEV", refs) if len(refs) > 1 else None) if mean_ref
+            else num(st["leg_std"][lg]),
+            bottom=THICK)
     for j in range(1, 4):
         put(r, col0 + j + nlegs, None, bottom=THICK)
     r += 1
 
     ws.cell(row=r, column=col0 + 1 + nlegs, value="RANGE").font = ARI_B
     rc = ws.cell(row=r, column=col0 + 2 + nlegs,
-                 value=round(st["range"], 3) if st["range"] is not None else None)
+                 value=(f"=MAX({','.join(all_kept)})-MIN({','.join(all_kept)})"
+                        if (mean_ref and all_kept)
+                        else (round(st["range"], 3)
+                              if st["range"] is not None else None)))
     rc.font, rc.number_format = ARI, "0.000"
     return r
 
@@ -1709,7 +1781,8 @@ def _write_ttest_tab(wb, per_test, per_ctrl, sets, n_test):
 
 
 def _write_boxplots_tab(wb, per_test, per_ctrl, legs_order, batch,
-                        cellmaker, HDR, FILL_STAT, FILL_RED, FONT_RED):
+                        cellmaker, HDR, FILL_STAT, FILL_RED, FONT_RED,
+                        mean_refs=None):
     """Per-pass summary tables, IQR limits, and a stock-chart box plot.
 
     Excel has no box-plot type that openpyxl can emit, but a STOCK chart drawn
@@ -1729,9 +1802,11 @@ def _write_boxplots_tab(wb, per_test, per_ctrl, legs_order, batch,
     chart_rows = []          # (label, first data row of the block)
     r = 2
 
-    for label, group in (("Test", per_test), ("Control", per_ctrl)):
+    refs = list(mean_refs or [])
+    for gi, (label, group) in enumerate((("Test", per_test), ("Control", per_ctrl))):
         if not group:
             continue
+        mref = refs[gi] if gi < len(refs) else None
         passes = _zscore_passes(group)
         stages = [("", set())]
         for pi, removed in enumerate(passes, 1):
@@ -1741,7 +1816,7 @@ def _write_boxplots_tab(wb, per_test, per_ctrl, legs_order, batch,
             head = r + (1 if title else 0)
             r = _write_fmt_summary_table(ws, r, 1, title, group, legs_order,
                                          removed, cell, HDR, FILL_STAT,
-                                         FILL_RED, FONT_RED)
+                                         FILL_RED, FONT_RED, mean_ref=mref)
             first, last = head + 1, head + len(group)
             st = _live_stats(group, legs_order, removed)
             vals = sorted(st["live"].values())
