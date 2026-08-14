@@ -1369,13 +1369,15 @@ def write_summarize_format(parent_dir: str, sets: list, out_path: str = None) ->
     sets = test_sets + ctrl_sets
 
     def make_cell(target):
-        def cell(r, c, value, *, bold=False, fill=None, box=False, ctr=False, font=None):
+        def cell(r, c, value, *, bold=False, fill=None, box=False, ctr=False,
+                 font=None, fmt=None):
             x = target.cell(row=r, column=c, value=value)
             if bold:  x.font = HDR
             if font:  x.font = font
             if fill:  x.fill = fill
             if box:   x.border = BOX
             if ctr:   x.alignment = CTR
+            if fmt:   x.number_format = fmt
             return x
         return cell
     cell = make_cell(ws)
@@ -1791,10 +1793,15 @@ def _write_boxplots_tab(wb, per_test, per_ctrl, legs_order, batch,
     converted to a Google Sheet, so the drawing is left to whoever wants it —
     the (minimum, Q1, Q3, maximum) table is laid out ready to chart from.
     """
+    from openpyxl.utils import get_column_letter
+
     ws = wb.create_sheet("BoxPlots")
     cell = cellmaker(ws)
-    chart_rows = []          # (label, first data row of the block)
+    chart_rows = []          # (label, and the cells its min/Q1/Q3/max live in)
     r = 2
+    FMT_1D   = "0.0"
+    HELP_COL = 26            # Z — clear of the limits block (J-Q) and the
+                             # graphing table (S-W), which sits below the blocks
 
     refs = list(mean_refs or [])
     for gi, (label, group) in enumerate((("Test", per_test), ("Control", per_ctrl))):
@@ -1814,21 +1821,49 @@ def _write_boxplots_tab(wb, per_test, per_ctrl, legs_order, batch,
             st = _live_stats(group, legs_order, removed)
             vals = sorted(st["live"].values())
             if len(vals) >= 4:
-                q1, med, q3 = (float(np.percentile(vals, p)) for p in (25, 50, 75))
-                iqr = q3 - q1
+                # Surviving leg means, as addresses in the table just written:
+                # row head+1+i is set i, column 2+j is leg j.
+                surv = [f"{get_column_letter(2 + j)}{head + 1 + i}"
+                        for i in range(len(group))
+                        for j, lg in enumerate(legs_order)
+                        if (i, lg) in st["live"]]
+                # QUARTILE needs one contiguous ARRAY — it will not take a comma
+                # list the way AVERAGE does, and a cell union in parentheses is
+                # an Excel-only trick that breaks in Google Sheets.  So the
+                # survivors get copied into a strip, and the quartiles read that.
+                # Outlier cells are simply absent from the strip, which is what
+                # keeps them out of the box while staying visible in red above.
+                cell(head, HELP_COL, "surviving leg means (quartile helper)",
+                     bold=True)
+                for k, addr in enumerate(surv):
+                    cell(head + 1, HELP_COL + k, f"={addr}", box=True)
+                strip = (f"{get_column_letter(HELP_COL)}{head + 1}:"
+                         f"{get_column_letter(HELP_COL + len(surv) - 1)}{head + 1}")
+
+                q_r = head + 2                       # row the limits land on
+                med_a, q1_a, q3_a = (f"{get_column_letter(c)}{q_r}"
+                                     for c in (10, 11, 12))
+                max_a, min_a, iqr_a = (f"{get_column_letter(c)}{q_r}"
+                                       for c in (13, 14, 15))
                 cols = ["Median", "Q1", "Q3", "Max", "Min", "IQR",
                         "+1.5 IQR (outliers)", "-1.5 IQR (outliers)"]
-                nums = [med, q1, q3, max(vals), min(vals), iqr,
-                        # The reference sheet's "1.5 IQR" columns actually add a
-                        # bare IQR; these are the real 1.5x limits.
-                        q3 + 1.5 * iqr, q1 - 1.5 * iqr]
+                fx = [f"=MEDIAN({strip})",
+                      f"=QUARTILE({strip},1)",
+                      f"=QUARTILE({strip},3)",
+                      f"=MAX({strip})",
+                      f"=MIN({strip})",
+                      f"={q3_a}-{q1_a}",
+                      # The reference sheet's "1.5 IQR" columns add a bare IQR;
+                      # these are the real 1.5x limits.
+                      f"={q3_a}+1.5*{iqr_a}",
+                      f"={q1_a}-1.5*{iqr_a}"]
                 cell(head, 10, "Interquartile Limits", bold=True)
-                for j, (cn, v) in enumerate(zip(cols, nums)):
+                for j, (cn, f) in enumerate(zip(cols, fx)):
                     cell(head + 1, 10 + j, cn, bold=True, fill=FILL_STAT, box=True)
-                    cell(head + 2, 10 + j, round(v, 1), box=True)
+                    cell(q_r, 10 + j, f, box=True, fmt=FMT_1D)
                 nm = f"{batch} {title}".strip() if title else f"{batch} Raw"
                 chart_rows.append((f"{label} — {nm}",
-                                   min(vals), q1, q3, max(vals)))
+                                   min_a, q1_a, q3_a, max_a))
             r += 2
 
     # Box-plot source table, kept in the reference sheet's column order:
@@ -1840,8 +1875,8 @@ def _write_boxplots_tab(wb, per_test, per_ctrl, legs_order, batch,
             cell(top + 1, 19 + j, h, bold=True, fill=FILL_STAT, box=True)
         for i, (nm, lo, q1, q3, hi) in enumerate(chart_rows):
             cell(top + 2 + i, 19, nm, box=True)
-            for j, v in enumerate((lo, q1, q3, hi)):
-                cell(top + 2 + i, 20 + j, round(float(v), 1), box=True)
+            for j, addr in enumerate((lo, q1, q3, hi)):
+                cell(top + 2 + i, 20 + j, f"={addr}", box=True, fmt=FMT_1D)
 
         # No chart object is emitted.  A stock chart was the only box-plot
         # substitute openpyxl can write, and it did not survive the trip through
