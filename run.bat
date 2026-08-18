@@ -25,5 +25,9 @@ if errorlevel 1 (
     %PY% -m pip install -r requirements-core.txt
 )
 
+REM Files the hand-installed bits (ToupTek SDK, trained models) into app/ if
+REM they are still loose in this folder.  Does nothing once they are in place.
+%PY% first_run_tidy.py
+
 %PY% main.py
 pause

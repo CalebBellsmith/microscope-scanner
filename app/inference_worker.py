@@ -24,22 +24,14 @@ import numpy as np
 os.environ["CUDA_VISIBLE_DEVICES"] = ""
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
-# Models normally sit next to this file; a rig set up before the code moved
-# into app/ still has them one level up, so both places are checked.
+# This runs as its own process, so it resolves the model paths itself rather
+# than inheriting them.  sys.path[0] is this folder, so paths.py is importable.
 _HERE     = os.path.dirname(os.path.abspath(__file__))
-_PARENT   = os.path.dirname(_HERE)
+sys.path.insert(0, _HERE)
+from paths import find_model                                  # noqa: E402
 
-
-def _model_path(name: str) -> str:
-    here = os.path.join(_HERE, name)
-    if os.path.exists(here):
-        return here
-    legacy = os.path.join(_PARENT, name)
-    return legacy if os.path.exists(legacy) else here
-
-
-ONNX_PATH = _model_path("model.onnx")
-PT_PATH   = _model_path("model.pt")
+ONNX_PATH = find_model("model.onnx")
+PT_PATH   = find_model("model.pt")
 IMG_SIZE  = 224   # MobileNetV3 input size
 
 

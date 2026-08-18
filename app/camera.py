@@ -14,18 +14,13 @@ All three expose the same interface:
     close()          — stop streaming, release device
     set_analysis_mode(bool) — switch between analysis and raw camera settings
 """
-import os
-import sys
-
 import numpy as np
 
-# The ToupTek SDK (toupcam.py + toupcam.dll) is installed by hand and is not in
-# git, so on a rig set up before the code moved into app/ it still sits in the
-# folder above this one.  Look there too rather than making the operator move
-# files after a pull.
-_PARENT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if _PARENT not in sys.path:
-    sys.path.append(_PARENT)
+# The ToupTek SDK is installed by hand and is not in git; paths.py knows the
+# folders it might be in and puts both toupcam.py and toupcam.dll within reach.
+from paths import prepare_sdk_import
+
+prepare_sdk_import()
 
 # Target resolution — must match ToupView live/snap settings
 TARGET_W, TARGET_H = 1024, 822

@@ -37,27 +37,11 @@ import threading
 import numpy as np
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
+from paths import find_model
+
 _HERE      = os.path.dirname(os.path.abspath(__file__))
-_PARENT    = os.path.dirname(_HERE)
-
-
-def _model_path(name: str) -> str:
-    """Locate a trained model file.
-
-    Models are large and stay out of git, so a rig set up before the code moved
-    into app/ still has them in the folder above.  Prefer the one next to the
-    code, fall back to the parent, and report the app/ path when neither exists
-    so the error message names where the file is meant to go.
-    """
-    here = os.path.join(_HERE, name)
-    if os.path.exists(here):
-        return here
-    legacy = os.path.join(_PARENT, name)
-    return legacy if os.path.exists(legacy) else here
-
-
-ONNX_PATH  = _model_path("model.onnx")
-MODEL_PATH = _model_path("model.pt")
+ONNX_PATH  = find_model("model.onnx")
+MODEL_PATH = find_model("model.pt")
 _WORKER    = os.path.join(_HERE, "inference_worker.py")
 
 

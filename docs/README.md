@@ -11,12 +11,22 @@ Everything else lives in subfolders so the operator sees one obvious thing to cl
 | Folder | Holds |
 |--------|-------|
 | `app/` | all Python code, the summary template, the requirements files |
+| `app/sdk/` | ToupTek camera SDK (`toupcam.py`, `toupcam.dll`) — installed by hand, not in git |
+| `app/models/` | trained models (`model.onnx`, `model.pt`) — built locally, not in git |
 | `scripts/` | `train.bat`, the launcher for the ML labelling tool |
 | `firmware/` | the ESP32 sketch |
 | `docs/` | this file and `ALGORITHMS.md` |
 
 The app opens its folder picker at **`Abrasion` on the Desktop** (any capitalisation),
 creating it if it is not there yet.
+
+The SDK and model files cannot be moved by a `git pull` — they were installed by
+hand and git does not track them — so `run.bat` calls `first_run_tidy.py`, which
+files them into `app/sdk/` and `app/models/` the first time it runs. Every lookup
+falls back to the old locations, so an untidied install keeps working either way.
+The one file that must stay in the top folder is `.gitignore`: git only reads it
+from the repository root. It is a hidden file, so operators will not see it
+unless Explorer is set to show hidden files.
 
 ## Workflow
 

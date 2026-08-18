@@ -8,8 +8,10 @@ __pycache__/
 dist/
 build/
 
-# Model file (large, trained locally)
+# Model files (large, trained locally) — they live in app/models/
 model.pt
+model.onnx
+model.onnx.data
 
 # Training data (images, kept local)
 training_data/
@@ -25,10 +27,13 @@ slide_scan/
 Thumbs.db
 desktop.ini
 
-# ToupTek SDK (platform-specific, added locally)
+# ToupTek SDK (platform-specific, added locally) — lives in app/sdk/
 toupcam.py
 toupcam.dll
 libtoupcam.dylib
+
+# One-off helper scripts kept on the rig only
+re_export.py
 
 # Redundant source archive
 abrasion.zip
