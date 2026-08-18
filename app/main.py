@@ -1,7 +1,7 @@
 """
 Automated Microscope Slide Scanner — main GUI (main.py)
 ========================================================
-Double-click run.bat in the folder above (Windows), or scripts/launch_mac.command (Mac).
+Double-click run.bat in the folder above to launch.
 
 WORKFLOW
 ────────
