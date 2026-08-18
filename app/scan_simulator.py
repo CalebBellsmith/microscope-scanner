@@ -9,7 +9,6 @@ receive — including the concurrent `MOVE XY` rung transitions.
 
 Run it on the Mac with:
     python3 scan_simulator.py
-or double-click  run_simulator.command
 
 Nothing is written to disk and no serial port is opened; this is purely a
 visual/timing dry run of capture_pipeline.py + firmware.ino.

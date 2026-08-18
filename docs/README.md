@@ -11,7 +11,7 @@ Everything else lives in subfolders so the operator sees one obvious thing to cl
 | Folder | Holds |
 |--------|-------|
 | `app/` | all Python code, the summary template, the requirements files |
-| `scripts/` | the other launchers — macOS (`launch_mac.command`), labelling (`train.bat`), simulator |
+| `scripts/` | the other launchers — macOS (`launch_mac.command`), labelling (`train.bat`) |
 | `firmware/` | the ESP32 sketch |
 | `docs/` | this file and `ALGORITHMS.md` |
 
