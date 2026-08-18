@@ -3,17 +3,29 @@
 ## Quick start
 
 1. Flash `firmware/firmware.ino` to the ESP32 (Arduino IDE, board: "ESP32 Dev Module", install `ESP32Servo` library).
-2. On the Windows laptop: `pip install -r requirements.txt`
-3. Double-click `run.bat`.
+2. Double-click **`run.bat`** — the only file in the top folder. First run installs
+   the dependencies itself (`app/requirements-core.txt`); after that it just opens.
+
+Everything else lives in subfolders so the operator sees one obvious thing to click:
+
+| Folder | Holds |
+|--------|-------|
+| `app/` | all Python code, the summary template, the requirements files |
+| `scripts/` | the other launchers — macOS (`launch_mac.command`), labelling (`train.bat`), simulator |
+| `firmware/` | the ESP32 sketch |
+| `docs/` | this file and `ALGORITHMS.md` |
+
+The app opens its folder picker at **`Abrasion` on the Desktop** (any capitalisation),
+creating it if it is not there yet.
 
 ## Workflow
 
 ### First use — build the ML model
 1. Connect camera + ESP32, click **Connect** in the GUI.
-2. In a separate terminal: `python labeling_tool.py`
+2. Double-click `scripts/train.bat` (or: `python app/labeling_tool.py`)
    - Live camera feed appears. Press keys to label frames: `G` good · `W` watermark · `B` blotch · `V` vertical scratch · `D` debris · `S` skip · `Q` quit.
    - Aim for ~50+ examples per class.
-3. `python train.py` — fine-tunes MobileNetV3-Small, saves `model.pt`.
+3. `python app/train.py` — fine-tunes MobileNetV3-Small, saves `model.pt`.
 4. Until `model.pt` exists the app falls back to Laplacian sharpness heuristic.
 
 ### Scanning
@@ -24,20 +36,20 @@
 5. Results are written to `<output>/<timestamp>/results.jsonl`.
 
 ### Adding your analysis code
-Edit `analysis_pipeline.py` → replace the body of `_analyze_image(self, image_path)` with your logic. The method receives an absolute path to a PNG (RGB, 1024×822) and must return a JSON-serialisable value.
+Edit `app/analysis_pipeline.py` → replace the body of `_analyze_image(self, image_path)` with your logic. The method receives an absolute path to a PNG (RGB, 1024×822) and must return a JSON-serialisable value.
 
 ## File overview
 
 | File | Purpose |
 |------|---------|
-| `main.py` | PyQt5 GUI, wires everything together |
-| `camera.py` | ToupTek → OpenCV → mss fallback |
-| `motor.py` | Serial to ESP32 |
-| `capture_pipeline.py` | Grid scan + nudge search |
-| `ml_inference.py` | Quality classifier |
-| `analysis_pipeline.py` | Concurrent analysis — **edit this** |
-| `labeling_tool.py` | Build training dataset |
-| `train.py` | Fine-tune MobileNetV3-Small |
+| `app/main.py` | PyQt5 GUI, wires everything together |
+| `app/camera.py` | ToupTek → OpenCV → mss fallback |
+| `app/motor.py` | Serial to ESP32 |
+| `app/capture_pipeline.py` | Grid scan + nudge search |
+| `app/ml_inference.py` | Quality classifier |
+| `app/analysis_pipeline.py` | Concurrent analysis — **edit this** |
+| `app/labeling_tool.py` | Build training dataset |
+| `app/train.py` | Fine-tune MobileNetV3-Small |
 | `firmware/firmware.ino` | ESP32 motor controller |
 
 ## Wireless (optional)

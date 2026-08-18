@@ -18,7 +18,7 @@
 #      still opens with the live camera feed (motor moves are skipped).
 # ============================================================================
 set -e
-cd "$(dirname "$0")"
+cd "$(dirname "$0")/../app"
 
 # The set of modules main.py needs to launch (rules mode; torch excluded).
 CORE_IMPORTS='import PyQt5, cv2, numpy, scipy, skimage, serial, mss, PIL, openpyxl'

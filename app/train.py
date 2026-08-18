@@ -196,7 +196,12 @@ def train(good_dir: str, bad_dir: str, progress_cb=None) -> float:
 # ── Standalone entry point ────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    base = os.path.join(os.path.dirname(os.path.abspath(__file__)), "training_data")
+    _here = os.path.dirname(os.path.abspath(__file__))
+    base  = os.path.join(_here, "training_data")
+    if not os.path.isdir(base):          # pre-restructure rigs keep it one up
+        legacy = os.path.join(os.path.dirname(_here), "training_data")
+        if os.path.isdir(legacy):
+            base = legacy
     good = os.path.join(base, "good")
     bad  = os.path.join(base, "bad")
 

@@ -51,7 +51,22 @@ from camera import open_camera
 from ml_inference import QualityClassifier
 
 _HERE        = os.path.dirname(os.path.abspath(__file__))   # folder this script lives in
-TRAINING_DIR = os.path.join(_HERE, "training_data")          # root for all label images
+_HERE_TD     = _HERE
+
+def _training_dir() -> str:
+    """Where labelled frames live.
+
+    Next to the code by default; a rig set up before the restructure has its
+    collected frames in the folder above, and those are worth keeping.
+    """
+    here = os.path.join(_HERE_TD, "training_data")
+    if os.path.isdir(here):
+        return here
+    legacy = os.path.join(os.path.dirname(_HERE_TD), "training_data")
+    return legacy if os.path.isdir(legacy) else here
+
+
+TRAINING_DIR = _training_dir()   # root for all label images
 GOOD_DIR     = os.path.join(TRAINING_DIR, "good")            # clean/acceptable frames
 BAD_DIR      = os.path.join(TRAINING_DIR, "bad")             # dusty/defective frames
 

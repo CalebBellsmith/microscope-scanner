@@ -1,11 +1,11 @@
 """
 Automated Microscope Slide Scanner — main GUI (main.py)
 ========================================================
-Double-click run.bat (Windows) or run.sh (Mac) to launch.
+Double-click run.bat in the folder above (Windows), or scripts/launch_mac.command (Mac).
 
 WORKFLOW
 ────────
-  1. App opens → user picks / creates a set folder (e.g. ~/Downloads/alchemy/abrasion/A-08/)
+  1. App opens → user picks / creates a set folder (defaults to Desktop/Abrasion/, e.g. Desktop/Abrasion/A-08/)
   2. User selects a scan profile (rows × cols) and capture mode, clicks Connect
   3. Click "Run Slide" → stage moves in a boustrophedon grid, capturing one image per stop
   4. After capture: "Name this leg?" dialog (FR / FL / BR / BL, or free text)
@@ -83,8 +83,43 @@ def _count_numbered_frames(leg_dir: str) -> int:
     except OSError:
         return 0
 
-# Default root for the file-chooser dialog — user can navigate away from here
-DEFAULT_BASE = os.path.join(os.path.expanduser("~"), "Downloads", "alchemy", "abrasion")
+def _default_base() -> str:
+    """The folder the set-picker opens in: "Abrasion" on the Desktop.
+
+    Case is ignored, so Abrasion / abrasion / ABRASION all count — whatever the
+    operator actually created is what gets used.  Windows machines signed into
+    OneDrive have their real Desktop redirected under the OneDrive folder, so
+    both locations are checked before giving up.  If no such folder exists it is
+    created, because a dialog that opens somewhere the work does not live is the
+    thing this is meant to stop.
+    """
+    home = os.path.expanduser("~")
+    roots = [os.path.join(home, "Desktop"),
+             os.path.join(home, "OneDrive", "Desktop")]
+    up = os.environ.get("USERPROFILE")           # Windows, if HOME is odd
+    if up:
+        roots += [os.path.join(up, "Desktop"),
+                  os.path.join(up, "OneDrive", "Desktop")]
+
+    for root in roots:
+        try:
+            for name in os.listdir(root):
+                if name.lower() == "abrasion" and os.path.isdir(
+                        os.path.join(root, name)):
+                    return os.path.join(root, name)
+        except OSError:
+            continue                             # no such Desktop on this box
+
+    for root in roots:                           # nothing found — make one
+        if os.path.isdir(root):
+            made = os.path.join(root, "Abrasion")
+            try:
+                os.makedirs(made, exist_ok=True)
+                return made
+            except OSError:
+                break
+    return home                                  # last resort: somewhere real
+
 
 # Built-in scan profiles: (display label, rows, cols)
 # None means "Custom" — user types their own rows/cols values
@@ -105,7 +140,22 @@ MODE_SUMMARIZE       = 3   # combine many sets' results into one summary workboo
 
 # ML training dataset (manual / auto-pause reviews drop labelled frames here so
 # the good/bad model can be retrained on real operator decisions).
-TRAINING_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "training_data")
+_HERE_TD = os.path.dirname(os.path.abspath(__file__))
+
+def _training_dir() -> str:
+    """Where labelled frames live.
+
+    Next to the code by default; a rig set up before the restructure has its
+    collected frames in the folder above, and those are worth keeping.
+    """
+    here = os.path.join(_HERE_TD, "training_data")
+    if os.path.isdir(here):
+        return here
+    legacy = os.path.join(os.path.dirname(_HERE_TD), "training_data")
+    return legacy if os.path.isdir(legacy) else here
+
+
+TRAINING_DIR = _training_dir()
 TRAINING_GOOD_DIR = os.path.join(TRAINING_DIR, "good")
 TRAINING_BAD_DIR  = os.path.join(TRAINING_DIR, "bad")
 
@@ -897,7 +947,9 @@ class MainWindow(QMainWindow):
 
     def _prompt_set_folder(self):
         path = QFileDialog.getExistingDirectory(
-            self, "Select or create set folder", DEFAULT_BASE
+            # Resolved per click, not at import, so a folder the operator
+            # creates while the app is open is picked up without a restart.
+            self, "Select or create set folder", _default_base()
         )
         if path:
             self._set_dir = path
@@ -1838,7 +1890,8 @@ class MainWindow(QMainWindow):
         Film summary tables with red-flagged outliers).
         """
         parent = QFileDialog.getExistingDirectory(
-            self, "Select the parent folder containing all sets")
+            self, "Select the parent folder containing all sets",
+            _default_base())
         if not parent:
             return
 

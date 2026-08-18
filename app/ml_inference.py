@@ -38,8 +38,26 @@ import numpy as np
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 _HERE      = os.path.dirname(os.path.abspath(__file__))
-ONNX_PATH  = os.path.join(_HERE, "model.onnx")
-MODEL_PATH = os.path.join(_HERE, "model.pt")
+_PARENT    = os.path.dirname(_HERE)
+
+
+def _model_path(name: str) -> str:
+    """Locate a trained model file.
+
+    Models are large and stay out of git, so a rig set up before the code moved
+    into app/ still has them in the folder above.  Prefer the one next to the
+    code, fall back to the parent, and report the app/ path when neither exists
+    so the error message names where the file is meant to go.
+    """
+    here = os.path.join(_HERE, name)
+    if os.path.exists(here):
+        return here
+    legacy = os.path.join(_PARENT, name)
+    return legacy if os.path.exists(legacy) else here
+
+
+ONNX_PATH  = _model_path("model.onnx")
+MODEL_PATH = _model_path("model.pt")
 _WORKER    = os.path.join(_HERE, "inference_worker.py")
 
 

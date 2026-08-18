@@ -1,6 +1,6 @@
 @echo off
 setlocal
-cd /d "%~dp0"
+cd /d "%~dp0app"
 
 REM The GUI needs Python 3.12 — PyQt5 has no wheels for 3.7, which is what a
 REM bare "python" was picking up off PATH and caused the "DLL load failed"

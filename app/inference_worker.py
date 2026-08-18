@@ -24,10 +24,22 @@ import numpy as np
 os.environ["CUDA_VISIBLE_DEVICES"] = ""
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
-# __file__ lives in the same folder as model.onnx / model.pt
+# Models normally sit next to this file; a rig set up before the code moved
+# into app/ still has them one level up, so both places are checked.
 _HERE     = os.path.dirname(os.path.abspath(__file__))
-ONNX_PATH = os.path.join(_HERE, "model.onnx")
-PT_PATH   = os.path.join(_HERE, "model.pt")
+_PARENT   = os.path.dirname(_HERE)
+
+
+def _model_path(name: str) -> str:
+    here = os.path.join(_HERE, name)
+    if os.path.exists(here):
+        return here
+    legacy = os.path.join(_PARENT, name)
+    return legacy if os.path.exists(legacy) else here
+
+
+ONNX_PATH = _model_path("model.onnx")
+PT_PATH   = _model_path("model.pt")
 IMG_SIZE  = 224   # MobileNetV3 input size
 
 
