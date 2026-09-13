@@ -67,7 +67,7 @@ from ml_inference import QualityClassifier
 from capture_pipeline import CapturePipeline, focus_score
 from analysis_pipeline import (
     AnalysisPipeline, write_new_format, write_legacy_format,
-    collect_sets, write_summarize_format,
+    collect_sets, write_summarize_format, load_set_results,
     _is_numbered_frame,
     LEGS, EXPECTED_IMAGES,
 )
@@ -966,13 +966,40 @@ class MainWindow(QMainWindow):
             self._scan_existing_legs()
 
     def _scan_existing_legs(self):
-        """If the set folder already has leg sub-folders, show them in the table."""
+        """Show the legs already in the set folder, and RELOAD any analysis
+        results they still hold so the set can be exported straight away.
+
+        Analysis writes each image's result into <leg>/results.jsonl as it goes,
+        so a leg analysed in an earlier session is still complete on disk.  The
+        export used to read only the in-memory _leg_results, which this method's
+        caller clears whenever the operator points the app at another folder —
+        so a set that was analysed but not yet exported came back with "Finish"
+        greyed out and had to be analysed all over again.  Reading the saved
+        results back makes re-opening the folder enough.
+        """
         if not self._set_dir:
             return
+        saved, modes = load_set_results(self._set_dir)
         for entry in sorted(os.listdir(self._set_dir)):
             full = os.path.join(self._set_dir, entry)
-            if os.path.isdir(full):
+            if not os.path.isdir(full):
+                continue
+            results = saved.get(entry)
+            if results:
+                self._leg_results[entry] = results
+                self._upsert_leg_row(entry, len(results), "Done")
+            else:
                 self._upsert_leg_row(entry, _count_numbered_frames(full), "—")
+        if saved:
+            # Name the mode the numbers were measured under: they are what the
+            # detector said at the time, not a re-run under whatever method is
+            # selected now.
+            how = f"  [{', '.join(sorted(modes))}]" if modes else ""
+            self._check_finish_eligibility()
+            self._statusbar.showMessage(
+                f"Reloaded {len(saved)} analysed leg(s) from {self._set_dir}"
+                f"{how} — ready to export."
+            )
 
     # ── Camera mode ───────────────────────────────────────────────────────────
 

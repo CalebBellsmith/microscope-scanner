@@ -1884,6 +1884,81 @@ def _write_boxplots_tab(wb, per_test, per_ctrl, legs_order, batch,
         # it and insert a candlestick chart if you want one drawn.
 
 
+# ── Saved results (results.jsonl) ─────────────────────────────────────────────
+# Analysis streams every image's result into <leg>/results.jsonl as it goes, so
+# a leg is durably on disk the moment it finishes — including a leg captured in
+# "Capture + Analyze" mode, whose results file is carried along when the temp
+# folder is renamed to the leg name.
+#
+# These loaders read that file back.  Without them the results existed ONLY in
+# the GUI's memory, and picking a different set folder wiped them, so a set that
+# was analysed but not yet exported had to be analysed all over again.  With
+# them, re-opening the set folder is enough to export it — an hour or a month
+# later.
+
+RESULTS_FILENAME = "results.jsonl"
+
+
+def load_leg_results(leg_dir: str) -> list | None:
+    """Read one leg's saved analysis results back, or None if it has none.
+
+    Robust to a file an interrupted run left half-written: a torn final line is
+    skipped rather than raised on.  Rows recorded as failures (an "error" key,
+    written once a frame has failed _MAX_ATTEMPTS times) carry no measurement
+    and are skipped too.
+
+    Files written before the per-scratch detail was saved still load — they just
+    have no "scratches", so the headline areas and every statistic export
+    normally and only the per-scratch width/length table comes out empty.
+    """
+    path = os.path.join(leg_dir, RESULTS_FILENAME)
+    if not os.path.isfile(path):
+        return None
+    results = []
+    try:
+        with open(path, "r") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue                      # torn line from an aborted run
+                if "error" in rec or "scratch_area" not in rec:
+                    continue
+                rec.setdefault("scratches", [])
+                rec.setdefault("scratch_count", len(rec["scratches"]))
+                results.append(rec)
+    except OSError:
+        return None
+    return results or None
+
+
+def load_set_results(set_dir: str) -> tuple[dict, set]:
+    """Every leg under `set_dir` that still holds saved analysis results.
+
+    Returns ({leg_name: results}, {analysis modes seen}).  The mode set lets the
+    GUI tell the operator WHICH detector produced the numbers it just reloaded —
+    they are the numbers as measured at the time, not a re-run under whatever
+    method happens to be selected now.
+    """
+    found, modes = {}, set()
+    try:
+        entries = sorted(os.listdir(set_dir))
+    except OSError:
+        return found, modes
+    for name in entries:
+        leg_dir = os.path.join(set_dir, name)
+        if not os.path.isdir(leg_dir):
+            continue
+        results = load_leg_results(leg_dir)
+        if results:
+            found[name] = results
+            modes |= {r["mode"] for r in results if r.get("mode")}
+    return found, modes
+
+
 # ── Pipeline class ────────────────────────────────────────────────────────────
 
 class AnalysisPipeline:
@@ -1974,10 +2049,18 @@ class AnalysisPipeline:
                                 result = detect_scratches(path, mode=self._mode)
                                 result["file"] = fname
                                 all_results.append(result)
+                                # The per-scratch detail and the mode go in too,
+                                # so this file holds EVERYTHING the Excel export
+                                # needs.  It used to record only the headline
+                                # area/count, which made the saved results a log
+                                # rather than something the export could be
+                                # rebuilt from — see load_leg_results().
                                 rf.write(json.dumps({
                                     "file": fname,
                                     "scratch_area": result["scratch_area"],
                                     "scratch_count": result["scratch_count"],
+                                    "scratches": result["scratches"],
+                                    "mode": self._mode,
                                 }) + "\n")
                                 rf.flush()
                                 # Live preview of the annotated overlay
