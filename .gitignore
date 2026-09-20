@@ -37,3 +37,6 @@ re_export.py
 
 # Redundant source archive
 abrasion.zip
+
+# Local Claude Code settings (machine-specific permission list)
+.claude/

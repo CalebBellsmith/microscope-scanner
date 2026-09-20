@@ -2162,20 +2162,38 @@ class MainWindow(QMainWindow):
         self._ana_prev_caption.setText(fname)
 
     def _on_error(self, msg):
-        QMessageBox.critical(self, "Error", msg)
-        # A capture/analysis error aborts the in-progress run — stop the
-        # streaming analysis so its watcher doesn't keep polling the temp folder.
+        # STOP THE HARDWARE FIRST, before anything modal.  The dialog at the
+        # bottom of this method blocks the handler until the operator dismisses
+        # it, and the capture pipeline used never to be stopped here at all —
+        # so an ANALYSIS error left the stage scanning the rest of the slide
+        # unattended while the run was already marked aborted, and
+        # _on_capture_done then discarded the whole leg on arrival.
         self._run_aborted = True
+        if self._capture_pipeline:
+            self._capture_pipeline.stop()
         # Release any pending operator review so the capture thread can unwind.
         self._review_active   = False
         self._review_decision = "good"
         self._review_event.set()
+        # Stop the streaming analysis so its watcher doesn't keep polling the
+        # temp folder.
         if getattr(self, "_stream_ap", None):
             self._stream_ap.stop()
             self._stream_ap = None
         self._stop_btn.setEnabled(False)
         self._go_btn.setEnabled(True)
         self._set_mode_enabled(True)
+
+        # Say where the partial capture went.  The run is aborted, so the leg is
+        # never named or moved — without this the images look simply lost, and
+        # the next Run Slide clears that folder.
+        tmp = getattr(self, "_tmp_capture_dir", None)
+        if tmp and os.path.isdir(tmp) and os.listdir(tmp):
+            msg = (f"{msg}\n\nThe scan has been stopped.  Images captured "
+                   f"before the error are still in:\n{tmp}\n\nMove them "
+                   f"somewhere safe before the next run — Run Slide clears "
+                   f"that folder.")
+        QMessageBox.critical(self, "Error", msg)
 
     # ── Cleanup ───────────────────────────────────────────────────────────────
 

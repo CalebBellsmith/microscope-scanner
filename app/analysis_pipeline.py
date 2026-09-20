@@ -16,6 +16,7 @@ import time
 import math
 import functools
 import threading
+import traceback
 import warnings
 
 import numpy as np
@@ -335,7 +336,13 @@ def _detect_legacy(rgb: np.ndarray, _component_filter=None):
                              # frame's calibrated area UP 11%)
 
     for prop in props:
-        area = prop.area
+        # int(): skimage returns prop.area as np.sum(...) -> a numpy int64, and
+        # json.dumps refuses that type.  It reaches results.jsonl through the
+        # per-scratch "area_px" below, so an uncast value made EVERY scratched
+        # frame fail to serialise (clean frames, with an empty scratch list,
+        # serialised fine -- which is what made it look intermittent).  Accurate
+        # mode already casts; this keeps legacy/defect-aware consistent.
+        area = int(prop.area)
         minr, minc = prop.bbox[0], prop.bbox[1]
         region = np.pad(prop.image.astype(np.uint8), 1)   # isolated region mask
         cnts, _ = cv2.findContours(region, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
@@ -1146,6 +1153,26 @@ _IMG_EXTS = (".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp")
 def _is_numbered_frame(fname: str) -> bool:
     stem = os.path.splitext(fname)[0]
     return stem.isdigit() and 0 <= int(stem) <= EXPECTED_IMAGES
+
+
+def _json_default(o):
+    """Coerce values json.dumps doesn't know natively.
+
+    Everything written to results.jsonl passes through here.  skimage and
+    OpenCV hand back numpy scalars (regionprops' area is np.sum(...), i.e. an
+    np.int64) and json refuses those outright — which is how a single uncast
+    field could make every scratched frame's record fail to serialise.  The
+    fields themselves are cast at the source; this is the backstop, so a stray
+    numpy type can never again cost a measurement.  .item() turns any numpy
+    scalar into its Python equivalent; anything else degrades to its repr.
+    """
+    item = getattr(o, "item", None)
+    if callable(item):
+        try:
+            return item()
+        except Exception:
+            pass
+    return str(o)
 
 
 # A file younger than this is assumed to be mid-write and left for the next
@@ -1997,6 +2024,23 @@ class AnalysisPipeline:
         self._thread = None
         self._results_path = os.path.join(leg_dir, "results.jsonl")
 
+    @staticmethod
+    def _write_record(rf, record):
+        """Append one results.jsonl line.  Never raises.
+
+        results.jsonl is a RECORD of the run, not its source of truth — the
+        measurements the export uses are held in memory.  So a line that cannot
+        be written or serialised is reported and skipped, never allowed to
+        propagate into an aborted pipeline or a lost frame.
+        """
+        try:
+            rf.write(json.dumps(record, default=_json_default) + "\n")
+            rf.flush()
+        except Exception as e:
+            print(f"[analysis] could not record {record.get('file')!r} "
+                  f"in results.jsonl ({type(e).__name__}: {e}) — the "
+                  f"measurement itself is unaffected")
+
     def mark_capture_done(self):
         """Signal that no more images will be captured — the watcher may finish
         the remaining backlog and then stop."""
@@ -2020,8 +2064,18 @@ class AnalysisPipeline:
 
             with open(self._results_path, "w") as rf:
                 while not self._stop_event.is_set():
+                    try:
+                        entries = os.listdir(self._dir)
+                    except OSError:
+                        # The folder went away underneath us: the run was
+                        # stopped and its __tmp__ deleted, or the leg was moved
+                        # into place.  That is a normal end — raising here threw
+                        # an error dialog at the operator for doing nothing
+                        # wrong, and (before the fix in main._on_error) left the
+                        # stage scanning on.
+                        break
                     images = sorted(
-                        f for f in os.listdir(self._dir)
+                        f for f in entries
                         if (f.endswith(".jpg") or f.endswith(".png"))
                         and not f.endswith("_overlay.png")
                         and f not in processed
@@ -2045,26 +2099,19 @@ class AnalysisPipeline:
                             if self._stop_event.is_set():
                                 break
                             path = os.path.join(self._dir, fname)
+                            # THREE SEPARATE CONCERNS, deliberately not sharing
+                            # one try block.  Only the measurement is worth
+                            # retrying; logging it and previewing it are not,
+                            # and must never cost a frame that analysed fine.
+                            #
+                            # They used to share a block, so a json.dumps that
+                            # choked on the record left the result already in
+                            # all_results while the retry left the frame
+                            # unprocessed — every attempt appended another copy,
+                            # and a 30-image leg exported 90 rows whose ANOVA
+                            # ran on an inflated n.
                             try:
                                 result = detect_scratches(path, mode=self._mode)
-                                result["file"] = fname
-                                all_results.append(result)
-                                # The per-scratch detail and the mode go in too,
-                                # so this file holds EVERYTHING the Excel export
-                                # needs.  It used to record only the headline
-                                # area/count, which made the saved results a log
-                                # rather than something the export could be
-                                # rebuilt from — see load_leg_results().
-                                rf.write(json.dumps({
-                                    "file": fname,
-                                    "scratch_area": result["scratch_area"],
-                                    "scratch_count": result["scratch_count"],
-                                    "scratches": result["scratches"],
-                                    "mode": self._mode,
-                                }) + "\n")
-                                rf.flush()
-                                # Live preview of the annotated overlay
-                                self._on_image(result["overlay_path"], fname)
                             except Exception as e:
                                 # A failure here used to retire the frame for good,
                                 # so one unlucky read cost a whole image out of the
@@ -2075,12 +2122,39 @@ class AnalysisPipeline:
                                 attempts[fname] = attempts.get(fname, 0) + 1
                                 if attempts[fname] < self._MAX_ATTEMPTS:
                                     continue          # leave unprocessed; retry
-                                rf.write(json.dumps({
+                                tb = traceback.format_exc()
+                                print(f"[analysis] {fname} failed "
+                                      f"{attempts[fname]}x, giving up:\n{tb}")
+                                self._write_record(rf, {
                                     "file": fname,
                                     "error": str(e),
+                                    "error_type": type(e).__name__,
+                                    "traceback": tb,
                                     "attempts": attempts[fname],
-                                }) + "\n")
-                                rf.flush()
+                                })
+                            else:
+                                # The measurement succeeded, so it counts —
+                                # whatever happens to the log line or the preview.
+                                result["file"] = fname
+                                all_results.append(result)
+                                # The per-scratch detail and the mode go in too,
+                                # so this file holds EVERYTHING the Excel export
+                                # needs.  It used to record only the headline
+                                # area/count, which made the saved results a log
+                                # rather than something the export could be
+                                # rebuilt from — see load_leg_results().
+                                self._write_record(rf, {
+                                    "file": fname,
+                                    "scratch_area": result["scratch_area"],
+                                    "scratch_count": result["scratch_count"],
+                                    "scratches": result["scratches"],
+                                    "mode": self._mode,
+                                })
+                                # Live preview of the annotated overlay: cosmetic.
+                                try:
+                                    self._on_image(result["overlay_path"], fname)
+                                except Exception as e:
+                                    print(f"[analysis] preview failed for {fname}: {e}")
                             processed.add(fname)
                             advanced = True
                             done += 1
@@ -2098,10 +2172,19 @@ class AnalysisPipeline:
                         waiting_for_capture = (
                             self._live_capture and not self._capture_done.is_set()
                         )
-                        if (not waiting_for_capture) and done > 0 and idle_ticks > 10:
+                        # `done > 0` used to be part of this test, which
+                        # meant a leg that yielded nothing analysable (every
+                        # frame tagged _soft, or a capture stopped at zero) left
+                        # the watcher spinning forever: on_done never fired, so
+                        # the leg sat on "Analyzing" and Go stayed disabled.
+                        # mark_capture_done() / an empty folder is answer enough.
+                        if (not waiting_for_capture) and idle_ticks > 10:
                             break
                         time.sleep(0.5)
 
             self._on_done(all_results)
         except Exception as e:
+            # Print before signalling: the GUI only ever showed str(e), which
+            # for most exceptions says nothing about WHERE it came from.
+            print(f"[analysis] pipeline aborted:\n{traceback.format_exc()}")
             self._on_error(e)
