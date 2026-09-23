@@ -472,15 +472,44 @@ the spec pixels (using both gradient directions since specs aren't oriented),
 scaled by a constant so the spec tier's numbers line up with the scratch tier's
 range and **one threshold serves both**.
 
-**Blank field → `+∞`** (treated as in-focus): if there are neither scratches nor
-specs to judge, there is nothing to be blurry. This is a known blind spot (a
-truly blank, truly blurry field would pass); it never occurred in 3,600 archive
-frames but is documented as a caveat.
+**Tier 3 — coarse darkness (severe defocus).** Tiers 1 and 2 both measure
+darkness below a ~25 px local background. Blur *wider than that kernel* makes the
+image its own background: darkness collapses under the absolute floor of 8, both
+tiers go blind, and the spot count hits zero.
 
-**Calibration.** In-focus frames read ≈ 4000–8000 in both tiers; soft frames
-≲ 2100. The default threshold is **3000**, bench-confirmed — it sits in the wide
-gap between the two bands. (Independent corroboration: on sharp glass the tour
-in §5 suggests almost exactly 3000, i.e. half the sharp-frame median.)
+This case used to return `+∞` — "nothing to judge, so nothing to be blurry" —
+and that was **exactly backwards**: severe defocus *creates* a featureless
+frame, so the worst frames in a set read as the best. Measured on the archive,
+every frame inverted from a correct "soft" reading to "perfectly sharp" at
+Gaussian σ ≈ 14–16, and 41 % of all frames blurred past the acceptable limit
+were kept silently as a result.
+
+The fix re-measures at an **81×81** scale. Gradient energy is useless there (it
+has already collapsed), but darkness *amplitude* survives and falls smoothly —
+≈ 7 at σ = 14 down to ≈ 1 at σ = 40 — so the score stays ordered and the Z search
+can still climb out. The tier is returned alongside the score, because reaching
+it at all means the fine detail is gone: a "verified peak" measured here is
+never accepted as focus.
+
+**Nothing returns a non-finite value.** A genuinely featureless frame reads ≈ 0
+under `TIER_BLANK`.
+
+**Calibration.** In-focus frames read ≈ 4000–8000 in the scratch and spec tiers.
+The default threshold is **1100**. It was 3000, which is *above the score of
+real in-focus frames* — 3 of 40 unblurred archive frames fall below it — so it
+sent ~46 % of sharp frames on a pointless search. Measured against
+operator-labelled blur: unblurred frames score 2024–8962 (median 4982), and the
+mildest blur judged unacceptable scores 455–1313, so 1100 sits in the gap. At
+that setting every frame blurred past the acceptable limit is caught (280/280),
+and the only escapes are the two sharpest frames of the mildest unacceptable
+level.
+
+**The threshold is not a focus verdict.** The score is comparable between two
+heights of the *same* field (17 of 20 archive fields score strictly
+monotonically in blur) but **not between different fields** — a score of ~2500
+is produced by sharp, slightly-blurred and clearly-blurred frames alike, because
+the metric conflates how sharp a frame is with how much is in it. So the
+threshold decides only *when to look*; §3.2's peak verdict decides focus.
 
 ### 3.2 The autofocus search (`_autofocus_search`)
 
@@ -504,15 +533,24 @@ was not just unnecessary but misleading (it could fight the learned direction).
 This is the correction that made the metric dependable on dirty PET. When both
 directions make the image *worse*, the field is at the sharpest it can physically
 be — full stop. Grainy, low-contrast substrates simply score lower across the
-board (a sharp dirty-PET frame might peak at 2700, under the 3000 threshold), and
-excluding their sharp frames would throw away good data. So:
+board — a sharp dirty-PET frame might peak at 900, under the 1100 threshold —
+and excluding their sharp frames would throw away good data. This is the same
+non-comparability described in §3.1: the number means something *within* a
+field and very little *across* fields. So:
 
 - The threshold decides only **when to search** (and when to escalate).
 - The **peak verdict** decides whether the frame is as-good-as-it-gets.
-- A frame is tagged soft (`NNN_soft.jpg`, excluded from analysis) **only if it is
-  below threshold AND the search could not verify a peak** — i.e. the climb was
-  cut short by the runaway bound, a stop, or dropped frames. That is the genuine
-  "something is wrong with the optics" case.
+- A frame is tagged soft (`NNN_soft.jpg`, excluded from analysis) if the search
+  **could not verify a peak** — cut short by the runaway bound, a stop, or
+  dropped frames — **or** if its best reading came from the coarse tier, which
+  means the fine detail is gone however well the peak verified. The absolute
+  score is deliberately not part of this verdict; see §3.1.
+
+**Dropped frames are "unknown", not "worse".** A probe that returns no frame used
+to score `−∞`, which the climb could not distinguish from "the score fell" — so a
+camera timeout manufactured a *verified peak* out of nothing, and the frame was
+kept untagged. A dropped probe now ends the search with `at_peak = False`, which
+is what the rule above always claimed.
 
 **Escalation.** If the best score is below threshold, the search retries once
 with **3× wider probes** over the full roller range. This does two jobs at once:
@@ -619,13 +657,22 @@ Two moves, in order (`_on_auto_calibrate`, `_autofocus_here`):
    (§3.2) at the current spot and leave the stage at the sharp height. This is
    not about *setting* a threshold — it's about giving the next step a sharp
    image to judge. If there's no motor or Z doesn't respond, it skips gracefully.
+
+   "The same search" is now literally true: both call `CapturePipeline.focus_now()`.
+   Calibrate used to have its own copy, and the copy had drifted — it scored the
+   **preview** frame (short exposure) while capture scores the long-exposure
+   frame, so it optimised a different image; a dropped frame scored `−∞` and so
+   read as "worse"; there was no escalation pass; and it never learned the Z
+   direction. The status line now also distinguishes the three outcomes:
+   focused, focus *not verified* (search cut short), and focus *failed* (settled
+   with no detail left to measure).
 2. **Tour for sensitivity.** Visit a small ring of 9 nearby spots, grabbing one
    frame each (so a single funky spot can't skew the result), and pick the
    **strictest scratch-vs-background sensitivity at which this slide still reads
    clean.** Because step 1 made the frames sharp, this sensitivity sweep is
    judging real structure, not blur. The tour always returns to the start.
 
-The focus threshold stays put at 3000. The status bar reports both outcomes, e.g.
+The focus threshold stays put at 1100. The status bar reports both outcomes, e.g.
 `sensitivity 0.61, focused (score 6420)`.
 
 ---

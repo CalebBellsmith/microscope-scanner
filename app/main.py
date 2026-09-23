@@ -64,7 +64,7 @@ class _NoScrollSlider(QSlider):
 from camera import open_camera
 from motor import MotorController
 from ml_inference import QualityClassifier
-from capture_pipeline import CapturePipeline, focus_score
+from capture_pipeline import CapturePipeline
 from analysis_pipeline import (
     AnalysisPipeline, write_new_format, write_legacy_format,
     collect_sets, write_summarize_format, load_set_results,
@@ -457,11 +457,16 @@ class MainWindow(QMainWindow):
         self._blur_spin = _NoScrollSpinBox()
         self._blur_spin.setFocusPolicy(Qt.ClickFocus)
         self._blur_spin.setRange(0, 20000)
-        self._blur_spin.setValue(3000)        # focus-score floor for in-focus frames
+        self._blur_spin.setValue(1100)        # focus-score floor for in-focus frames
         self._blur_spin.setToolTip(
-            "Frames scoring below this focus value are treated as out of focus.  "
-            "Calibrated on the 2,400-frame archive: in-focus ≈4000-8000, "
-            "soft/degraded ≲2100.  Higher = stricter (acts more often)."
+            "Frames scoring below this are sent for a Z focus search.  They are "
+            "NOT discarded: the search runs and the frame is kept unless no focus "
+            "peak can be verified.  So this dial trades scan TIME against how "
+            "often the rig stops to look — it no longer decides what counts as "
+            "soft.\n\n"
+            "Default 1100.  Real in-focus frames score 2024-8962; the mildest "
+            "blur judged unacceptable scores 455-1313.  Higher = stops to look "
+            "more often (3000 did so on ~46% of sharp frames)."
         )
         blur_row.addWidget(self._blur_spin)
         blur_row.addStretch()
@@ -889,8 +894,12 @@ class MainWindow(QMainWindow):
     <code>NNN_soft.jpg</code> — kept for the record but never analysed.</p>
     <p><b>Focus threshold</b> — frames scoring below this are treated as out of
     focus.  Focus is objective (a frame is sharp or it isn't, whatever the
-    slide), so this stays a fixed dial: in-focus ≈4000-8000, soft ≲2100;
-    default 3000.  Higher = stricter (acts more often).</p>
+    slide), so this stays a fixed dial; default <b>1100</b>.  It decides only
+    how often the rig STOPS TO LOOK — a frame below it is searched, not
+    discarded, and is kept unless no focus peak can be verified.  Real in-focus
+    frames score 2024-8962; the mildest unacceptable blur scores 455-1313.
+    Higher = looks more often (the old 3000 looked on ~46% of sharp frames,
+    costing roughly two minutes of probing per leg).</p>
     <p><b>Z-step / Z-range</b> — how far each autofocus probe moves (default 300),
     and a runaway guard on total travel (default 10000 — the Z axis is a
     continuous roller, so this is a sanity bound, not a physical limit).
@@ -1457,61 +1466,44 @@ class MainWindow(QMainWindow):
 
     def _autofocus_here(self):
         """
-        Bring the live frame into focus at the current stage position: probe
-        one Z step each way, hill-climb the direction that improves the focus
-        score, stop at the peak (same search the capture pipeline uses).  The
-        stage is LEFT at the focused height.  Returns the best score, or None
-        when there's no motor / the Z stepper doesn't respond (the calibrate
-        tour then just proceeds with the frame as-is).
+        Bring the frame into focus at the current stage position, using the
+        SAME search the capture pipeline runs — not a copy of it.  The stage is
+        LEFT at the focused height.
+
+        Returns (score, tier, at_peak), or None when there is no motor/camera
+        or the Z stepper does not respond (the calibrate tour then just
+        proceeds with the frame as it is).
+
+        This used to be a second, home-grown hill-climb.  It had drifted from
+        the real one in four ways that all mattered: it scored the PREVIEW
+        frame (short exposure) while capture scores the long-exposure frame, so
+        it optimised the wrong image; a dropped frame scored -inf and so read
+        as "worse", which ends a climb early; there was no escalation pass; and
+        it never learned the Z direction.  Delegating removes the drift.
         """
         if self._motor is None or self._camera is None:
             return None
-        import time as _time
-        SETTLE = 0.3
-        step   = self._z_step_spin.value()
-        bound  = self._z_range_spin.value()
-        cur    = [0]                       # net Z applied so far
 
-        def go_to(z):
-            if z != cur[0]:
-                self._motor.move("Z", z - cur[0])
-                cur[0] = z
-                _time.sleep(SETTLE)
+        # A throwaway pipeline purely to reuse its focus search.  Nothing is
+        # captured or written — no start(), so no folders are created — it just
+        # needs the camera, the motor and the Z settings from the GUI.
+        pipe = CapturePipeline(
+            camera=self._camera, motor=self._motor, classifier=self._clf,
+            output_dir="", set_name="", leg="",
+            rows=1, cols=1, x_spacing=1, y_spacing=1,
+            blur_threshold=self._blur_spin.value(),
+            z_step=self._z_step_spin.value(),
+            z_range=self._z_range_spin.value(),
+        )
 
-        def score_at(z):
-            go_to(z)
-            f = self._camera.grab()
-            self._statusbar.showMessage(f"Calibrating — focusing… (Z {z:+d})")
-            QApplication.processEvents()
-            return float("-inf") if f is None else focus_score(f)
+        def on_probe(z, score, tier):
+            self._statusbar.showMessage(
+                f"Calibrating — focusing…  (Z {z:+d}, score {score:.0f})")
+            QApplication.processEvents()   # keep the GUI alive between moves
 
         try:
-            best_s, best_z = score_at(0), 0
-            direction = None
-            up = score_at(step)
-            if up > best_s:
-                best_s, best_z, direction = up, step, 1
-            else:
-                dn = score_at(-step)
-                if dn > best_s:
-                    best_s, best_z, direction = dn, -step, -1
-            if direction is not None:
-                while True:
-                    target = best_z + direction * step
-                    if abs(target) > bound:
-                        break
-                    s = score_at(target)
-                    if s > best_s:
-                        best_s, best_z = s, target
-                    else:
-                        break              # passed the peak
-            go_to(best_z)                  # settle at the sharpest height
-            return best_s
+            return pipe.focus_now(on_probe=on_probe)
         except Exception as e:
-            try:
-                go_to(0)                   # Z failed mid-search — walk back
-            except Exception:
-                pass
             self._statusbar.showMessage(f"Calibrate: Z focus skipped ({e})")
             QApplication.processEvents()
             return None
@@ -1548,9 +1540,21 @@ class MainWindow(QMainWindow):
         # doesn't touch the focus threshold; it just drives Z to the focus
         # peak so the sensitivity tour below judges sharp frames.
         self._cal_focus_msg = ""
-        best = self._autofocus_here()
-        if best is not None:
-            self._cal_focus_msg = f", focused (score {best:.0f})"
+        result = self._autofocus_here()
+        if result is not None:
+            best, tier, at_peak = result
+            if at_peak and tier in CapturePipeline._TIERS_MEASURABLE:
+                self._cal_focus_msg = f", focused (score {best:.0f})"
+            elif tier not in CapturePipeline._TIERS_MEASURABLE:
+                # The search settled, but on a frame with no fine detail left
+                # to measure — that is not focus, it is a long way off it.
+                self._cal_focus_msg = (f", FOCUS FAILED (score {best:.0f} — no "
+                                       f"detail to focus on; check the slide "
+                                       f"and Z travel)")
+            else:
+                # Cut short by the travel bound, a stop, or dropped frames.
+                self._cal_focus_msg = (f", focus NOT verified (best {best:.0f}) "
+                                       f"— widen Z range or refocus by hand")
 
         import time as _time
         SETTLE   = 0.15                              # brief settle before each grab

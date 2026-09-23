@@ -56,7 +56,7 @@ class CapturePipeline:
                  output_dir, set_name, leg,
                  rows, cols, x_spacing, y_spacing,
                  quality_threshold=0.5,
-                 review_mode="none", review_fn=None, blur_threshold=3000.0,
+                 review_mode="none", review_fn=None, blur_threshold=1100.0,
                  good_dir=None, bad_dir=None,
                  z_step=300, z_range=10000, nudge_scale=0.4,
                  on_progress=None, on_frame=None, on_done=None, on_error=None):
@@ -279,11 +279,42 @@ class CapturePipeline:
     # scratch darkness c (verified from contrast 33 → 83), so E/c is what
     # stays flat for sharp frames — the old E/c² over-punished dark scratches.
     # _SPEC_SCALE aligns the spec-fallback range with the scratch-tier range
-    # so ONE threshold serves both.  In-focus frames read ≈4000-8000, soft
-    # ones ≲2100 — default GUI threshold 3000 (bench-tested; sits in the wide
-    # gap between the soft and sharp score bands).
+    # so ONE threshold serves both.  Default GUI threshold 1100: unblurred
+    # archive frames score 2024-8962, and the mildest blur the operator calls
+    # unacceptable scores 455-1313, so 1100 sits in the gap.  (It was 3000,
+    # which is ABOVE the score of real in-focus frames — 3 of 40 unblurred
+    # archive frames fall below it — so it sent ~46% of sharp frames on a
+    # pointless search.  After the peak-verdict change that costs time, not
+    # correctness, but it is still ~2 minutes of probing per leg.)
     _FOCUS_SCALE = 10.0
     _SPEC_SCALE  = 0.76
+
+    # Tier 3 — the severe-defocus regime.  Tiers 1 and 2 both measure darkness
+    # below a ~25 px local background; blur wider than that kernel makes the
+    # image its OWN background, darkness collapses under the absolute floor of
+    # 8, and both tiers go blind.  That used to return +inf ("nothing to judge,
+    # so nothing to be blurry"), which is exactly backwards: severe defocus
+    # MAKES a featureless frame, and the frames it hit were the most out-of-
+    # focus ones there are.  Measured on the archive: at Gaussian sigma>=14
+    # every frame inverted from a correct "soft" reading to "perfectly sharp".
+    #
+    # So re-measure at a coarse scale instead.  Gradient energy is useless here
+    # (it has already collapsed), but darkness AMPLITUDE survives and falls
+    # smoothly all the way out — 7.5 at sigma 14 down to 1.2 at sigma 40 — so
+    # the score stays ordered and the Z search can still climb out.  The scale
+    # keeps this tier far below any sane threshold: reaching it AT ALL means
+    # the frame has no measurable fine detail, which is never "in focus".
+    _COARSE_K      = 81      # background kernel, wider than any plausible blur
+    _COARSE_PCT    = 99.5    # percentile of darkness (not max — noise-robust)
+    _COARSE_SCALE  = 0.25
+    _COARSE_BLANK  = 0.5     # below this there is genuinely nothing in frame
+
+    # Which tier produced a score.  A score from the coarse tier is a statement
+    # that the fine detail is GONE, so it can never be accepted as focused,
+    # however convincingly the search verifies a peak there.
+    TIER_SCRATCH, TIER_SPEC, TIER_COARSE, TIER_BLANK = (
+        "scratch", "spec", "coarse", "blank")
+    _TIERS_MEASURABLE = (TIER_SCRATCH, TIER_SPEC)
 
     @staticmethod
     def _horizontal_scratch_mask(gray):
@@ -319,8 +350,13 @@ class CapturePipeline:
 
     @classmethod
     def _focus_score(cls, frame) -> float:
+        """Focus score alone (higher = sharper).  See _focus_measure."""
+        return cls._focus_measure(frame)[0]
+
+    @classmethod
+    def _focus_measure(cls, frame) -> tuple:
         """
-        Two-tier focus score, higher = sharper.
+        Three-tier focus score, higher = sharper.  Returns (score, tier).
 
         Tier 1 — scratches: when the frame has a substantial, genuinely dark
         horizontal-scratch mask, measure the vertical-gradient energy along
@@ -335,12 +371,19 @@ class CapturePipeline:
         fuzz out exactly when the frame goes soft.  Same E/c form on the spec
         pixels, scaled to the scratch tier's range.
 
-        Returns +inf only when there are neither scratches nor specs to judge
-        (blank field → treated as in focus).
+        Tier 3 — coarse darkness: when BOTH of the above go blind because the
+        blur is wider than their ~25 px background kernel.  See _COARSE_K.
+        This tier never returns a number that can pass as focused; it exists to
+        stay ORDERED so the Z search can climb back out.  `tier` is returned so
+        callers can tell a real focus reading from one of these.
+
+        Never returns a non-finite value.  A genuinely featureless frame reads
+        ~0 under TIER_BLANK; it used to read +inf, which made the worst frames
+        in the set look like the best.
 
         Calibrated on the 2,400-frame old-system archive: in-focus frames
-        read ≈4000-8000 in BOTH tiers, soft/degraded ones ≲2100.  Default
-        threshold 2500.
+        read ≈4000-8000 in the scratch and spec tiers, soft/degraded ones
+        ≲2100.  Default GUI threshold 1100 — see the note by _FOCUS_SCALE.
         """
         import cv2
         gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
@@ -351,7 +394,8 @@ class CapturePipeline:
             if contrast >= cls._FOCUS_MIN_CONTRAST:
                 gy = cv2.Sobel(gray.astype(np.float64), cv2.CV_64F, 0, 1, ksize=3)
                 edge_energy = float((gy[sel] ** 2).mean())
-                return cls._FOCUS_SCALE * edge_energy / contrast
+                return (cls._FOCUS_SCALE * edge_energy / contrast,
+                        cls.TIER_SCRATCH)
 
         # Spec fallback — small dark spots against a smooth local background.
         bg = cv2.morphologyEx(
@@ -360,14 +404,29 @@ class CapturePipeline:
         dk = cv2.subtract(bg, gray).astype(np.float64)
         thr = max(8.0, dk.mean() + 2.0 * dk.std())
         spots = dk > thr
-        if int(spots.sum()) < cls._FOCUS_MIN_SPOTS:
-            return float("inf")
-        g64 = gray.astype(np.float64)
-        gx = cv2.Sobel(g64, cv2.CV_64F, 1, 0, ksize=3)
-        gy = cv2.Sobel(g64, cv2.CV_64F, 0, 1, ksize=3)
-        edge_energy = float(((gx ** 2 + gy ** 2)[spots]).mean())
-        contrast = float(dk[spots].mean()) + 1e-6
-        return cls._SPEC_SCALE * cls._FOCUS_SCALE * edge_energy / contrast
+        if int(spots.sum()) >= cls._FOCUS_MIN_SPOTS:
+            g64 = gray.astype(np.float64)
+            gx = cv2.Sobel(g64, cv2.CV_64F, 1, 0, ksize=3)
+            gy = cv2.Sobel(g64, cv2.CV_64F, 0, 1, ksize=3)
+            edge_energy = float(((gx ** 2 + gy ** 2)[spots]).mean())
+            contrast = float(dk[spots].mean()) + 1e-6
+            return (cls._SPEC_SCALE * cls._FOCUS_SCALE * edge_energy / contrast,
+                    cls.TIER_SPEC)
+
+        # Tier 3 — coarse fallback.  Neither tier above can see anything, which
+        # means either the frame is blurred past their kernel or there is truly
+        # nothing in it.  A wide background close tells those apart: severe
+        # defocus still leaves large-scale darkness (the smeared scratches),
+        # a blank field leaves none.
+        bgc = cv2.morphologyEx(
+            gray, cv2.MORPH_CLOSE,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
+                                      (cls._COARSE_K, cls._COARSE_K)))
+        amp = float(np.percentile(cv2.subtract(bgc, gray), cls._COARSE_PCT))
+        score = cls._COARSE_SCALE * amp
+        if score < cls._COARSE_BLANK:
+            return 0.0, cls.TIER_BLANK
+        return score, cls.TIER_COARSE
 
     def _acquire_keeper(self):
         """
@@ -389,10 +448,18 @@ class CapturePipeline:
             return frame
 
         if mode == "autofocus":
-            # Focus is objective: a frame is either sharp enough or not.  Only
-            # soft frames (rare) trigger a Z search, so this fires seldom.
-            if self._z_disabled or self._focus_score(frame) >= self._blur_thresh:
-                return frame            # in focus, or Z unavailable — keep as-is
+            if self._z_disabled:
+                return frame            # no Z axis — nothing can be verified
+            # The threshold decides only WHETHER TO LOOK.  It is an absolute
+            # comparison across different fields, and this metric is not
+            # comparable that way — a sharp sparse frame scores below a
+            # slightly blurred dense one — so it must never be the thing that
+            # decides "soft".  The peak verdict does that (see
+            # _autofocus_search).  A coarse/blank reading always looks, since
+            # it means the fine detail is gone entirely.
+            score, tier = self._focus_measure(frame)
+            if tier in self._TIERS_MEASURABLE and score >= self._blur_thresh:
+                return frame
             return self._autofocus(frame)
 
         if mode == "auto":
@@ -456,6 +523,23 @@ class CapturePipeline:
                   f"Keeping frames as captured for the rest of this run.")
             return soft_frame
 
+    def focus_now(self, on_probe=None):
+        """Public entry point: drive Z to the focus peak where the stage is
+        standing, and leave it there.  Returns (score, tier, at_peak).
+
+        This exists so the GUI's Auto-calibrate button runs the SAME search as
+        capture rather than its own copy.  It used to have one, and the copy
+        had drifted badly: it scored the PREVIEW frame instead of the capture
+        frame, read a dropped frame as 'worse', had no escalation pass, never
+        learned the Z direction, and could not tell a real focus reading from
+        the coarse fallback — while its docstring claimed it was "the same
+        search the capture pipeline uses".  One implementation, no drift.
+
+        on_probe(z, score, tier) is called after each probe, so a caller
+        driving this from the GUI thread can repaint between moves.
+        """
+        return self._focus_search(on_probe=on_probe)
+
     def _autofocus_search(self, soft_frame):
         """
         Drive the Z stepper to bring a soft field into focus, then re-capture.
@@ -482,14 +566,37 @@ class CapturePipeline:
           • FOCUS IS THE PEAK, NOT THE NUMBER: when both directions make the
             image worse, the field is at its sharpest physically possible —
             it is accepted as focused even if its absolute score is low
-            (grainy substrates score lower across the board).  Only a field
-            below threshold WITHOUT a verified peak (search cut short by the
-            bound / stop / dropped frames) is flagged via self._last_soft,
+            (grainy substrates score lower across the board).  The absolute
+            score is deliberately NOT part of this verdict: it is comparable
+            between two heights of the SAME field (17/20 archive fields score
+            strictly monotonically in blur) but not between different fields
+            (a score of ~2500 is produced by sharp, slightly-blurred and
+            clearly-blurred frames alike).  The threshold decides when to
+            SEARCH; the peak decides focus.  A field with no verified peak
+            (bound / stop / dropped frames), or one whose best reading came
+            from the coarse fallback tier — meaning the fine detail is gone
+            however well the peak verified — is flagged via self._last_soft,
             which tags the saved filename so analysis skips it.
         """
+        best_s, best_tier, at_peak = self._focus_search(soft_frame)
+        self._last_soft = (not at_peak) or best_tier not in self._TIERS_MEASURABLE
+        # The stage is already sitting at the best height; take the
+        # defect-nudged keeper there.
+        return self._best_frame()
+
+    def _focus_search(self, start_frame=None, on_probe=None):
+        """The focus search itself, shared by capture-time autofocus and the
+        GUI's Auto-calibrate.  Leaves the stage at the best height found and
+        returns (best_score, best_tier, at_peak).  Sets no state beyond the
+        learned Z direction, so callers decide what the result MEANS.
+        """
         cur_z = 0                                   # net Z applied during this search
-        s0    = self._focus_score(soft_frame)
-        best_s, best_z = s0, 0
+        if start_frame is None:
+            start_frame = self._wait_for_frame()
+        if start_frame is None:
+            return 0.0, self.TIER_BLANK, False      # no frame at all to judge
+        s0, t0 = self._focus_measure(start_frame)
+        best_s, best_z, best_tier = s0, 0, t0
 
         def go_to(target_z):
             nonlocal cur_z
@@ -499,68 +606,83 @@ class CapturePipeline:
                 cur_z = target_z
                 time.sleep(self.SETTLE_S)           # let focus settle before sampling
 
-        def score_at(target_z):
+        def sample(target_z):
+            """(score, tier) at this height, or None if the frame was dropped.
+
+            None is NOT -inf.  Returning -inf made a dropped frame read as
+            'the score got worse', which climb() then took as proof it had
+            passed the peak — so a camera timeout could manufacture a verified
+            focus peak out of nothing.  The docstring below always claimed
+            dropped frames flag _last_soft; now they actually do."""
             go_to(target_z)
             f = self._wait_for_frame()
-            return (float("-inf") if f is None else self._focus_score(f))
+            if f is None:
+                return None
+            m = self._focus_measure(f)
+            if on_probe is not None:
+                on_probe(target_z, m[0], m[1])
+            return m
 
-        def climb(step, bound, best_s, best_z):
+        def climb(step, bound, best_s, best_z, best_tier):
             """Probe one step each way from best_z (learned direction first),
             then hill-climb the uphill way until a step stops improving.
             Remembers the winning direction for the next search.
-            Returns (best_s, best_z, at_peak): at_peak is True when the search
-            ENDED because the score fell on both sides of best_z — a verified
-            focus peak — and False when it was cut short (range bound, stop,
-            dropped frames), i.e. a better height might exist unseen."""
+            Returns (best_s, best_z, best_tier, at_peak): at_peak is True when
+            the search ENDED because the score fell on both sides of best_z — a
+            verified focus peak — and False when it was cut short (range bound,
+            stop, dropped frames), i.e. a better height might exist unseen."""
             up = best_z + self._z_dir * step
-            s_up = score_at(up)
+            m = sample(up)
+            if m is None:
+                return best_s, best_z, best_tier, False    # dropped — unknown
+            s_up, t_up = m
             if s_up > best_s:
-                best_s, best_z, direction = s_up, up, self._z_dir
+                best_s, best_z, best_tier, direction = s_up, up, t_up, self._z_dir
             else:
                 dn = best_z - self._z_dir * step
-                s_dn = score_at(dn)
+                m = sample(dn)
+                if m is None:
+                    return best_s, best_z, best_tier, False
+                s_dn, t_dn = m
                 if s_dn > best_s:
-                    best_s, best_z, direction = s_dn, dn, -self._z_dir
+                    best_s, best_z, best_tier, direction = s_dn, dn, t_dn, -self._z_dir
                 else:
                     # neither way improves — both neighbours are worse, so the
                     # start height IS the peak
-                    return best_s, best_z, True
+                    return best_s, best_z, best_tier, True
             self._z_dir = direction                # learned: probe here first next time
             while not self._stop_event.is_set():
                 target = best_z + direction * step
                 if abs(target) > bound:            # runaway guard
-                    return best_s, best_z, False   # peak may lie beyond the bound
-                s = score_at(target)
+                    return best_s, best_z, best_tier, False
+                m = sample(target)
+                if m is None:
+                    return best_s, best_z, best_tier, False
+                s, t = m
                 if s > best_s:
-                    best_s, best_z = s, target
+                    best_s, best_z, best_tier = s, target, t
                 else:
                     # the score fell: we climbed up one side and came down the
                     # other — best_z is a verified peak
-                    return best_s, best_z, True
-            return best_s, best_z, False           # stopped mid-search
+                    return best_s, best_z, best_tier, True
+            return best_s, best_z, best_tier, False        # stopped mid-search
 
-        best_s, best_z, at_peak = climb(self._z_step, self._z_range,
-                                        best_s, best_z)
+        best_s, best_z, best_tier, at_peak = climb(
+            self._z_step, self._z_range, best_s, best_z, best_tier)
 
         # Score below threshold?  Escalate once: wider probes, full roller
         # range.  This both reaches far-away peaks AND double-checks a low
         # "peak" from the first pass — if ±3×step can't beat it either, the
         # peak is real, not single-step score noise.
         if best_s < self._blur_thresh and not self._stop_event.is_set():
-            best_s, best_z, at_peak = climb(self._z_step * self.ESCALATE_MULT,
-                                            self.ESCALATE_RANGE, best_s, best_z)
+            best_s, best_z, best_tier, at_peak = climb(
+                self._z_step * self.ESCALATE_MULT, self.ESCALATE_RANGE,
+                best_s, best_z, best_tier)
 
-        # FOCUS IS THE PEAK, NOT THE NUMBER: a field at a verified peak is as
-        # sharp as it can physically be — grainy/low-contrast substrates just
-        # score lower overall, and excluding their sharp frames would starve
-        # the analysis.  The threshold decides when to SEARCH; only a field
-        # that is below threshold AND has no verified peak (search cut short)
-        # is tagged _soft and excluded.
-        self._last_soft = (best_s < self._blur_thresh) and not at_peak
-        # Settle at the best height and take the defect-nudged keeper there.
-        # (best_z is 0 when nothing improved — that restores the start height.)
+        # Settle at the best height.  (best_z is 0 when nothing improved —
+        # that restores the start height.)
         go_to(best_z)
-        return self._best_frame()
+        return best_s, best_tier, at_peak
 
     def _best_frame(self):
         """
@@ -752,8 +874,8 @@ def _centroid_nudge(frame: np.ndarray,
 
 def focus_score(frame) -> float:
     """
-    Module-level access to the two-tier focus metric (higher = sharper,
-    +inf = blank field with nothing to judge).  Used by the GUI's
-    Auto-calibrate tour, which scores frames without building a pipeline.
+    Module-level access to the three-tier focus metric (higher = sharper;
+    always finite, ~0 for a frame with nothing measurable in it).  Used by the
+    GUI's Auto-calibrate tour, which scores frames without building a pipeline.
     """
     return CapturePipeline._focus_score(frame)
