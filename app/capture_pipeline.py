@@ -58,7 +58,7 @@ class CapturePipeline:
                  quality_threshold=0.5,
                  review_mode="none", review_fn=None, blur_threshold=1100.0,
                  good_dir=None, bad_dir=None,
-                 z_step=300, z_range=10000, nudge_scale=0.4,
+                 z_step=700, z_range=10000, nudge_scale=0.4,
                  on_progress=None, on_frame=None, on_done=None, on_error=None):
         """
         camera            : camera object (ToupTekCamera / OpenCVCamera)

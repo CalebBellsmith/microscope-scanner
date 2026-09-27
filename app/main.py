@@ -482,9 +482,14 @@ class MainWindow(QMainWindow):
         self._z_step_spin = _NoScrollSpinBox()
         self._z_step_spin.setFocusPolicy(Qt.ClickFocus)
         self._z_step_spin.setRange(1, 5000)
-        self._z_step_spin.setValue(300)
-        self._z_step_spin.setToolTip("Half-steps the Z (focus) stepper moves per "
-                                     "probe during an autofocus search.")
+        self._z_step_spin.setValue(700)
+        self._z_step_spin.setToolTip(
+            "Half-steps the Z (focus) stepper moves per probe during an "
+            "autofocus search.  Default 700.\n\n"
+            "One dial, three users: the capture-time autofocus, the "
+            "Auto-calibrate button's focus pass, and the W / S manual jog.  "
+            "Bigger = the search covers ground faster but lands less precisely "
+            "(the escalation pass already probes 3x this).")
         z_row.addWidget(self._z_step_spin)
         z_row.addSpacing(10)
         z_row.addWidget(QLabel("Z range ½:"))
@@ -900,7 +905,7 @@ class MainWindow(QMainWindow):
     frames score 2024-8962; the mildest unacceptable blur scores 455-1313.
     Higher = looks more often (the old 3000 looked on ~46% of sharp frames,
     costing roughly two minutes of probing per leg).</p>
-    <p><b>Z-step / Z-range</b> — how far each autofocus probe moves (default 300),
+    <p><b>Z-step / Z-range</b> — how far each autofocus probe moves (default 700),
     and a runaway guard on total travel (default 10000 — the Z axis is a
     continuous roller, so this is a sanity bound, not a physical limit).
     Z-step also sets how far <b>W / S</b> jog the focus in manual joystick.</p>
