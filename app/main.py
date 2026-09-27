@@ -988,6 +988,8 @@ class MainWindow(QMainWindow):
         """
         if not self._set_dir:
             return
+        repaired = [e for e in sorted(os.listdir(self._set_dir))
+                    if self._unnest_leg(os.path.join(self._set_dir, e))]
         saved, modes = load_set_results(self._set_dir)
         for entry in sorted(os.listdir(self._set_dir)):
             full = os.path.join(self._set_dir, entry)
@@ -1009,6 +1011,42 @@ class MainWindow(QMainWindow):
                 f"Reloaded {len(saved)} analysed leg(s) from {self._set_dir}"
                 f"{how} — ready to export."
             )
+        if repaired:
+            self._statusbar.showMessage(
+                "Lifted images out of a leftover __tmp__ folder in: "
+                + ", ".join(repaired))
+
+    @staticmethod
+    def _unnest_leg(leg_dir: str) -> bool:
+        """Undo a leg whose frames ended up in <leg>/__tmp__/ rather than <leg>/.
+
+        Capture used to move its temp folder INTO an existing leg folder rather
+        than renaming it onto one, leaving the whole leg a level too deep —
+        where nothing that looks for numbered frames can see it.  Lift any such
+        leg back up on sight, so sets captured before the fix repair themselves
+        when the folder is next opened.
+
+        Deliberately only the UNAMBIGUOUS case: the leg itself holds no numbered
+        frames, and no file is overwritten.  Returns True if anything moved.
+        """
+        if not os.path.isdir(leg_dir):
+            return False
+        nested = os.path.join(leg_dir, "__tmp__")
+        if not os.path.isdir(nested) or _count_numbered_frames(leg_dir):
+            return False
+        import shutil
+        moved = False
+        try:
+            for name in os.listdir(nested):
+                dst = os.path.join(leg_dir, name)
+                if not os.path.exists(dst):
+                    shutil.move(os.path.join(nested, name), dst)
+                    moved = True
+            if not os.listdir(nested):
+                os.rmdir(nested)
+        except OSError as e:
+            print(f"[main] could not un-nest {nested}: {e}")
+        return moved
 
     # ── Camera mode ───────────────────────────────────────────────────────────
 
@@ -1780,20 +1818,37 @@ class MainWindow(QMainWindow):
             return None, None, 0
         leg_name = leg_name.strip()
 
+        # An EXISTING destination has to be cleared first.  shutil.move() into
+        # a directory that already exists moves the source INSIDE it, so the
+        # images landed at set_dir/<leg>/__tmp__/001.jpg — the whole leg one
+        # folder too deep.  The old guard only cleared the destination when the
+        # leg was in self._leg_results, i.e. only when THIS session captured it;
+        # a leg folder left by an earlier session, or from before an app
+        # restart, skipped the guard and got nested.
         final_dir = os.path.join(self._set_dir, leg_name)
-        if os.path.isdir(final_dir) and leg_name in self._leg_results:
-            if QMessageBox.question(
-                self, "Overwrite?",
-                f"Leg '{leg_name}' already has results. Overwrite?",
-                QMessageBox.Yes | QMessageBox.No,
-            ) == QMessageBox.No:
-                _discard(None)
-                return None, None, 0
+        if os.path.isdir(final_dir):
+            if os.listdir(final_dir):
+                known = leg_name in self._leg_results
+                if QMessageBox.question(
+                    self, "Overwrite?",
+                    f"Leg '{leg_name}' already "
+                    + ("has results in this session."
+                       if known else "exists in this set folder.")
+                    + "\n\nOverwrite it with the leg just captured?",
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+                ) == QMessageBox.No:
+                    _discard(None)
+                    return None, None, 0
             shutil.rmtree(final_dir, ignore_errors=True)
             self._leg_results.pop(leg_name, None)
             self._analyzing_legs.discard(leg_name)
 
         shutil.move(tmp_dir, final_dir)
+        # The destination was cleared above, so that move is a rename and the
+        # frames sit directly in final_dir.  Check rather than assume: a stray
+        # nested folder costs the operator a level of navigation and hides the
+        # leg from everything that looks for numbered frames.
+        self._unnest_leg(final_dir)
         row = self._find_leg_row("(capturing…)")
         if row >= 0:
             self._leg_table.removeRow(row)
